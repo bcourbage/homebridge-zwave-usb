@@ -652,4 +652,163 @@ describe('ZWaveController (Direct Mode)', () => {
       expect(onStopped).toHaveBeenCalledWith('timeout');
     });
   });
+  describe('failed node removal safety', () => {
+    /** `sleeps` models a battery device: not always listening, not a FLiRS node. */
+    const addNode = (nodeId: number, status: number, name?: string, sleeps = false) => {
+      const node = new EventEmitter() as any;
+      node.nodeId = nodeId;
+      node.status = status;
+      node.name = name;
+      node.isListening = !sleeps;
+      node.isFrequentListening = false;
+      mockDriver.controller.emit('node added', node);
+      return node;
+    };
+
+    beforeEach(() => {
+      mockDriver.controller.isFailedNode = jest.fn().mockResolvedValue(false);
+      mockDriver.controller.removeFailedNode = jest.fn().mockResolvedValue(undefined);
+    });
+
+    it('refuses to remove a temporarily dead but valid node', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      // Node 8 is a real shade whose battery pack is out for charging.
+      addNode(8, 3, "Lia's Shade");
+
+      const assessment = await controller.assessFailedNodeRemoval(8);
+
+      expect(assessment.eligible).toBe(false);
+      expect(assessment.reason).toContain('does not consider Node 8 failed');
+      await expect(controller.removeFailedNode(8, 8)).rejects.toThrow(
+        /does not consider Node 8 failed/,
+      );
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('never removes a sleeping node', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(6, 1, "Nico's Shade Remote", true);
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+
+      const assessment = await controller.assessFailedNodeRemoval(6);
+
+      expect(assessment.eligible).toBe(false);
+      expect(assessment.reason).toContain('sleeping');
+      await expect(controller.removeFailedNode(6, 6)).rejects.toThrow(/sleeping/);
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('never removes a sleeping node that happens to be awake', async () => {
+      // A battery device alternates between Asleep and Awake. Checking only Asleep would make it
+      // removable in whichever instant the controller caught it awake.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(6, 2, "Nico's Shade Remote", true);
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+
+      const assessment = await controller.assessFailedNodeRemoval(6);
+
+      expect(assessment.eligible).toBe(false);
+      expect(assessment.reason).toContain('sleeping');
+      await expect(controller.removeFailedNode(6, 6)).rejects.toThrow(/sleeping/);
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('refuses the removal when the controller cannot say whether the node failed', async () => {
+      // Fail closed: a controller that times out mid-query must not leave a node removable.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(7, 3, 'Dead-looking node');
+      mockDriver.controller.isFailedNode.mockRejectedValue(new Error('Controller timed out'));
+
+      const assessment = await controller.assessFailedNodeRemoval(7);
+
+      expect(assessment.eligible).toBe(false);
+      await expect(controller.removeFailedNode(7, 7)).rejects.toThrow();
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('never removes a battery device whose status is not yet known', async () => {
+      // The hole the status check left: a battery node sits in Unknown between a restart and its
+      // first wake-up, which is exactly when a user reaches for Remove.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(9, 0, "Lia's Shade Remote", true);
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+
+      const assessment = await controller.assessFailedNodeRemoval(9);
+
+      expect(assessment.eligible).toBe(false);
+      await expect(controller.removeFailedNode(9, 9)).rejects.toThrow();
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('never removes a node that is not part of this network', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const assessment = await controller.assessFailedNodeRemoval(42);
+
+      expect(assessment.eligible).toBe(false);
+      await expect(controller.removeFailedNode(42, 42)).rejects.toThrow();
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('reports a removal the controller could not carry out', async () => {
+      // Swallowing this would let the UI tell the user a node was removed when it was not.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(11, 3, 'Dead node');
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+      mockDriver.controller.removeFailedNode.mockRejectedValue(new Error('Removal failed'));
+
+      await expect(controller.removeFailedNode(11, 11)).rejects.toThrow(/Removal failed/);
+    });
+
+    it('never removes the controller node', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const assessment = await controller.assessFailedNodeRemoval(1);
+
+      expect(assessment.eligible).toBe(false);
+      await expect(controller.removeFailedNode(1, 1)).rejects.toThrow(/controller/);
+    });
+
+    it('requires the confirmation to match the node ID', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(2, 3);
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+
+      await expect(controller.removeFailedNode(2, 3)).rejects.toThrow(/confirmation/);
+      expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+    });
+
+    it('checks with the controller immediately before removing', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(2, 3, 'Ghost');
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+
+      await controller.removeFailedNode(2, 2);
+
+      expect(mockDriver.controller.isFailedNode).toHaveBeenCalledWith(2);
+      expect(mockDriver.controller.removeFailedNode).toHaveBeenCalledWith(2);
+    });
+
+    it('logs why a node is or is not eligible', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(8, 3, "Lia's Shade");
+
+      await controller.removeFailedNode(8, 8).catch(() => undefined);
+
+      expect(log.info).toHaveBeenCalledWith(
+        expect.stringContaining("Failed-node removal check for Node 8 (Lia's Shade): not eligible"),
+      );
+    });
+  });
 });

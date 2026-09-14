@@ -9,7 +9,6 @@ import {
   HAPFormat,
   HAPPerm,
 } from '../platform/settings';
-import { NodeStatus } from '@zwave-js/core';
 import { formatRebuildRoutesSummary, summarizeRebuildRoutes } from '../zwave/rebuildRoutes';
 
 /**
@@ -19,14 +18,18 @@ import { formatRebuildRoutesSummary, summarizeRebuildRoutes } from '../zwave/reb
  */
 const HEAL_SWITCH_RESET_DELAY_MS = 500;
 
-export const CONTROLLER_CACHE_REPAIR_VERSION = 2;
+/**
+ * Bumped to 3 so the "Prune Dead Nodes" switch is removed from cached controller accessories.
+ * Removing a node from the Z-Wave network is destructive and now lives in the management UI,
+ * where the specific node and its name are shown before anything is deleted.
+ */
+export const CONTROLLER_CACHE_REPAIR_VERSION = 3;
 
 export class ControllerAccessory {
   private statusService: Service;
   private inclusionService: Service;
   private exclusionService: Service;
   private healService: Service;
-  private pruneService: Service;
   public readonly platformAccessory: PlatformAccessory;
   private inclusionTimer?: NodeJS.Timeout;
   private exclusionTimer?: NodeJS.Timeout;
@@ -42,7 +45,6 @@ export class ControllerAccessory {
    * every await and abandons itself if the user has since asked for something else.
    */
   private healGeneration = 0;
-  private isPruneActive = false;
 
   // Track listeners for cleanup
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -152,7 +154,7 @@ export class ControllerAccessory {
         });
       });
 
-      const canonicalSwitchSubtypes = new Set(['Inclusion', 'Exclusion', 'Heal', 'Prune']);
+      const canonicalSwitchSubtypes = new Set(['Inclusion', 'Exclusion', 'Heal']);
       const seenCanonicalSwitchSubtypes = new Set<string>();
       this.platformAccessory.services.slice().forEach((service) => {
         if (service.UUID !== this.platform.Service.Switch.UUID) {
@@ -284,23 +286,6 @@ export class ControllerAccessory {
     didUpdateConfiguredNames =
       this.syncConfiguredName(this.healService, 'Heal Network') || didUpdateConfiguredNames;
 
-    // --- 5. Prune Dead Nodes Switch ---
-    this.pruneService =
-      this.platformAccessory.getServiceById(this.platform.Service.Switch, 'Prune') ||
-      this.platformAccessory.addService(this.platform.Service.Switch, 'Prune Dead Nodes', 'Prune');
-
-    this.pruneService
-      .getCharacteristic(this.platform.Characteristic.Name)
-      .setProps({
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        format: HAPFormat.STRING as any,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        perms: [HAPPerm.PAIRED_READ as any],
-      })
-      .updateValue('Prune Dead Nodes');
-    didUpdateConfiguredNames =
-      this.syncConfiguredName(this.pruneService, 'Prune Dead Nodes') || didUpdateConfiguredNames;
-
     // Setup Switch characteristic Handlers
     this.inclusionService
       .getCharacteristic(this.platform.Characteristic.On)
@@ -320,17 +305,10 @@ export class ControllerAccessory {
         void this.handleSetHeal(value);
       });
 
-    this.pruneService
-      .getCharacteristic(this.platform.Characteristic.On)
-      .onSet((value: CharacteristicValue) => {
-        void this.handleSetPrune(value);
-      });
-
     // Initialize all control switches to OFF in the cached characteristic state.
     this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
     this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
     this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
-    this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
     if (existingAccessory && (didRepairCache || didUpdateConfiguredNames)) {
       this.platform.api.updatePlatformAccessories([this.platformAccessory]);
@@ -384,10 +362,8 @@ export class ControllerAccessory {
         this.platform.log.info('Controller event: Inclusion Started');
         this.isInclusionActive = true;
         this.isExclusionActive = false;
-        this.isPruneActive = false;
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
       },
       'inclusion stopped': () => {
         this.platform.log.info('Controller event: Inclusion Stopped');
@@ -402,14 +378,12 @@ export class ControllerAccessory {
         this.platform.log.info('Controller event: Exclusion Started');
         this.isExclusionActive = true;
         this.isInclusionActive = false;
-        this.isPruneActive = false;
         if (this.inclusionTimer) {
           clearTimeout(this.inclusionTimer);
           this.inclusionTimer = undefined;
         }
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
       },
       'exclusion stopped': () => {
         this.platform.log.info('Controller event: Exclusion Stopped');
@@ -493,10 +467,8 @@ export class ControllerAccessory {
         this.isInclusionActive = true;
         this.isExclusionActive = false;
         this.resetHealSwitch();
-        this.isPruneActive = false;
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
         // MUTEX: Turn off others
         if (wasExclusionActive) {
@@ -552,10 +524,8 @@ export class ControllerAccessory {
         this.isExclusionActive = true;
         this.isInclusionActive = false;
         this.resetHealSwitch();
-        this.isPruneActive = false;
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
         // MUTEX: Turn off others
         if (wasInclusionActive) {
@@ -655,11 +625,9 @@ export class ControllerAccessory {
 
       this.isInclusionActive = false;
       this.isExclusionActive = false;
-      this.isPruneActive = false;
       this.healService.updateCharacteristic(this.platform.Characteristic.On, true);
       this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
       this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-      this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
       // MUTEX
       if (wasInclusionActive) {
@@ -723,89 +691,7 @@ export class ControllerAccessory {
     }
   }
 
-  private async handleSetPrune(value: CharacteristicValue) {
-    try {
-      if (value) {
-        const wasInclusionActive = this.isInclusionActive;
-        const wasExclusionActive = this.isExclusionActive;
-        const wasHealActive = this.isHealInFlight();
-
-        this.isPruneActive = true;
-        this.isInclusionActive = false;
-        this.isExclusionActive = false;
-        this.resetHealSwitch();
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, true);
-        this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-
-        /**
-         * MUTEX FIX: Ensure only one management task is active.
-         */
-        try {
-          if (wasInclusionActive) {
-            await this.controller.stopInclusion();
-          }
-          if (wasExclusionActive) {
-            await this.controller.stopExclusion();
-          }
-          if (wasHealActive) {
-            await this.controller.stopHealing();
-          }
-        } catch { /* ignore */ }
-
-        this.platform.log.info('Requesting Prune Dead Nodes...');
-
-        // Find all Dead nodes
-        const deadNodeIds: number[] = [];
-        for (const [nodeId, node] of this.controller.nodes) {
-          if (nodeId !== 1 && node.status === NodeStatus.Dead) {
-            deadNodeIds.push(nodeId);
-          } else if (node.status === NodeStatus.Asleep) {
-            this.platform.log.debug(`Prune: Node ${nodeId} is ASLEEP (Battery). Skipping.`);
-          }
-        }
-
-        if (deadNodeIds.length === 0) {
-          this.platform.log.info('No Dead nodes found to prune.');
-          this.isPruneActive = false;
-          setTimeout(() => {
-            this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
-          }, 100);
-          return;
-        }
-
-        this.platform.log.info(`Found ${deadNodeIds.length} dead nodes: ${deadNodeIds.join(', ')}`);
-
-        for (const nodeId of deadNodeIds) {
-          if (!this.isPruneActive) {
-            this.platform.log.info('Pruning interrupted by user.');
-            break;
-          }
-          try {
-            await this.controller.removeFailedNode(nodeId);
-          } catch (err) {
-            this.platform.log.error(`Failed to prune node ${nodeId}:`, err);
-          }
-        }
-
-        this.platform.log.info('Pruning complete.');
-        this.isPruneActive = false;
-        setTimeout(() => {
-          this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
-        }, 500);
-      } else {
-        this.isPruneActive = false;
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
-      }
-    } catch (err) {
-      this.platform.log.error('Failed to set prune state:', err);
-      this.isPruneActive = false;
-      this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
-    }
-  }
-
   public stop() {
-    this.isPruneActive = false;
     if (this.inclusionTimer) {
       clearTimeout(this.inclusionTimer);
     }

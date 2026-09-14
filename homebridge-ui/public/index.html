@@ -251,6 +251,16 @@
       <button class="btn btn-sm btn-primary" id="executeConfirm">OK</button>
     </div>
   </div>
+
+  <div id="removeNodeModal" class="custom-modal">
+    <h6>Remove Node</h6>
+    <p id="removeNodeSummary" class="small"></p>
+    <p id="removeNodeReason" class="small text-muted"></p>
+    <div class="text-right">
+      <button class="btn btn-sm btn-secondary" id="cancelRemoveNode">Cancel</button>
+      <button class="btn btn-sm btn-danger" id="confirmRemoveNode">Remove</button>
+    </div>
+  </div>
   <script src="./ui-helpers.js"></script>
   <script>
     (async () => {
@@ -374,6 +384,7 @@
                   <button class="btn btn-sm btn-outline-secondary rename-node" data-nodeid="${node.nodeId}">Rename</button>
                   <button class="btn btn-sm btn-outline-secondary refresh-node-info" data-nodeid="${node.nodeId}" data-requires-wakeup="${!node.isListening && !node.isFrequentListening}">Refresh Info</button>
                   <button class="btn btn-sm btn-outline-primary check-update" data-nodeid="${node.nodeId}">Check Update</button>
+                  <button class="btn btn-sm btn-outline-danger remove-node" data-nodeid="${node.nodeId}">Remove</button>
                 </div>
               `;
             }
@@ -410,6 +421,7 @@
         document.getElementById('modalBackdrop').style.display = 'none';
         document.getElementById('renameModal').style.display = 'none';
         document.getElementById('confirmModal').style.display = 'none';
+        document.getElementById('removeNodeModal').style.display = 'none';
         isPromptOpen = false;
         activeNodeId = null;
         activeUpdateData = null;
@@ -441,6 +453,27 @@
             ? 'This resets the node interview state and requests fresh metadata. Keep the device awake while the refresh runs so it can answer interview commands.'
             : 'This resets the node interview state and requests fresh metadata from the node. Continue?';
           showModal('confirmModal');
+          return;
+        }
+
+        if (target.classList.contains('remove-node')) {
+          target.disabled = true;
+          try {
+            const check = await window.homebridge.request('check-node-removal', nodeId);
+            activeNodeId = nodeId;
+            // The name comes from the assessment, which always carries one, so the dialog cannot
+            // show a name the node has since stopped having.
+            const nodeName = check.name;
+            document.getElementById('removeNodeSummary').innerHTML =
+              `Remove <strong>Node ${uiHelpers.escapeHtml(nodeId)}</strong> (${uiHelpers.escapeHtml(nodeName)}) from the Z-Wave network?`;
+            document.getElementById('removeNodeReason').textContent = check.reason || '';
+            document.getElementById('confirmRemoveNode').disabled = !check.eligible;
+            showModal('removeNodeModal');
+          } catch (err) {
+            window.homebridge.toast.error(err.message);
+          } finally {
+            target.disabled = false;
+          }
           return;
         }
 
@@ -524,6 +557,23 @@
           window.homebridge.toast.error(err.message);
           loadNodes();
 	        }
+	      });
+
+	      document.getElementById('cancelRemoveNode').addEventListener('click', hideModals);
+	      document.getElementById('confirmRemoveNode').addEventListener('click', async () => {
+	        const nodeId = activeNodeId;
+	        hideModals();
+
+	        try {
+	          await window.homebridge.request('remove-failed-node', {
+	            nodeId,
+	            confirmNodeId: Number(nodeId),
+	          });
+	          window.homebridge.toast.success(`Node ${nodeId} removed from the Z-Wave network.`);
+	        } catch (err) {
+	          window.homebridge.toast.error(err.message);
+	        }
+	        loadNodes();
 	      });
 
 	      document.getElementById('cleanupStaleAccessories').addEventListener('click', async () => {

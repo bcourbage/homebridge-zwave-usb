@@ -1,5 +1,13 @@
 import { Accessory, Categories, Characteristic, HapStatusError, Service, uuid } from 'hap-nodejs';
 import { IdentifierCache } from 'hap-nodejs/dist/lib/model/IdentifierCache';
+import { HAPStorage } from 'hap-nodejs/dist/lib/model/HAPStorage';
+import os from 'os';
+import fsp from 'fs';
+
+// hap-nodejs writes its identifier cache to ./persist relative to the working directory, which
+// is the repository root under jest. Point it at a scratch directory so a test run leaves the
+// checkout alone.
+HAPStorage.setCustomStoragePath(fsp.mkdtempSync(`${os.tmpdir()}/hap-schema-`));
 import { CommandClasses, NodeStatus } from '@zwave-js/core';
 import { AccessoryFactory } from '../src/accessories/AccessoryFactory';
 import { ControllerAccessory } from '../src/accessories/ControllerAccessory';
