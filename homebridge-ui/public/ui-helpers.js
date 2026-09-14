@@ -149,6 +149,64 @@
     };
   }
 
+  /** A position the covering reported, or wording for one it never did. */
+  function positionText(value) {
+    return typeof value === 'number' ? `${value}%` : 'an unknown position';
+  }
+
+  /**
+   * What a position test proved. The plugin cannot say a command was accepted: a write can
+   * resolve without reaching the device, so the wording reports what settled and nothing more.
+   * A covering already at the commanded position ends there whether it moved or not, so that
+   * case is reported as proving nothing rather than as a pass.
+   */
+  function describeCoveringTestResult(result) {
+    const asked = `Commanded ${result.requested}%`;
+    const from = `from ${positionText(result.before)}`;
+    const now = `now ${positionText(result.after)}`;
+
+    if (result.startedAtTarget) {
+      return `${asked} ${from}, ${now}. The covering was already there, so this proves nothing. Try a different position.`;
+    }
+
+    if (result.timedOut) {
+      return `${asked} ${from}, ${now}. The covering was still reporting movement when the test gave up, so nothing was established.`;
+    }
+
+    if (result.reached) {
+      return `${asked} ${from}, ${now}. The covering moved there.`;
+    }
+
+    return `${asked} ${from}, ${now}. The covering did not reach that position.`;
+  }
+
+  /**
+   * What a stop proved. A covering that ignores the stop carries on to its target and comes to
+   * rest there, which is indistinguishable from a successful stop unless the target is part of
+   * the answer.
+   */
+  function describeCoveringStopResult(result) {
+    const where = `Ended at ${positionText(result.after)}, from ${positionText(result.before)}`;
+
+    if (result.timedOut) {
+      return `${where}. The covering was still reporting movement when the test gave up, so the stop cannot be credited.`;
+    }
+
+    if (result.shortOfTarget) {
+      return `${where}, which is short of its target of ${positionText(result.target)}. It came to rest there after the stop was sent, consistent with the stop taking effect.`;
+    }
+
+    if (!result.moved) {
+      return `${where}. The covering never reported moving after the stop was sent, so nothing was established. Start a move first, then stop it part way.`;
+    }
+
+    if (typeof result.target !== 'number') {
+      return `${where}. No target was recorded, so there is nothing to compare against.`;
+    }
+
+    return `${where}, which is its target of ${positionText(result.target)}. The covering may have finished traveling on its own, so the stop proved nothing.`;
+  }
+
   function buildPluginConfig(currentConfig, formValues) {
     const securityKeys = normalizeSecurityKeys(formValues.securityKeys || {});
     const invalidSecurityKeyFields = getInvalidSecurityKeyFields(securityKeys);
@@ -189,6 +247,8 @@
     escapeHtml,
     formatRssi,
     describeRoute,
+    describeCoveringTestResult,
+    describeCoveringStopResult,
     renderDiagnostics,
     buildPluginConfig,
   };

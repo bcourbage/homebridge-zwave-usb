@@ -119,6 +119,12 @@ describe('homebridge-ui server request wiring', () => {
     await requests.get('node-diagnostics')!(5);
 
     expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/diagnostics', 'GET');
+
+    await requests.get('test-covering-position')!({ nodeId: 5, position: 25 });
+    await requests.get('stop-covering')!(5);
+
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/test-position', 'POST', { position: 25 });
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/test-stop', 'POST');
   });
 
   it('should reject IPC responses with error status codes', async () => {

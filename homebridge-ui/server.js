@@ -27,6 +27,14 @@ class UiServer extends HomebridgePluginUiServer {
       return await this.ipcRequest(`/nodes/${nodeId}/diagnostics`, 'GET');
     });
 
+    this.onRequest('test-covering-position', async ({ nodeId, position }) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/test-position`, 'POST', { position });
+    });
+
+    this.onRequest('stop-covering', async (nodeId) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/test-stop`, 'POST');
+    });
+
     this.onRequest('check-firmware', async (nodeId) => {
       return await this.ipcRequest(`/firmware/updates/${nodeId}`, 'GET');
     });

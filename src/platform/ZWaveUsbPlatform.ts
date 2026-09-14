@@ -16,6 +16,13 @@ import { IZWaveController, IZWaveNode, ZWaveValueEvent } from '../zwave/interfac
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
 import { AccessoryFactory } from '../accessories/AccessoryFactory';
 import { ControllerAccessory } from '../accessories/ControllerAccessory';
+import { readCoveringPosition } from '../zwave/coveringTravel';
+import { HAP_COMMUNICATION_FAILURE } from '../features/ZWaveFeature';
+import {
+  POSITION_TOLERANCE as COVERING_POSITION_TOLERANCE,
+  STABILITY_TOLERANCE as COVERING_STABILITY_TOLERANCE,
+  STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS,
+} from '../zwave/coveringController';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -26,6 +33,33 @@ import {
 } from './settings';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const packageJson = require('../../package.json');
+
+/** How often a covering's reported position is sampled while it travels. */
+const COVERING_POLL_MS = 2000;
+/**
+ * How long to let the device answer a command before its reported state is trusted. Until the
+ * device reports, the cached position and duration still describe the previous move.
+ */
+const COVERING_REPORT_GRACE_MS = 8000;
+/** Upper bound on a covering's travel time. */
+const COVERING_TRAVEL_TIMEOUT_MS = 70000;
+
+/**
+ * Turns whatever a HomeKit characteristic write rejected with into something a person can read.
+ * hap-nodejs rethrows a refused write as a bare HAP status number, not an Error, so reading
+ * `.message` off it yields undefined and the panel shows an empty object.
+ */
+function describeRequestFailure(err: unknown): string {
+  if (err instanceof Error) {
+    return err.message;
+  }
+
+  if (err === HAP_COMMUNICATION_FAILURE) {
+    return 'The plugin refused the command. The Homebridge log says why.';
+  }
+
+  return `The command failed with HomeKit status ${String(err)}.`;
+}
 
 export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
@@ -224,8 +258,45 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
           this.zwaveController
             ?.getNodeRouteDiagnostics(nodeId)
-            .then((diagnostics) => sendJson(diagnostics))
+            .then((diagnostics) =>
+              sendJson({
+                ...diagnostics,
+                isWindowCovering: this.isPublishedAsWindowCovering(nodeId),
+              }),
+            )
             .catch((err) => sendJson({ error: err.message }, 500));
+          return;
+        }
+
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/test-position') &&
+          method === 'POST'
+        ) {
+          let body = '';
+          req.on('data', (chunk) => (body += chunk));
+          req.on('end', async () => {
+            try {
+              const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+              const { position } = JSON.parse(body || '{}');
+              const result = await this.driveCovering(nodeId, Number(position));
+              return sendJson(result);
+            } catch (err) {
+              return sendJson({ error: describeRequestFailure(err) }, 400);
+            }
+          });
+          return;
+        }
+
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/test-stop') &&
+          method === 'POST'
+        ) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          this.driveCoveringStop(nodeId)
+            .then((result) => sendJson(result))
+            .catch((err) => sendJson({ error: describeRequestFailure(err) }, 400));
           return;
         }
 
@@ -526,6 +597,302 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     } finally {
       this.discoveryInFlight.delete(node.nodeId);
     }
+  }
+
+  /**
+   * Waits for the device's own "I have stopped" signal rather than for the HomeKit values to
+   * agree, because a covering reports intermediate positions while it travels and the gaps
+   * between those reports otherwise look like a settled position.
+   */
+  private async waitForCoveringToStop(
+    node: IZWaveNode,
+    endpointIndex: number,
+    readPosition: () => number | null,
+  ): Promise<{ position: number | null; outcome: 'settled' | 'timed-out'; moved: boolean }> {
+    const startedAt = Date.now();
+    let moved = false;
+    let settled = false;
+    const deadline = startedAt + COVERING_TRAVEL_TIMEOUT_MS;
+    let lastMoved = startedAt;
+    let lastSeen = readCoveringPosition(node, endpointIndex, 'currentValue');
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, COVERING_POLL_MS));
+
+      const sample = readCoveringPosition(node, endpointIndex, 'currentValue');
+      if (
+        sample !== undefined &&
+        (lastSeen === undefined || Math.abs(sample - lastSeen) > COVERING_STABILITY_TOLERANCE)
+      ) {
+        // Compared against the previous sample, not against a fixed anchor: a covering creeping
+        // a percent at a time would otherwise never clear a fixed threshold and would be called
+        // stopped while it was still moving.
+        lastSeen = sample;
+        lastMoved = Date.now();
+        moved = true;
+        continue;
+      }
+
+      // Until the grace period is over the covering may not have begun to move, so a position
+      // that has not changed yet says nothing. The stall clock only runs after it.
+      if (Date.now() - startedAt < COVERING_REPORT_GRACE_MS) {
+        lastMoved = Date.now();
+        continue;
+      }
+
+      if (Date.now() - lastMoved >= COVERING_STALL_WINDOW_MS) {
+        settled = true;
+        break;
+      }
+    }
+
+    /**
+     * A covering still reporting new positions when the deadline passes has not stopped, and a
+     * sampled position that happens to equal the target at that moment is a coincidence rather
+     * than an arrival. The caller needs to know which of the two it got.
+     */
+    return {
+      position: readCoveringPosition(node, endpointIndex, 'currentValue') ?? readPosition(),
+      outcome: settled ? 'settled' : 'timed-out',
+      moved,
+    };
+  }
+
+  /** Stops a covering through HomeKit's HoldPosition and reports where it came to rest. */
+  /**
+   * The node's covering service, when it has exactly one. A node can publish a covering per
+   * endpoint, and the panel is per node with one set of controls, so picking the first would
+   * move whichever shade HAP happened to restore first with nothing to say which.
+   */
+  /**
+   * One covering operation per node at a time. A move takes tens of seconds, and a second
+   * request arriving while the first is in flight would drive the same motor from two places
+   * and make both readings meaningless. The guard lives here rather than in the page because
+   * another browser tab, or a direct call to the local interface, bypasses the page entirely.
+   */
+  private readonly coveringOperations = new Set<number>();
+
+  /** The guarded entry points the local interface uses, exposed for tests to drive directly. */
+  private driveCovering(nodeId: number, position: number) {
+    return this.withCoveringOperation(nodeId, () => this.testCoveringPosition(nodeId, position));
+  }
+
+  private driveCoveringStop(nodeId: number) {
+    return this.withCoveringOperation(nodeId, () => this.stopCovering(nodeId));
+  }
+
+  private async withCoveringOperation<T>(nodeId: number, run: () => Promise<T>): Promise<T> {
+    if (this.coveringOperations.has(nodeId)) {
+      throw new Error(`A covering test is already running for Node ${nodeId}.`);
+    }
+
+    this.coveringOperations.add(nodeId);
+    try {
+      return await run();
+    } finally {
+      this.coveringOperations.delete(nodeId);
+    }
+  }
+
+  private theOnlyCoveringService(accessory: ZWaveAccessory, nodeId: number): Service {
+    const services = accessory.platformAccessory.services.filter(
+      (candidate) => candidate.UUID === this.Service.WindowCovering.UUID,
+    );
+
+    if (services.length === 0) {
+      throw new Error(`Node ${nodeId} is not published as a window covering.`);
+    }
+
+    if (services.length > 1) {
+      throw new Error(
+        `Node ${nodeId} publishes ${services.length} coverings, so this control cannot tell ` +
+          'which one to move. Drive them from the Home app instead.',
+      );
+    }
+
+    return services[0];
+  }
+
+  private async stopCovering(nodeId: number): Promise<{
+    nodeId: number;
+    before: number | null;
+    after: number | null;
+    target: number | null;
+    shortOfTarget: boolean;
+    moved: boolean;
+    timedOut: boolean;
+  }> {
+    const accessory = this.zwaveAccessories.get(nodeId);
+    if (!accessory) {
+      throw new Error(`Node ${nodeId} has no HomeKit accessory yet.`);
+    }
+
+    const service = this.theOnlyCoveringService(accessory, nodeId);
+
+    const node = this.zwaveController?.nodes.get(nodeId);
+    if (!node) {
+      throw new Error(`Node ${nodeId} is not part of the Z-Wave network.`);
+    }
+
+    const readPosition = () => {
+      const value = service.getCharacteristic(this.Characteristic.CurrentPosition).value;
+      return typeof value === 'number' ? value : null;
+    };
+
+    const readTarget = () => {
+      const value = service.getCharacteristic(this.Characteristic.TargetPosition).value;
+      return typeof value === 'number' ? value : null;
+    };
+
+    const before = readPosition();
+    const target = readTarget();
+    this.log.info(`Stop test: Node ${nodeId} asked to stop (was ${before}%, target ${target}%)`);
+
+    await service.getCharacteristic(this.Characteristic.HoldPosition).handleSetRequest(true);
+    const travel = await this.waitForCoveringToStop(
+      node,
+      this.coveringEndpointIndex(service),
+      readPosition,
+    );
+    const after = travel.position;
+    /**
+     * A covering that ignores the stop carries on and comes to rest at its target, which looks
+     * exactly like a successful stop unless the target is part of the answer. Resting short of
+     * it is necessary evidence but not sufficient: a covering that was already stationary short
+     * of a stale target would otherwise be credited with obeying a stop it never received, so
+     * movement has to have been observed after the request too.
+     */
+    const restedShort =
+      after !== null &&
+      target !== null &&
+      Math.abs(after - target) > COVERING_POSITION_TOLERANCE;
+    const shortOfTarget = restedShort && travel.moved && travel.outcome === 'settled';
+    this.log.info(
+      `Stop test: Node ${nodeId} ended at ${after}% with target ${target}% ` +
+        `(${travel.outcome}, movement ${travel.moved ? 'observed' : 'not observed'}, ` +
+        `${shortOfTarget ? 'short of target' : 'inconclusive'})`,
+    );
+
+    return {
+      nodeId,
+      before,
+      after,
+      target,
+      shortOfTarget,
+      moved: travel.moved,
+      timedOut: travel.outcome === 'timed-out',
+    };
+  }
+
+  /**
+   * The endpoint a covering service belongs to. Features name their service after the endpoint
+   * index, so a covering published from a non-root endpoint is read from that endpoint rather
+   * than from endpoint 0, which would never report a position for it.
+   */
+  private coveringEndpointIndex(service: Service): number {
+    const parsed = Number.parseInt(service.subtype ?? '0', 10);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  private isPublishedAsWindowCovering(nodeId: number): boolean {
+    const accessory = this.zwaveAccessories.get(nodeId);
+
+    return Boolean(
+      accessory?.platformAccessory.services.some(
+        (service) => service.UUID === this.Service.WindowCovering.UUID,
+      ),
+    );
+  }
+
+  /**
+   * Drives a covering to a position through the same HomeKit characteristic the Home app writes
+   * to, then reports where the device actually ended up. A device can accept a command and stay
+   * put, so the reported position is what decides whether the move worked.
+   */
+  private async testCoveringPosition(
+    nodeId: number,
+    position: number,
+  ): Promise<{
+    nodeId: number;
+    requested: number;
+    before: number | null;
+    after: number | null;
+    reached: boolean;
+    startedAtTarget: boolean;
+    timedOut: boolean;
+  }> {
+    if (!Number.isFinite(position) || position < 0 || position > 100) {
+      throw new Error('Position must be between 0 and 100.');
+    }
+
+    const accessory = this.zwaveAccessories.get(nodeId);
+    if (!accessory) {
+      throw new Error(`Node ${nodeId} has no HomeKit accessory yet.`);
+    }
+
+    const service = this.theOnlyCoveringService(accessory, nodeId);
+
+    const node = this.zwaveController?.nodes.get(nodeId);
+    if (!node) {
+      throw new Error(`Node ${nodeId} is not part of the Z-Wave network.`);
+    }
+
+    const readPosition = () => {
+      const value = service.getCharacteristic(this.Characteristic.CurrentPosition).value;
+      return typeof value === 'number' ? value : null;
+    };
+
+    const requested = Math.round(position);
+    const before = readPosition();
+    this.log.info(`Position test: Node ${nodeId} commanded to ${requested}% (was ${before}%)`);
+
+    await service.getCharacteristic(this.Characteristic.TargetPosition).handleSetRequest(requested);
+
+    /**
+     * A covering travels for tens of seconds and reports intermediate positions on the way, so
+     * the reading is taken once the reported position has held still rather than after a fixed
+     * delay that would sample the shade mid-travel.
+     */
+    const travel = await this.waitForCoveringToStop(
+      node,
+      this.coveringEndpointIndex(service),
+      readPosition,
+    );
+    const after = travel.position;
+    const atTarget = after !== null && Math.abs(after - requested) <= COVERING_POSITION_TOLERANCE;
+    /**
+     * A covering that was already at the commanded position ends there whether it moved or not,
+     * so the test proves nothing. Saying "reached" would hand a dead covering a pass, which is
+     * the condition this tool exists to find.
+     */
+    const startedAtTarget =
+      before !== null && Math.abs(before - requested) <= COVERING_POSITION_TOLERANCE;
+    /**
+     * A covering still reporting movement when the deadline passed has not arrived, whatever
+     * the last sample happened to read.
+     */
+    const reached = atTarget && !startedAtTarget && travel.outcome === 'settled';
+    const outcome = startedAtTarget
+      ? 'inconclusive, it was already there'
+      : travel.outcome === 'timed-out'
+        ? 'still moving when the test timed out'
+        : reached
+          ? 'reached'
+          : 'not reached';
+    this.log.info(
+      `Position test: Node ${nodeId} reports ${after}% after ${requested}% was commanded ` +
+        `(was ${before}%, ${outcome})`,
+    );
+
+    return {
+      nodeId,
+      requested,
+      before,
+      after,
+      reached,
+      startedAtTarget,
+      timedOut: travel.outcome === 'timed-out',
+    };
   }
 
   private shouldCreateAccessoryForUnreadyNode(cachedAccessory: PlatformAccessory | undefined): boolean {

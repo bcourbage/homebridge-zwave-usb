@@ -6,6 +6,8 @@ const {
   normalizeSecurityKey,
   getInvalidSecurityKeyFields,
   buildPluginConfig,
+  describeCoveringTestResult,
+  describeCoveringStopResult,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -356,5 +358,133 @@ describe('homebridge-ui renderDiagnostics', () => {
 
   it('does not throw for a missing report', () => {
     expect(() => renderDiagnostics(undefined)).not.toThrow();
+  });
+});
+
+describe('covering test result wording', () => {
+  it('calls a test inconclusive when the covering was already at the commanded position', () => {
+    // The presets include 0 and 100 and a shade usually sits at one of them, so this is the
+    // most likely click. Reporting it as a pass would hand a dead covering a clean bill.
+    const text = describeCoveringTestResult({
+      requested: 100,
+      before: 100,
+      after: 100,
+      reached: false,
+      startedAtTarget: true,
+    });
+
+    expect(text).toContain('already there');
+    expect(text).not.toContain('moved there');
+  });
+
+  it('reports a covering that moved to the commanded position', () => {
+    const text = describeCoveringTestResult({
+      requested: 25,
+      before: 81,
+      after: 25,
+      reached: true,
+      startedAtTarget: false,
+    });
+
+    expect(text).toContain('moved there');
+    expect(text).toContain('from 81%');
+  });
+
+  it('never claims a command was accepted, which the plugin cannot know', () => {
+    const text = describeCoveringTestResult({
+      requested: 25,
+      before: 81,
+      after: 81,
+      reached: false,
+      startedAtTarget: false,
+    });
+
+    expect(text).toContain('did not reach');
+    expect(text).not.toMatch(/accepted/i);
+  });
+
+  it('says a position the covering never reported is unknown', () => {
+    const text = describeCoveringTestResult({
+      requested: 25,
+      before: null,
+      after: null,
+      reached: false,
+      startedAtTarget: false,
+    });
+
+    expect(text).toContain('an unknown position');
+  });
+
+  it('credits a stop only when the covering moved and then rested short of its target', () => {
+    expect(
+      describeCoveringStopResult({
+        before: 60,
+        after: 76,
+        target: 100,
+        shortOfTarget: true,
+        moved: true,
+        timedOut: false,
+      }),
+    ).toContain('consistent with the stop taking effect');
+  });
+
+  it('refuses to credit a stop when the covering never moved', () => {
+    // A covering sitting at 76% with a stale target of 100% rests short of it without ever
+    // receiving the stop. Crediting that would invent evidence out of a stale number.
+    const text = describeCoveringStopResult({
+      before: 76,
+      after: 76,
+      target: 100,
+      shortOfTarget: false,
+      moved: false,
+      timedOut: false,
+    });
+
+    expect(text).toContain('never reported moving');
+    expect(text).not.toContain('taking effect');
+  });
+
+  it('refuses to credit a stop that timed out', () => {
+    const text = describeCoveringStopResult({
+      before: 60,
+      after: 40,
+      target: 0,
+      shortOfTarget: false,
+      moved: true,
+      timedOut: true,
+    });
+
+    expect(text).toContain('cannot be credited');
+  });
+
+  it('reports a position test that timed out as establishing nothing', () => {
+    const text = describeCoveringTestResult({
+      requested: 25,
+      before: 81,
+      after: 25,
+      reached: false,
+      startedAtTarget: false,
+      timedOut: true,
+    });
+
+    // Even when the last sample happens to equal the target.
+    expect(text).toContain('still reporting movement');
+    expect(text).not.toContain('moved there');
+  });
+
+  it('refuses to credit a stop that ended at the target', () => {
+    // A covering that ignored the stop finishes its travel and rests on the target, which looks
+    // exactly like a stop that worked.
+    const text = describeCoveringStopResult({
+      before: 60,
+      after: 0,
+      target: 0,
+      shortOfTarget: false,
+      moved: true,
+      timedOut: false,
+    });
+
+    expect(text).toContain('proved nothing');
+    expect(text).not.toContain('took effect');
   });
 });

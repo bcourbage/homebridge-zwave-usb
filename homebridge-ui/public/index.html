@@ -460,8 +460,23 @@
             const d = await window.homebridge.request('node-diagnostics', nodeId);
             const { title, html } = uiHelpers.renderDiagnostics(d);
             document.getElementById('diagnosticsTitle').textContent = title;
-            document.getElementById('diagnosticsBody').innerHTML = html;
+            document.getElementById('diagnosticsBody').innerHTML = `
+              ${html}
+              <div class="mt-2" id="positionTestRow" style="display:none;">
+                <div class="small font-weight-bold">Move the covering and report where it stops</div>
+                <div class="btn-group btn-group-sm mt-1">
+                  <button class="btn btn-outline-secondary test-position" data-position="0">0%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="25">25%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="75">75%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="100">100%</button>
+                  <button class="btn btn-outline-warning stop-covering">Stop</button>
+                </div>
+                <div class="small text-muted mt-1" id="positionTestResult"></div>
+              </div>
+            `;
             activeNodeId = nodeId;
+            document.getElementById('positionTestRow').style.display =
+              d.isWindowCovering ? 'block' : 'none';
             showModal('diagnosticsModal');
           } catch (err) {
             window.homebridge.toast.error(err.message);
@@ -551,6 +566,70 @@
           window.homebridge.toast.error(err.message);
           loadNodes();
 	        }
+	      });
+
+	      /**
+	       * One covering operation at a time. A move runs for tens of seconds, so leaving the
+	       * controls live would let a second click drive the same motor while the first is still
+	       * going and make both readings meaningless. The generation counter means a result that
+	       * arrives after the panel has moved on cannot overwrite what is on screen.
+	       */
+	      let coveringRun = 0;
+
+	      const runCoveringControl = async (pending, waitingText) => {
+	        const generation = ++coveringRun;
+	        const resultEl = document.getElementById('positionTestResult');
+	        const controls = document.querySelectorAll('#positionTestRow button');
+	        controls.forEach((control) => {
+	          control.disabled = true;
+	        });
+	        resultEl.textContent = waitingText;
+
+	        try {
+	          const text = await pending();
+	          if (generation === coveringRun) {
+	            resultEl.textContent = text;
+	          }
+	        } catch (err) {
+	          if (generation === coveringRun) {
+	            resultEl.textContent = err.message;
+	          }
+	        } finally {
+	          if (generation === coveringRun) {
+	            controls.forEach((control) => {
+	              control.disabled = false;
+	            });
+	          }
+	        }
+	      };
+
+	      document.getElementById('diagnosticsBody').addEventListener('click', async (e) => {
+	        const stopButton = e.target.closest('.stop-covering');
+	        if (stopButton) {
+	          await runCoveringControl(
+	            async () =>
+	              uiHelpers.describeCoveringStopResult(
+	                await window.homebridge.request('stop-covering', activeNodeId),
+	              ),
+	            'Stopping...',
+	          );
+	          return;
+	        }
+
+	        const target = e.target.closest('.test-position');
+	        if (!target) return;
+
+	        const position = Number(target.getAttribute('data-position'));
+	        await runCoveringControl(
+	          async () =>
+	            uiHelpers.describeCoveringTestResult(
+	              await window.homebridge.request('test-covering-position', {
+	                nodeId: activeNodeId,
+	                position,
+	              }),
+	            ),
+	          `Moving to ${position}%...`,
+	        );
 	      });
 
 	      document.getElementById('closeDiagnostics').addEventListener('click', hideModals);
