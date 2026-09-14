@@ -645,6 +645,8 @@ describe('ZWaveUsbPlatform', () => {
 
     (platform as any).zwaveController.homeId = 100;
     (platform as any).zwaveAccessories.set(2, existing);
+    const matterAdd = jest.fn();
+    (platform as any).matterCoverings.add = matterAdd;
 
     const graphSpy = jest.spyOn(AccessoryFactory, 'getGraphSignature').mockReturnValue('new-graph');
     const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(reconciled as any);
@@ -657,6 +659,76 @@ describe('ZWaveUsbPlatform', () => {
       expect(reconciled.initialize).toHaveBeenCalledWith({ pruneUnmanagedServices: true });
       expect(existing.updateNode).not.toHaveBeenCalled();
       expect(existing.refresh).not.toHaveBeenCalled();
+      /**
+       * The Matter layer has to be told, and told about the new object. It is the only thing
+       * that repoints the endpoint's handlers at the rebuilt wrapper; without this call the
+       * covering keeps answering Matter commands through the object that was just stopped.
+       */
+      expect(matterAdd).toHaveBeenCalledWith(reconciled);
+    } finally {
+      graphSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it('should not republish the Matter accessory when the graph signature is unchanged', () => {
+    // An ordinary re-interview ends here, not in the rebuild above: the signature comes back the
+    // same and the existing wrapper is updated in place. The Matter accessory is neither
+    // republished nor repointed, so the endpoint keeps the handlers it already has.
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const node = {
+      nodeId: 2,
+      name: 'Unchanged Node',
+      deviceConfig: { label: 'Unchanged Node', manufacturer: 'Maker' },
+      ready: true,
+      status: 4,
+      getDefinedValueIDs: jest.fn().mockReturnValue([]),
+      getAllEndpoints: jest
+        .fn()
+        .mockReturnValue([{ index: 0, supportsCC: jest.fn().mockReturnValue(false) }]),
+      getValueMetadata: jest.fn(),
+      getValue: jest.fn(),
+      supportsCC: jest.fn().mockReturnValue(false),
+    };
+
+    const existing = {
+      isInitialized: jest.fn().mockReturnValue(true),
+      getGraphSignature: jest.fn().mockReturnValue('same-graph'),
+      stop: jest.fn(),
+      updateNode: jest.fn(),
+      refresh: jest.fn(),
+    };
+
+    (platform as any).zwaveController.homeId = 100;
+    (platform as any).zwaveAccessories.set(2, existing);
+    const matterAdd = jest.fn();
+    (platform as any).matterCoverings.add = matterAdd;
+
+    const graphSpy = jest
+      .spyOn(AccessoryFactory, 'getGraphSignature')
+      .mockReturnValue('same-graph');
+    const createSpy = jest.spyOn(AccessoryFactory, 'create');
+
+    try {
+      (platform as any).handleNodeUpdated(node);
+
+      expect(existing.updateNode).toHaveBeenCalledWith(node);
+      expect(existing.refresh).toHaveBeenCalled();
+      expect(existing.stop).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(matterAdd).not.toHaveBeenCalled();
     } finally {
       graphSpy.mockRestore();
       createSpy.mockRestore();
@@ -1363,4 +1435,202 @@ describe('ZWaveUsbPlatform', () => {
       /between 0 and 100/,
     );
   });
+
+  describe('the live set a Matter cache sweep is keyed on', () => {
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      const platform = new ZWaveUsbPlatform(log, config, api) as any;
+      platform.zwaveController.nodes = new Map([[5, { nodeId: 5 }]]);
+      Object.defineProperty(platform.zwaveController, 'homeId', { value: 0xabc, writable: true });
+      return platform;
+    };
+
+    const cached = (uuid: string, nodeId: number, homeId: number) =>
+      ({ UUID: uuid, context: { nodeId, homeId }, services: [] }) as never;
+
+    it('excludes an accessory cached from a different Z-Wave network', () => {
+      // Node numbers are reused across networks, so the node id alone proves nothing.
+      const platform = newPlatform();
+      platform.accessories.push(cached('other-network', 5, 0x999));
+
+      expect(platform.liveAccessoryUuids().has('other-network')).toBe(false);
+    });
+
+    it('keeps a node that has not been built yet, whatever it turns out to be', () => {
+      // Asleep, dead or still interviewing. What it will publish as is not knowable, so
+      // unregistering it from Matter would be a guess against a shade with a flat battery.
+      const platform = newPlatform();
+      platform.accessories.push(cached('not-ready', 5, 0xabc));
+
+      expect(platform.liveAccessoryUuids().has('not-ready')).toBe(true);
+    });
+
+    it('drops a ready accessory that is no longer published as a covering', () => {
+      // Reclassified as a light, say. Its Matter covering registration is now stale.
+      const platform = newPlatform();
+      platform.accessories.push(cached('reclassified', 5, 0xabc));
+      platform.zwaveAccessories.set(5, {
+        stop: jest.fn(),
+        platformAccessory: { UUID: 'reclassified', services: [{ UUID: 'service-Lightbulb' }] },
+      });
+
+      expect(platform.liveAccessoryUuids().has('reclassified')).toBe(false);
+    });
+
+    it('keeps a ready accessory that is still a covering', () => {
+      const platform = newPlatform();
+      platform.accessories.push(cached('still-a-covering', 5, 0xabc));
+      platform.zwaveAccessories.set(5, {
+        stop: jest.fn(),
+        platformAccessory: {
+          UUID: 'still-a-covering',
+          services: [{ UUID: platform.Service.WindowCovering.UUID }],
+        },
+      });
+
+      expect(platform.liveAccessoryUuids().has('still-a-covering')).toBe(true);
+    });
+  });
+
+
+  describe('the Matter cache sweep and controller startup', () => {
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      const platform = new ZWaveUsbPlatform(log, config, api) as any;
+      // The controller accessory needs a fuller HAP mock than these tests care about, and none
+      // of them is about it.
+      platform.buildControllerAccessory = jest.fn(() => {
+        platform.controllerAccessory = { stop: jest.fn() };
+      });
+      return platform;
+    };
+
+    it('does not sweep when the controller could not be started', async () => {
+      // An empty node list after a failed start means the stick could not be read, not that
+      // every node was removed. Sweeping on it would unregister every restored covering.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterCoverings.reconcileCached = reconcile;
+      platform.zwaveController.start = jest.fn().mockRejectedValue(new Error('stick unplugged'));
+
+      try {
+        await platform.connectToZWaveController();
+
+        expect(reconcile).not.toHaveBeenCalled();
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('sweeps once on the retry that finally connects', async () => {
+      // didFinishLaunching has long since returned by then, so nothing else would run it.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterCoverings.reconcileCached = reconcile;
+      platform.zwaveController.start = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('stick unplugged'))
+        .mockResolvedValue(undefined);
+
+      try {
+        await platform.connectToZWaveController();
+        expect(reconcile).not.toHaveBeenCalled();
+
+        await jest.advanceTimersByTimeAsync(31000);
+
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not report a Matter sweep failure as a Z-Wave connection failure', async () => {
+      // Matter is optional. Treating its failure as the stick failing schedules another connect,
+      // and that stops a driver that is working perfectly well.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      platform.matterCoverings.reconcileCached = jest
+        .fn()
+        .mockRejectedValue(new Error('matter is unwell'));
+      const start = jest.fn().mockResolvedValue(undefined);
+      platform.zwaveController.start = start;
+
+      try {
+        await platform.connectToZWaveController();
+
+        // The connection stands: no retry was scheduled and the controller accessory was built.
+        expect(platform.retryTimeout).toBeUndefined();
+        expect(platform.controllerAccessory).toBeDefined();
+
+        await jest.advanceTimersByTimeAsync(31000);
+        expect(start).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.matterSweepTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('retries only the sweep after it fails, without touching Z-Wave', async () => {
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('matter is unwell'))
+        .mockResolvedValue(undefined);
+      platform.matterCoverings.reconcileCached = reconcile;
+      const start = jest.fn().mockResolvedValue(undefined);
+      platform.zwaveController.start = start;
+
+      try {
+        await platform.connectToZWaveController();
+        expect(reconcile).toHaveBeenCalledTimes(1);
+
+        await jest.advanceTimersByTimeAsync(31000);
+
+        expect(reconcile).toHaveBeenCalledTimes(2);
+        // The driver was never restarted to get there.
+        expect(start).toHaveBeenCalledTimes(1);
+
+        // And once it succeeds it does not keep going.
+        await jest.advanceTimersByTimeAsync(31000);
+        expect(reconcile).toHaveBeenCalledTimes(2);
+      } finally {
+        clearTimeout(platform.matterSweepTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('sweeps only once across repeated connections', async () => {
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterCoverings.reconcileCached = reconcile;
+      platform.zwaveController.start = jest.fn().mockResolvedValue(undefined);
+
+      try {
+        await platform.connectToZWaveController();
+        await platform.connectToZWaveController();
+
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+  });
+
 });

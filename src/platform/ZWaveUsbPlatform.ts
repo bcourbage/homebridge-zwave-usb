@@ -66,6 +66,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
   public readonly accessories: PlatformAccessory[] = [];
+  /** Whether the one-time Matter cache sweep has run for this session. */
+  private matterCacheSwept = false;
+  private matterSweepTimeout?: NodeJS.Timeout;
   private zwaveController: IZWaveController | undefined;
   private readonly zwaveAccessories = new Map<number, ZWaveAccessory>();
   private controllerAccessory: ControllerAccessory | undefined;
@@ -145,6 +148,10 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       this.api.on('shutdown', async () => {
         this.log.info('Shutting down Z-Wave controller...');
         this.stopIpcServer();
+        if (this.matterSweepTimeout) {
+          clearTimeout(this.matterSweepTimeout);
+          this.matterSweepTimeout = undefined;
+        }
         if (this.retryTimeout) {
           clearTimeout(this.retryTimeout);
         }
@@ -454,6 +461,15 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     };
   }
 
+  /**
+   * Homebridge restores the Matter accessories it has cached before the network is discovered,
+   * the same way it restores HomeKit ones. Recording them lets a covering whose node has since
+   * been excluded be removed from Matter instead of lingering in the controller.
+   */
+  configureMatterAccessory(accessory: { UUID: string; displayName: string }) {
+    this.matterCoverings.configureCachedAccessory(accessory);
+  }
+
   configureAccessory(accessory: PlatformAccessory) {
     this.log.info('Loading accessory from cache:', accessory.displayName);
     this.accessories.push(accessory);
@@ -469,11 +485,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       await this.zwaveController.start();
       this.log.info('Z-Wave controller connected successfully.');
 
-      // RESOURCE LEAK FIX: Stop previous accessory instances before re-creating
-      if (this.controllerAccessory) {
-        this.controllerAccessory.stop();
-      }
-      this.controllerAccessory = new ControllerAccessory(this, this.zwaveController);
+      this.buildControllerAccessory();
     } catch (err) {
       this.log.error(
         `Failed to connect to Z-Wave controller: ${err instanceof Error ? err.message : String(err)}`,
@@ -483,7 +495,19 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       this.retryTimeout = setTimeout(() => {
         this.connectToZWaveController();
       }, 30000);
+      return;
     }
+
+    /**
+     * Outside the catch above, and deliberately. Matter is optional, and a failure to reconcile
+     * its cache says nothing about the stick: reporting it as a connection failure would schedule
+     * another connect, and that restarts a driver that is working perfectly well.
+     *
+     * Only now is the node list the network's own answer either. On a failed start it is empty
+     * because the stick could not be read, not because every node was removed, and sweeping on
+     * that would unregister every restored Matter accessory the user has.
+     */
+    await this.sweepMatterCache();
   }
 
   private handleNodeAdded(node: IZWaveNode) {
@@ -935,6 +959,112 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     return 'pending-interview';
   }
 
+  /** Replaces the controller accessory, stopping the previous instance so it does not leak. */
+  private buildControllerAccessory(): void {
+    if (this.controllerAccessory) {
+      this.controllerAccessory.stop();
+    }
+    this.controllerAccessory = new ControllerAccessory(this, this.zwaveController!);
+  }
+
+  /**
+   * Removes Matter registrations Homebridge restored that are not nodes on this network. Runs
+   * once, after a connection that actually succeeded, because a retry means didFinishLaunching
+   * has long since returned and nothing else would ever run it.
+   */
+  private async sweepMatterCache(): Promise<void> {
+    if (this.matterCacheSwept) {
+      return;
+    }
+
+    try {
+      await this.matterCoverings.reconcileCached(this.liveAccessoryUuids());
+      this.matterCacheSwept = true;
+    } catch (err) {
+      this.log.warn(
+        `Could not reconcile the Matter accessory cache: ${
+          err instanceof Error ? err.message : String(err)
+        }. Retrying in 30 seconds; the Z-Wave connection is unaffected.`,
+      );
+      if (this.matterSweepTimeout) {
+        clearTimeout(this.matterSweepTimeout);
+      }
+      // The sweep alone, not another connect: the driver is fine and must not be restarted.
+      this.matterSweepTimeout = setTimeout(() => void this.sweepMatterCache(), 30000);
+      this.matterSweepTimeout.unref();
+    }
+  }
+
+  /**
+   * The accessory UUIDs of every node the controller currently reports, whether or not the node
+   * is awake, interviewed or published yet. This is the network's own answer about what exists,
+   * which is what a Matter cache sweep has to be keyed on: a shade with its battery out is still
+   * a node, and unregistering it because it has not been published would take it out of every
+   * Matter controller that can see it.
+   */
+  private liveAccessoryUuids(): Set<string> {
+    const live = new Set<string>();
+    const homeId = this.zwaveController?.homeId;
+    const coveringType = (this.Service.WindowCovering as unknown as { UUID?: string })?.UUID;
+
+    const built = new Map<string, ZWaveAccessory>();
+    for (const accessory of this.zwaveAccessories.values()) {
+      built.set(accessory.platformAccessory.UUID, accessory);
+    }
+
+    const isCovering = (platformAccessory: PlatformAccessory): boolean =>
+      coveringType !== undefined &&
+      platformAccessory.services.some((service) => service.UUID === coveringType);
+
+    /**
+     * Taken from the accessories themselves rather than rebuilt from the node id. A UUID here
+     * can be a legacy one this plugin adopted to preserve a user's automations, so regenerating
+     * it would miss exactly the devices that have been around longest.
+     */
+    for (const accessory of this.accessories) {
+      const context = accessory.context as { nodeId?: number; homeId?: number } | undefined;
+      if (context?.nodeId == null) {
+        continue;
+      }
+
+      // A different network's accessory, kept in the cache, must not be read as alive merely
+      // because this network happens to use the same node number.
+      if (context.homeId !== homeId) {
+        continue;
+      }
+
+      if (!this.zwaveController?.nodes.has(context.nodeId)) {
+        continue;
+      }
+
+      const ready = built.get(accessory.UUID);
+      if (ready) {
+        /**
+         * This run has built the accessory, so its service graph is known. If it is no longer
+         * published as a covering, the Matter registration for it is stale and must go.
+         */
+        if (isCovering(ready.platformAccessory)) {
+          live.add(accessory.UUID);
+        }
+        continue;
+      }
+
+      /**
+       * Not built yet: asleep, dead, or still interviewing. What it will be published as is not
+       * knowable, so it is kept rather than unregistered on a guess.
+       */
+      live.add(accessory.UUID);
+    }
+
+    for (const accessory of built.values()) {
+      if (isCovering(accessory.platformAccessory)) {
+        live.add(accessory.platformAccessory.UUID);
+      }
+    }
+
+    return live;
+  }
+
   private pruneStaleAccessories(): number {
     const currentNodeIds = new Set(Array.from(this.zwaveController?.nodes.keys() || []));
     const staleAccessories = this.accessories.filter((acc) => {
@@ -953,6 +1083,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     this.api.unregisterPlatformAccessories('homebridge-zwave-usb', 'ZWaveUSB', staleAccessories);
 
     const staleUuids = new Set(staleAccessories.map((accessory) => accessory.UUID));
+    staleUuids.forEach((uuid) => void this.matterCoverings.remove(uuid));
+    void this.matterCoverings.reconcileCached(this.liveAccessoryUuids());
     const staleNodeIds = new Set(
       staleAccessories
         .map((accessory) => {
@@ -997,6 +1129,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       );
 
       const removedUuids = new Set(accessoriesToRemove.map((accessory) => accessory.UUID));
+      removedUuids.forEach((uuid) => void this.matterCoverings.remove(uuid));
       const remainingAccessories = this.accessories.filter(
         (accessory) => !removedUuids.has(accessory.UUID),
       );

@@ -8,17 +8,24 @@ import {
 } from './coveringPosition';
 import { matterLabel, matterSerialNumber } from './matterText';
 
-/**
- * The parts of Homebridge's Matter API this plugin uses. It is declared here rather than
- * imported because `api.matter` only exists on Homebridge 2 and the plugin still supports
- * Homebridge 1, where the property is simply absent.
- */
 /** The status errors a cluster handler throws to report a failure to the controller. */
 interface MatterStatusErrors {
   Failure: new (message?: string) => Error;
   NotFound: new (message?: string) => Error;
 }
 
+/** One accessory on its way to Matter, with the descriptor built for it retained locally. */
+interface PendingPublication {
+  uuid: string;
+  accessory: ZWaveAccessory;
+  descriptor: MatterAccessoryDescriptor;
+}
+
+/**
+ * The parts of Homebridge's Matter API this plugin uses. It is declared here rather than
+ * imported because `api.matter` only exists on Homebridge 2 and the plugin still supports
+ * Homebridge 1, where the property is simply absent.
+ */
 interface MatterApi {
   deviceTypes: Record<string, unknown>;
   status: MatterStatusErrors;
@@ -75,16 +82,37 @@ const PUBLISH_DEBOUNCE_MS = 3000;
  * Publishes covering accessories over Matter so controllers that cannot speak HomeKit, such as
  * Alexa, can operate them.
  *
- * Commands are routed through the same HomeKit characteristic the Home app writes to, so a Matter
- * request goes through the same command coalescing, encoding and position reconciliation as a
- * HomeKit one. Nothing here talks to Z-Wave directly.
+ * Commands are routed through the covering's HomeKit characteristics, so a Matter request goes
+ * through the same command coalescing, encoding and position reconciliation as a HomeKit one.
+ * Nothing here talks to Z-Wave directly.
  */
 export class MatterCoverings {
   private readonly published = new Set<string>();
   /** Descriptors of what was registered, so an accessory can be unregistered again. */
   private readonly descriptors = new Map<string, MatterAccessoryDescriptor>();
-  /** UUIDs Homebridge restored from its own Matter cache, which have to be reconciled. */
+  /**
+   * UUIDs Homebridge restored from its own Matter cache and that this run has not claimed yet.
+   * The distinction is load bearing rather than bookkeeping: a restored endpoint is the only
+   * one Homebridge lets a registration attach to in place, so an entry leaving this map is what
+   * says the identifier must never be offered for registration again this session.
+   */
   private readonly cached = new Map<string, MatterAccessoryDescriptor>();
+  /**
+   * Accessories whose descriptor construction or publication is in progress. While a UUID is
+   * here it is in neither `pending` nor `published`, so without it a second `add()` would queue
+   * the same accessory again and register it twice.
+   */
+  private readonly inFlight = new Set<string>();
+  /**
+   * A replacement offered while publication was in flight, tagged with the generation current
+   * when it was offered. Kept apart from `inFlight` because the two answer different questions:
+   * one is whether an operation is running, the other is what to do when it finishes. A removal
+   * bumps the generation, which is what makes a replacement offered before it stale, while a
+   * genuinely new request made after the removal carries the new generation and still runs.
+   */
+  private readonly deferred = new Map<string, { accessory: ZWaveAccessory; generation: number }>();
+  /** Bumped whenever an accessory is removed, so a registration in flight can be discarded. */
+  private readonly generations = new Map<string, number>();
   /** Per-accessory detach callbacks for the HomeKit listeners that mirror state into Matter. */
   private readonly trackers = new Map<string, Array<() => void>>();
   /** The accessory instance each published UUID is currently mirroring. */
@@ -104,6 +132,8 @@ export class MatterCoverings {
       this.publishTimer = undefined;
     }
     this.pending.clear();
+    this.inFlight.clear();
+    this.deferred.clear();
     [...this.trackers.keys()].forEach((uuid) => this.untrack(uuid));
   }
 
@@ -120,13 +150,14 @@ export class MatterCoverings {
   public async remove(uuid: string): Promise<void> {
     this.pending.delete(uuid);
     this.untrack(uuid);
-    this.published.delete(uuid);
+    // Anything still in flight for this accessory belongs to a generation that is now obsolete.
+    this.generations.set(uuid, (this.generations.get(uuid) ?? 0) + 1);
 
     const descriptor = this.descriptors.get(uuid) ?? this.cached.get(uuid);
-    this.descriptors.delete(uuid);
-    this.cached.delete(uuid);
-
     if (!descriptor || !this.matter) {
+      this.published.delete(uuid);
+      this.descriptors.delete(uuid);
+      this.cached.delete(uuid);
       return;
     }
 
@@ -135,11 +166,54 @@ export class MatterCoverings {
         descriptor,
       ]);
     } catch (err) {
+      /**
+       * Only a refusal raised before the removal is dispatched reaches here. Bridged
+       * unregistration is dispatched as an event that is not awaited, so a removal the Matter
+       * server goes on to refuse returns from this call as though it had worked, and the record
+       * is dropped below. Homebridge offers the endpoint back from its cache on the next start,
+       * which is where such a removal is noticed and tried again; within this session it is
+       * not detectable.
+       */
       this.platform.log.warn(
-        `Could not remove ${descriptor.displayName} from Matter: ${
+        `Could not remove ${descriptor.displayName} from Matter, so it is still recorded: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
+      /**
+       * No longer published, because the plugin has given up on it as a live accessory, but
+       * still recorded as restored so the next reconcile tries the removal again. Dropping it
+       * from both would leave a device in the controller that nothing here can ever remove.
+       */
+      this.published.delete(uuid);
+      this.descriptors.set(uuid, descriptor);
+      this.cached.set(uuid, descriptor);
+      return;
+    }
+
+    this.published.delete(uuid);
+    this.descriptors.delete(uuid);
+    this.cached.delete(uuid);
+  }
+
+  /**
+   * Removes every Matter accessory Homebridge restored that this run did not match to a live
+   * covering. Called once the network has been discovered, which is the first moment the absence
+   * of a node means the node is gone rather than not interviewed yet.
+   */
+  public async reconcileCached(liveUuids: ReadonlySet<string>): Promise<void> {
+    /**
+     * Keyed on what the network has, not on what has been published. Publication is debounced
+     * and a covering that is asleep, dead or still interviewing may not have been queued at all
+     * yet, so treating unpublished as absent would unregister a shade whose battery is simply
+     * out.
+     */
+    const leftovers = [...this.cached.keys()].filter((uuid) => !liveUuids.has(uuid));
+    for (const uuid of leftovers) {
+      this.platform.log.info(
+        `Removing ${this.cached.get(uuid)?.displayName ?? uuid} from Matter: ` +
+          'it was restored from the cache but is not a node on this network.',
+      );
+      await this.remove(uuid);
     }
   }
 
@@ -157,17 +231,21 @@ export class MatterCoverings {
       return;
     }
 
+    if (this.inFlight.has(uuid)) {
+      // Publication is already running for this accessory. Record the newest object so the
+      // operation can republish against it when it finishes, rather than starting a second one.
+      this.deferred.set(uuid, { accessory, generation: this.generations.get(uuid) ?? 0 });
+      return;
+    }
+
     if (this.published.has(uuid)) {
       if (this.tracked.get(uuid) === accessory) {
         return;
       }
 
-      /**
-       * The accessory object was rebuilt, so the registered handlers close over a stopped one.
-       * Dropping the registration lets it be published again against the live accessory.
-       */
-      this.untrack(uuid);
-      this.published.delete(uuid);
+      // The accessory object was rebuilt while its Matter endpoint is live.
+      this.refreshTracking(uuid, accessory);
+      return;
     }
 
     this.pending.set(uuid, accessory);
@@ -197,31 +275,125 @@ export class MatterCoverings {
       return;
     }
 
-    const queued = [...this.pending.values()];
+    const queued = [...this.pending.entries()];
     this.pending.clear();
 
-    const descriptors: MatterAccessoryDescriptor[] = [];
-    const registered: ZWaveAccessory[] = [];
+    /**
+     * Captured before any await. A removal that happens while a descriptor is being built would
+     * otherwise bump the generation before this read, and the publication would see its own
+     * stale work as current.
+     */
+    queued.forEach(([uuid]) => this.inFlight.add(uuid));
 
-    for (const accessory of queued) {
-      const descriptor = this.describe(accessory, matter);
-      if (descriptor) {
-        descriptors.push(descriptor);
-        registered.push(accessory);
-        this.descriptors.set(descriptor.UUID, descriptor);
+    const generations = new Map(
+      queued.map(([uuid]) => [uuid, this.generations.get(uuid) ?? 0] as const),
+    );
+
+    /**
+     * Both groups go through registration, which is the only path that records the plugin and
+     * platform an endpoint belongs to. Homebridge accepts it for an identifier it has never seen
+     * and for one it restored from its own cache, where it attaches the handlers and the
+     * ownership to the endpoint already there; it rejects a second registration of an endpoint
+     * that is already live this session. That rejection happens downstream of the call awaited
+     * here, so nothing offered in error would be visible: the groups are built from what has not
+     * been claimed yet rather than from what a failure would tell us. They stay separate so a
+     * failure of one cannot discard the other.
+     */
+    const fresh: PendingPublication[] = [];
+    const restored: PendingPublication[] = [];
+
+    for (const [uuid, accessory] of queued) {
+      const descriptor = await this.describe(accessory, matter);
+      if (!descriptor) {
+        continue;
       }
+
+      /**
+       * Held locally until dispatch. Recording it now would let a removal that arrives
+       * mid-flight ask Matter to unregister an accessory that was never offered.
+       */
+      (this.cached.has(uuid) ? restored : fresh).push({ uuid, accessory, descriptor });
     }
 
-    if (descriptors.length === 0) {
+    // Handed over separately, so a failure reported for one group does not discard a group that
+    // was already dispatched and would otherwise be offered a second time later.
+    try {
+      await this.commit(matter, fresh, generations);
+      await this.commit(matter, restored, generations);
+    } finally {
+      for (const [uuid, accessory] of queued) {
+        this.inFlight.delete(uuid);
+        const replacement = this.deferred.get(uuid);
+        this.deferred.delete(uuid);
+
+        if (!replacement) {
+          continue;
+        }
+
+        if (replacement.generation !== (this.generations.get(uuid) ?? 0)) {
+          /**
+           * The accessory was removed after this replacement was offered. Publishing it now
+           * would put back a device the plugin has already been told to take away.
+           */
+          continue;
+        }
+
+        /**
+         * Ordering is established by the generation, not by object identity. The same object
+         * offered again after a removal is a new request, because the publication it would
+         * have duplicated has been undone, and skipping it on identity alone would lose a
+         * re-included node that happens to reuse its wrapper.
+         */
+        const unchanged =
+          replacement.accessory === accessory &&
+          replacement.generation === (generations.get(uuid) ?? 0);
+        if (unchanged) {
+          continue;
+        }
+
+        // Rebuilt while this was in flight, so the handlers just published close over a stopped
+        // object, or removed and asked for again. Queue it now that the UUID is free.
+        this.add(replacement.accessory);
+      }
+    }
+  }
+
+  /**
+   * Offers one group to Matter and records what it handed over. An entry whose accessory was
+   * removed while this was in flight is undone rather than committed, using the descriptor
+   * retained here rather than the shared map, which the removal has already emptied.
+   */
+  private async commit(
+    matter: MatterApi,
+    group: PendingPublication[],
+    generations: ReadonlyMap<string, number>,
+  ): Promise<void> {
+    if (group.length === 0) {
       return;
     }
 
+    /**
+     * Checked here rather than only after the call, because a removal that arrives while the
+     * descriptors are being built would otherwise be dispatched anyway and undone afterwards.
+     * The undo is not a reliable answer: bridged unregistration is dispatched as an event of
+     * its own, so it can be handled before the registration it is meant to cancel. Not sending
+     * the work at all is the only part of this the plugin controls.
+     */
+    const live = group.filter(
+      (entry) => (this.generations.get(entry.uuid) ?? 0) === generations.get(entry.uuid),
+    );
+
+    if (live.length === 0) {
+      return;
+    }
+
+    const descriptors = live.map((entry) => entry.descriptor);
     try {
       await matter.registerPlatformAccessories('homebridge-zwave-usb', 'ZWaveUSB', descriptors);
     } catch (err) {
       /**
-       * Matter is optional. A bridge without it, or a registration the server rejects, must not
-       * disturb the HomeKit accessories that are already working.
+       * Matter is optional. A bridge without it, or a registration refused before it is
+       * dispatched, must not disturb the HomeKit accessories that are already working.
        */
       this.platform.log.warn(
         `Could not publish ${descriptors.length} covering(s) over Matter: ${
@@ -231,30 +403,67 @@ export class MatterCoverings {
       return;
     }
 
-    for (const accessory of registered) {
-      const uuid = accessory.platformAccessory.UUID;
-      this.published.add(uuid);
-      this.cached.delete(uuid);
-      this.tracked.set(uuid, accessory);
-      this.trackPosition(accessory);
-      this.trackBattery(accessory);
+    const undo: MatterAccessoryDescriptor[] = [];
+    const committed: PendingPublication[] = [];
+
+    for (const entry of live) {
+      if ((this.generations.get(entry.uuid) ?? 0) !== generations.get(entry.uuid)) {
+        // Removed while the registration was being dispatched. Compensating for it is
+        // best-effort, for the ordering reason above, which is why the window is kept small
+        // rather than relied on.
+        undo.push(entry.descriptor);
+        continue;
+      }
+
+      this.descriptors.set(entry.uuid, entry.descriptor);
+      this.published.add(entry.uuid);
+      // Claimed, so no longer a restored endpoint awaiting reclamation.
+      this.cached.delete(entry.uuid);
+      this.tracked.set(entry.uuid, entry.accessory);
+      this.trackPosition(entry.accessory);
+      this.trackBattery(entry.accessory);
+      committed.push(entry);
     }
 
-    /**
-     * The Matter server accepts the accessories asynchronously and reports its own failures, so
-     * this records what was handed over rather than claiming the devices are live.
-     */
-    this.platform.log.info(
-      `Handed ${descriptors.length} covering(s) to Matter: ` +
-        registered.map((accessory) => accessory.platformAccessory.displayName).join(', '),
-    );
+    if (committed.length > 0) {
+      /**
+       * A bridged registration is dispatched as an event that is not awaited, so this call
+       * returning says the accessories were handed over and nothing about what became of them.
+       * The wording follows.
+       */
+      this.platform.log.info(
+        `Handed ${committed.length} covering(s) to Matter: ` +
+          committed.map((entry) => entry.accessory.platformAccessory.displayName).join(', '),
+      );
+    }
+
+    if (undo.length === 0) {
+      return;
+    }
+
+    try {
+      await matter.unregisterPlatformAccessories('homebridge-zwave-usb', 'ZWaveUSB', undo);
+    } catch (err) {
+      /**
+       * The registration was dispatched and the plugin no longer wants it. Keeping these as
+       * restored leaves something for the next reconcile to remove, rather than an orphan in
+       * the controller that nothing knows about.
+       */
+      this.platform.log.warn(
+        `Could not undo a registration for ${undo.length} removed covering(s): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      undo.forEach((descriptor) => this.cached.set(descriptor.UUID, descriptor));
+    }
   }
 
-  private describe(
+  private async describe(
     accessory: ZWaveAccessory,
     matter: MatterApi,
-  ): MatterAccessoryDescriptor | undefined {
+  ): Promise<MatterAccessoryDescriptor | undefined> {
     const platformAccessory = accessory.platformAccessory;
+    const uuid = platformAccessory.UUID;
     const service = this.findCoveringService(platformAccessory);
     const deviceType = matter.deviceTypes?.WindowCovering;
 
@@ -263,9 +472,16 @@ export class MatterCoverings {
     }
 
     const information = this.readAccessoryInformation(platformAccessory);
-    const position = this.readPosition(service) ?? 0;
-    const lift = homeKitPositionToMatterLift(position);
-    const targetLift = homeKitPositionToMatterLift(this.readTargetPosition(service) ?? position);
+    /**
+     * A covering that has not reported yet has no position, and the attribute is nullable for
+     * exactly that. Publishing a number would be worse than vague: HomeKit 0 is fully closed and
+     * inverts to Matter 10000, so every controller on the network would be told the covering is
+     * shut. This is the same encoding the battery level above uses for an unknown level.
+     */
+    const known = await this.readPosition(service);
+    const knownTarget = await this.readTargetPosition(service);
+    const lift = known === undefined ? null : homeKitPositionToMatterLift(known);
+    const targetLift = knownTarget === undefined ? lift : homeKitPositionToMatterLift(knownTarget);
     const battery = this.describeBattery(platformAccessory);
 
     return {
@@ -288,18 +504,23 @@ export class MatterCoverings {
         ...(battery ? { [POWER_SOURCE_CLUSTER]: battery } : {}),
       },
       handlers: {
+        /**
+         * Each handler is async so that resolving the accessory reports a failure the same way
+         * the command itself does. Thrown from a plain arrow it would escape synchronously,
+         * past a caller that only watches the returned promise.
+         */
         [WINDOW_COVERING_CLUSTER]: {
-          goToLiftPercentage: (request?: never) => {
+          goToLiftPercentage: async (request?: never) => {
             const { liftPercent100thsValue } = (request ??
               {}) as unknown as GoToLiftPercentageRequest;
             return this.requestPosition(
-              accessory,
+              this.live(uuid, matter),
               matterLiftToHomeKitPosition(liftPercent100thsValue),
             );
           },
-          upOrOpen: () => this.requestPosition(accessory, 100),
-          downOrClose: () => this.requestPosition(accessory, 0),
-          stopMotion: () => this.requestStop(accessory),
+          upOrOpen: async () => this.requestPosition(this.live(uuid, matter), 100),
+          downOrClose: async () => this.requestPosition(this.live(uuid, matter), 0),
+          stopMotion: async () => this.requestStop(this.live(uuid, matter)),
         },
       },
     };
@@ -357,8 +578,9 @@ export class MatterCoverings {
   }
 
   /**
-   * Stops the covering through HomeKit's HoldPosition, which is the same route the Home app's
-   * stop control takes.
+   * Stops the covering through HomeKit's HoldPosition characteristic. It is the plugin's real
+   * HomeKit-facing stop, not a route of its own, though Apple's Home app does not expose a
+   * control that writes it.
    */
   private async requestStop(accessory: ZWaveAccessory): Promise<void> {
     const service = this.findCoveringService(accessory.platformAccessory);
@@ -397,14 +619,29 @@ export class MatterCoverings {
     };
   }
 
-  private readPosition(service: Service): number | undefined {
-    const value = service.getCharacteristic(this.platform.Characteristic.CurrentPosition)?.value;
-    return typeof value === 'number' ? value : undefined;
+  /**
+   * Asks the characteristic rather than reading its cached value. Until a covering has answered
+   * once, the plugin publishes no position and the read fails, while the cached value is still
+   * HomeKit's default of 0, which would be indistinguishable from a closed covering.
+   */
+  private async readCharacteristicPosition(
+    service: Service,
+    characteristic: typeof Characteristic.CurrentPosition | typeof Characteristic.TargetPosition,
+  ): Promise<number | undefined> {
+    try {
+      const value = await service.getCharacteristic(characteristic)?.handleGetRequest();
+      return typeof value === 'number' ? value : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
-  private readTargetPosition(service: Service): number | undefined {
-    const value = service.getCharacteristic(this.platform.Characteristic.TargetPosition)?.value;
-    return typeof value === 'number' ? value : undefined;
+  private async readPosition(service: Service): Promise<number | undefined> {
+    return this.readCharacteristicPosition(service, this.platform.Characteristic.CurrentPosition);
+  }
+
+  private async readTargetPosition(service: Service): Promise<number | undefined> {
+    return this.readCharacteristicPosition(service, this.platform.Characteristic.TargetPosition);
   }
 
   /**
@@ -431,9 +668,9 @@ export class MatterCoverings {
   }
 
   /**
-   * Invokes a HomeKit characteristic's write handler. A failure is reported and swallowed: Matter
-   * has its own error signalling and an exception escaping here would be reported against the
-   * cluster command rather than the device.
+   * Invokes a HomeKit characteristic's write handler. A failure is logged and then raised as a
+   * Matter status, so the controller that sent the command is told it failed rather than being
+   * left to assume it worked.
    */
   private async writeCharacteristic(
     service: Service,
@@ -481,6 +718,76 @@ export class MatterCoverings {
    * Mirrors the covering's HomeKit position into Matter whenever it changes, so a controller that
    * is watching over Matter sees the same position the Home app does.
    */
+  /**
+   * The accessory an identifier stands for right now. A handler resolves it when a command
+   * arrives rather than closing over the object that existed when the handler was built,
+   * because a Matter endpoint outlives the Z-Wave wrapper it mirrors: a rebuild replaces the
+   * wrapper while the endpoint, and the handlers registered with it, stay as they were.
+   */
+  private live(uuid: string, matter: MatterApi): ZWaveAccessory {
+    const accessory = this.tracked.get(uuid);
+    if (!accessory) {
+      throw new matter.status.NotFound(`No covering is registered for ${uuid}.`);
+    }
+
+    return accessory;
+  }
+
+  /**
+   * Points a live endpoint at a rebuilt accessory. Registering the identifier again is not
+   * available here: Homebridge attaches a registration in place only for an endpoint it
+   * restored from its own cache, and rejects a second registration of one already live, which
+   * it reports downstream of the call the plugin awaits. Nothing about the endpoint needs to
+   * change in any case, since the handlers resolve the accessory by identifier, so repointing
+   * the record and resubscribing is the whole update.
+   */
+  private refreshTracking(uuid: string, accessory: ZWaveAccessory): void {
+    this.untrack(uuid);
+    this.tracked.set(uuid, accessory);
+    this.trackPosition(accessory);
+    this.trackBattery(accessory);
+    void this.pushCurrentState(accessory).catch((err) => {
+      this.platform.log.debug(
+        `Could not mirror the rebuilt covering to Matter: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    });
+  }
+
+  /**
+   * Brings Matter back in step after a rebuild. The listeners that were mirroring state belonged
+   * to the characteristics of the object just replaced, so without this the endpoint would hold
+   * what was last reported until the new object happens to report a change of its own.
+   */
+  private async pushCurrentState(accessory: ZWaveAccessory): Promise<void> {
+    const service = this.findCoveringService(accessory.platformAccessory);
+    if (!service) {
+      return;
+    }
+
+    const known = await this.readPosition(service);
+    const knownTarget = await this.readTargetPosition(service);
+    const lift = known === undefined ? null : homeKitPositionToMatterLift(known);
+
+    this.pushState(accessory, WINDOW_COVERING_CLUSTER, {
+      currentPositionLiftPercent100ths: lift,
+      targetPositionLiftPercent100ths:
+        knownTarget === undefined ? lift : homeKitPositionToMatterLift(knownTarget),
+    });
+
+    const battery = this.findBatteryService(accessory.platformAccessory);
+    if (!battery) {
+      return;
+    }
+
+    const level = this.readBatteryLevel(battery);
+    this.pushState(accessory, POWER_SOURCE_CLUSTER, {
+      batChargeLevel: this.readBatteryChargeLevel(battery),
+      batPercentRemaining: level === undefined ? null : homeKitBatteryToMatterPercent(level),
+    });
+  }
+
   private trackPosition(accessory: ZWaveAccessory): void {
     const service = this.findCoveringService(accessory.platformAccessory);
     if (!service) {
@@ -488,7 +795,7 @@ export class MatterCoverings {
     }
 
     /**
-     * Current and target are reported separately. Pushing the travelling position into both
+     * Current and target are reported separately. Pushing the traveling position into both
      * would erase the target the controller asked for, and a controller that infers completion
      * from target === current would call the move finished on the first intermediate report.
      */
