@@ -23,6 +23,7 @@ import {
   STABILITY_TOLERANCE as COVERING_STABILITY_TOLERANCE,
   STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS,
 } from '../zwave/coveringController';
+import { MatterCoverings } from '../matter/MatterCoverings';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -75,6 +76,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * RACE CONDITION FIX: Track which nodes are currently being created
    * to prevent duplicate accessories if multiple events fire rapidly.
    */
+  private readonly matterCoverings = new MatterCoverings(this);
   private discoveryInFlight = new Set<number>();
   private firmwareProgress = new Map<number, { sent: number; total: number; status?: number }>();
   private refreshStates = new Map<number, 'waiting-wakeup' | 'refreshing'>();
@@ -146,6 +148,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         if (this.retryTimeout) {
           clearTimeout(this.retryTimeout);
         }
+        this.matterCoverings.stop();
         for (const acc of this.zwaveAccessories.values()) {
           acc.stop();
         }
@@ -538,6 +541,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId);
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
           hydratedAccessory.initialize({ removeSupersededServices: true });
+          this.matterCoverings.add(hydratedAccessory);
           return;
         }
 
@@ -554,6 +558,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const reconciledAccessory = AccessoryFactory.create(this, node, homeId);
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
+          this.matterCoverings.add(reconciledAccessory);
           return;
         }
 
@@ -591,6 +596,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
          * classification differed, so the graph is reconciled as part of the first build.
          */
         accessory.initialize({ removeSupersededServices: true });
+        this.matterCoverings.add(accessory);
       } else {
         accessory.refresh();
       }
