@@ -88,6 +88,39 @@ describe('homebridge-ui server request wiring', () => {
     expect(ipcRequest).toHaveBeenNthCalledWith(6, '/firmware/abort/9', 'POST');
   });
 
+  it('should forward the node diagnostics request to the IPC endpoint', async () => {
+    const requests = new Map<string, (...args: any[]) => Promise<unknown>>();
+    let serverInstance: { ipcRequest?: jest.Mock } | undefined;
+
+    jest.doMock('@homebridge/plugin-ui-utils', () => {
+      return {
+        HomebridgePluginUiServer: class {
+          homebridgeStoragePath = '/tmp';
+          constructor() {
+            serverInstance = this as { ipcRequest?: jest.Mock };
+          }
+          onRequest(name: string, handler: (...args: any[]) => Promise<unknown>) {
+            requests.set(name, handler);
+          }
+          ready() {
+            return undefined;
+          }
+        },
+      };
+    });
+
+    jest.isolateModules(() => {
+      require('../homebridge-ui/server.js');
+    });
+
+    const ipcRequest = jest.fn().mockResolvedValue({ ok: true });
+    serverInstance!.ipcRequest = ipcRequest;
+
+    await requests.get('node-diagnostics')!(5);
+
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/diagnostics', 'GET');
+  });
+
   it('should reject IPC responses with error status codes', async () => {
     let serverInstance: any;
 

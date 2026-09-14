@@ -121,6 +121,7 @@ mockController.stopExclusion = jest.fn().mockResolvedValue(true);
 mockController.startHealing = jest.fn().mockResolvedValue('started');
 mockController.stopHealing = jest.fn().mockResolvedValue(true);
 mockController.removeFailedNode = jest.fn().mockResolvedValue(undefined);
+mockController.getNodeRouteDiagnostics = jest.fn();
 mockController.setS2Pin = jest.fn();
 
 describe('ControllerAccessory', () => {
