@@ -251,6 +251,14 @@
       <button class="btn btn-sm btn-primary" id="executeConfirm">OK</button>
     </div>
   </div>
+
+  <div id="diagnosticsModal" class="custom-modal">
+    <h6 id="diagnosticsTitle">Radio and Route Diagnostics</h6>
+    <div id="diagnosticsBody" class="small"></div>
+    <div class="text-right mt-2">
+      <button class="btn btn-sm btn-secondary" id="closeDiagnostics">Close</button>
+    </div>
+  </div>
   <script src="./ui-helpers.js"></script>
   <script>
     (async () => {
@@ -373,6 +381,7 @@
                 <div class="btn-group">
                   <button class="btn btn-sm btn-outline-secondary rename-node" data-nodeid="${node.nodeId}">Rename</button>
                   <button class="btn btn-sm btn-outline-secondary refresh-node-info" data-nodeid="${node.nodeId}" data-requires-wakeup="${!node.isListening && !node.isFrequentListening}">Refresh Info</button>
+                  <button class="btn btn-sm btn-outline-secondary node-diagnostics" data-nodeid="${node.nodeId}">Diagnostics</button>
                   <button class="btn btn-sm btn-outline-primary check-update" data-nodeid="${node.nodeId}">Check Update</button>
                 </div>
               `;
@@ -410,6 +419,7 @@
         document.getElementById('modalBackdrop').style.display = 'none';
         document.getElementById('renameModal').style.display = 'none';
         document.getElementById('confirmModal').style.display = 'none';
+        document.getElementById('diagnosticsModal').style.display = 'none';
         isPromptOpen = false;
         activeNodeId = null;
         activeUpdateData = null;
@@ -441,6 +451,23 @@
             ? 'This resets the node interview state and requests fresh metadata. Keep the device awake while the refresh runs so it can answer interview commands.'
             : 'This resets the node interview state and requests fresh metadata from the node. Continue?';
           showModal('confirmModal');
+          return;
+        }
+
+        if (target.classList.contains('node-diagnostics')) {
+          target.disabled = true;
+          try {
+            const d = await window.homebridge.request('node-diagnostics', nodeId);
+            const { title, html } = uiHelpers.renderDiagnostics(d);
+            document.getElementById('diagnosticsTitle').textContent = title;
+            document.getElementById('diagnosticsBody').innerHTML = html;
+            activeNodeId = nodeId;
+            showModal('diagnosticsModal');
+          } catch (err) {
+            window.homebridge.toast.error(err.message);
+          } finally {
+            target.disabled = false;
+          }
           return;
         }
 
@@ -525,6 +552,8 @@
           loadNodes();
 	        }
 	      });
+
+	      document.getElementById('closeDiagnostics').addEventListener('click', hideModals);
 
 	      document.getElementById('cleanupStaleAccessories').addEventListener('click', async () => {
 	        try {

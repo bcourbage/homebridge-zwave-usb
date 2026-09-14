@@ -1,8 +1,13 @@
 import { Logger } from 'homebridge';
 import { Driver, ZWaveNode, InclusionStrategy, RebuildRoutesStatus } from 'zwave-js';
-import { CommandClasses } from '@zwave-js/core';
+import { CommandClasses, isRssiError, rssiToString } from '@zwave-js/core';
 import { EventEmitter } from 'events';
-import { HealStartResult, IZWaveController, ZWaveValueEvent } from './interfaces';
+import {
+  HealStartResult,
+  IZWaveController,
+  NodeRouteDiagnostics,
+  ZWaveValueEvent,
+} from './interfaces';
 import { formatRebuildRoutesSummary, summarizeRebuildRoutes } from './rebuildRoutes';
 import path from 'path';
 import fs from 'fs';
@@ -1021,6 +1026,91 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
       this.log.error(`Failed to remove failed node ${nodeId}:`, err);
       throw err;
     }
+  }
+
+  /**
+   * An RSSI is a dBm measurement or one of three error states that zwave-js encodes as numbers
+   * above the measurable range (125 no signal, 126 receiver saturated, 127 not available).
+   * Passed on as numbers they read as a very strong signal, so a measurement stays a number and
+   * an error state becomes the words zwave-js uses for it.
+   */
+  private describeRssi(rssi: number | undefined): number | string | undefined {
+    if (rssi === undefined) {
+      return undefined;
+    }
+
+    return isRssiError(rssi) ? rssiToString(rssi) : rssi;
+  }
+
+  /**
+   * Collects what the controller knows about how it reaches a node. Routes are chosen per
+   * transmission, so these values describe the last observed route rather than a fixed path.
+   */
+  public async getNodeRouteDiagnostics(nodeId: number): Promise<NodeRouteDiagnostics> {
+    if (!this.driver) {
+      throw new Error('Driver not started');
+    }
+
+    const node = this.nodes.get(nodeId);
+    if (!node) {
+      throw new Error(`Node ${nodeId} not found`);
+    }
+
+    const controller = this.driver.controller;
+    const statistics = node.statistics;
+    const lifeline = controller.getKnownLifelineRoutes().get(nodeId);
+
+    let neighbors: number[] | undefined;
+    try {
+      neighbors = [...(await controller.getNodeNeighbors(nodeId))].sort((a, b) => a - b);
+    } catch (err) {
+      this.log.debug(`Could not read neighbors for Node ${nodeId}: ${err}`);
+    }
+
+    let backgroundRSSI: Record<string, number | string> | undefined;
+    try {
+      const rssi = await controller.getBackgroundRSSI();
+      backgroundRSSI = Object.fromEntries(
+        Object.entries(rssi)
+          .filter(([, value]) => value !== undefined)
+          .map(([channel, value]) => [channel, this.describeRssi(value as number)]),
+      ) as Record<string, number | string>;
+    } catch (err) {
+      this.log.debug(`Could not read background RSSI: ${err}`);
+    }
+
+    const describeRoute = (route?: {
+      repeaters: number[];
+      rssi?: number;
+      protocolDataRate?: number;
+      routeFailedBetween?: [number, number];
+    }) =>
+      route
+        ? {
+            repeaters: [...route.repeaters],
+            direct: route.repeaters.length === 0,
+            ackRSSI: this.describeRssi(route.rssi),
+            protocolDataRate: route.protocolDataRate,
+            routeFailedBetween: route.routeFailedBetween,
+          }
+        : undefined;
+
+    return {
+      nodeId,
+      name: node.name || node.label || node.deviceConfig?.label || `Node ${nodeId}`,
+      status: node.status,
+      neighbors,
+      lastWorkingRoute: describeRoute(statistics?.lwr ?? lifeline?.lwr),
+      nextToLastWorkingRoute: describeRoute(statistics?.nlwr ?? lifeline?.nlwr),
+      averageAckRSSI: this.describeRssi(statistics?.rssi),
+      roundTripTimeMs: statistics?.rtt,
+      commandsTX: statistics?.commandsTX,
+      commandsRX: statistics?.commandsRX,
+      commandsDroppedTX: statistics?.commandsDroppedTX,
+      commandsDroppedRX: statistics?.commandsDroppedRX,
+      lastSeen: statistics?.lastSeen?.toISOString(),
+      backgroundRSSI,
+    };
   }
 
   /**

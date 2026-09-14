@@ -216,6 +216,19 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/diagnostics') &&
+          method === 'GET'
+        ) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          this.zwaveController
+            ?.getNodeRouteDiagnostics(nodeId)
+            .then((diagnostics) => sendJson(diagnostics))
+            .catch((err) => sendJson({ error: err.message }, 500));
+          return;
+        }
+
         if (normalizedUrl === '/accessories/prune-stale' && method === 'POST') {
           try {
             const removed = this.pruneStaleAccessories();

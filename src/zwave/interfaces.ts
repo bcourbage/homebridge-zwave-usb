@@ -24,6 +24,43 @@ export interface ZWaveValueEvent {
   prevValue?: unknown;
 }
 
+/**
+ * The last observed route to a node. Z-Wave picks a route per transmission, so this describes
+ * what was used most recently rather than a permanent connection.
+ */
+export interface ObservedRoute {
+  repeaters: number[];
+  direct: boolean;
+  /**
+   * The RSSI of the ACK the controller received, as a dBm measurement or the words for an RSSI
+   * error state. On a routed transmission it is the controller's first hop.
+   */
+  ackRSSI?: number | string;
+  protocolDataRate?: number;
+  routeFailedBetween?: [number, number];
+}
+
+export interface NodeRouteDiagnostics {
+  nodeId: number;
+  name: string;
+  status: number;
+  neighbors?: number[];
+  lastWorkingRoute?: ObservedRoute;
+  nextToLastWorkingRoute?: ObservedRoute;
+  /**
+   * zwave-js keeps an exponentially weighted average, not the latest reading, of the ACK RSSI the
+   * controller measured. For a routed transmission that is the first hop, not the destination.
+   */
+  averageAckRSSI?: number | string;
+  roundTripTimeMs?: number;
+  commandsTX?: number;
+  commandsRX?: number;
+  commandsDroppedTX?: number;
+  commandsDroppedRX?: number;
+  lastSeen?: string;
+  backgroundRSSI?: Record<string, number | string>;
+}
+
 export interface IZWaveController extends EventEmitter {
   homeId: number | undefined;
   nodes: Map<number, ZWaveNode>;
@@ -38,6 +75,7 @@ export interface IZWaveController extends EventEmitter {
   /** Whether a route rebuild this plugin started is still in progress. */
   isHealing(): boolean;
   removeFailedNode(nodeId: number): Promise<void>;
+  getNodeRouteDiagnostics(nodeId: number): Promise<NodeRouteDiagnostics>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
   setS2Pin(pin: string): void;

@@ -816,4 +816,114 @@ describe('ZWaveUsbPlatform', () => {
       createSpy.mockRestore();
     }
   });
+
+  it('should report route diagnostics for a node', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    const diagnostics = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      status: 4,
+      neighbors: [4],
+      lastWorkingRoute: { repeaters: [], direct: true, ackRSSI: -90 },
+    };
+    controller.getNodeRouteDiagnostics = jest.fn().mockResolvedValue(diagnostics);
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/5/diagnostics';
+    req.method = 'GET';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+      });
+
+      expect(controller.getNodeRouteDiagnostics).toHaveBeenCalledWith(5);
+      expect(JSON.parse((res.end as jest.Mock).mock.calls[0][0])).toEqual(diagnostics);
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
+
+  it('should answer a diagnostics request for an unknown node with an error', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    const diagnostics = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      status: 4,
+      neighbors: [4],
+      lastWorkingRoute: { repeaters: [], direct: true, ackRSSI: -90 },
+    };
+    controller.getNodeRouteDiagnostics = jest.fn().mockRejectedValue(new Error('Node 99 not found'));
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/99/diagnostics';
+    req.method = 'GET';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+      });
+
+      expect(res.writeHead).toHaveBeenCalledWith(500, expect.anything());
+      expect(JSON.parse((res.end as jest.Mock).mock.calls[0][0])).toEqual({
+        error: 'Node 99 not found',
+      });
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
 });

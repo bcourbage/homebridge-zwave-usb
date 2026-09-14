@@ -269,6 +269,196 @@ describe('ZWaveController (Direct Mode)', () => {
     await expect(pinPromise).resolves.toBe('00123');
     expect(onStatusUpdated).toHaveBeenCalledWith('S2 PIN REQUIRED');
   });
+  describe('node route diagnostics', () => {
+    const addNode = (extra: Record<string, unknown> = {}) => {
+      const node = new EventEmitter() as any;
+      node.nodeId = 5;
+      node.status = 4;
+      node.name = "Nico's Shade";
+      node.statistics = {
+        lwr: { repeaters: [], rssi: -88, protocolDataRate: 3 },
+        nlwr: { repeaters: [4], rssi: -95, protocolDataRate: 2 },
+        rssi: -88,
+        rtt: 45.6,
+        commandsTX: 120,
+        commandsRX: 118,
+        commandsDroppedTX: 2,
+        commandsDroppedRX: 1,
+        lastSeen: new Date('2026-10-18T12:00:00.000Z'),
+      };
+      Object.assign(node, extra);
+      mockDriver.controller.emit('node added', node);
+
+      return node;
+    };
+
+    beforeEach(() => {
+      mockDriver.controller.getKnownLifelineRoutes = jest.fn().mockReturnValue(new Map());
+      mockDriver.controller.getNodeNeighbors = jest.fn().mockResolvedValue([6, 4]);
+      mockDriver.controller.getBackgroundRSSI = jest
+        .fn()
+        .mockResolvedValue({ rssiChannel0: -100, rssiChannel1: -98 });
+    });
+
+    it('reports what the controller holds for the node', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode();
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report).toMatchObject({
+        nodeId: 5,
+        name: "Nico's Shade",
+        status: 4,
+        neighbors: [4, 6],
+        lastWorkingRoute: { repeaters: [], direct: true, ackRSSI: -88, protocolDataRate: 3 },
+        nextToLastWorkingRoute: { repeaters: [4], direct: false, ackRSSI: -95 },
+        averageAckRSSI: -88,
+        roundTripTimeMs: 45.6,
+        commandsTX: 120,
+        commandsRX: 118,
+        commandsDroppedTX: 2,
+        commandsDroppedRX: 1,
+        lastSeen: '2026-10-18T12:00:00.000Z',
+        backgroundRSSI: { rssiChannel0: -100, rssiChannel1: -98 },
+      });
+    });
+
+    it.each([
+      [127, 'N/A'],
+      [126, 'Receiver saturated'],
+      [125, 'No signal detected'],
+    ])('reports RSSI error state %i as words, never as a dBm figure', async (code, words) => {
+      mockDriver.controller.getBackgroundRSSI = jest
+        .fn()
+        .mockResolvedValue({ rssiChannel0: code, rssiChannel1: -98, rssiChannel2: code });
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode({
+        statistics: {
+          lwr: { repeaters: [4], rssi: code, protocolDataRate: 2 },
+          nlwr: { repeaters: [], rssi: -80, protocolDataRate: 3 },
+          rssi: code,
+        },
+      });
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.lastWorkingRoute?.ackRSSI).toBe(words);
+      expect(report.nextToLastWorkingRoute?.ackRSSI).toBe(-80);
+      expect(report.averageAckRSSI).toBe(words);
+      expect(report.backgroundRSSI).toEqual({
+        rssiChannel0: words,
+        rssiChannel1: -98,
+        rssiChannel2: words,
+      });
+    });
+
+    it('keeps the strongest and weakest measurable values as numbers', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode({ statistics: { rssi: -128, lwr: { repeaters: [], rssi: 124 } } });
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.averageAckRSSI).toBe(-128);
+      expect(report.lastWorkingRoute?.ackRSSI).toBe(124);
+    });
+
+    it('passes on which two nodes the most recent transmission failed between', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode({
+        statistics: { lwr: { repeaters: [4], rssi: -86, routeFailedBetween: [4, 5] } },
+      });
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.lastWorkingRoute?.routeFailedBetween).toEqual([4, 5]);
+    });
+
+    it('keeps the rest of the report when the neighbor query fails', async () => {
+      mockDriver.controller.getNodeNeighbors = jest.fn().mockRejectedValue(new Error('timeout'));
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode();
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.neighbors).toBeUndefined();
+      expect(report.lastWorkingRoute).toBeDefined();
+      expect(report.backgroundRSSI).toBeDefined();
+      expect(log.debug).toHaveBeenCalledWith(expect.stringContaining('Could not read neighbors'));
+    });
+
+    it('keeps the rest of the report when the background RSSI query fails', async () => {
+      mockDriver.controller.getBackgroundRSSI = jest.fn().mockRejectedValue(new Error('busy'));
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode();
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.backgroundRSSI).toBeUndefined();
+      expect(report.neighbors).toEqual([4, 6]);
+      expect(log.debug).toHaveBeenCalledWith(
+        expect.stringContaining('Could not read background RSSI'),
+      );
+    });
+
+    it('leaves out a background channel the controller could not measure', async () => {
+      mockDriver.controller.getBackgroundRSSI = jest
+        .fn()
+        .mockResolvedValue({ rssiChannel0: -100, rssiChannel1: -98, rssiChannel2: undefined });
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode();
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      // toEqual would treat a present-but-undefined key as absent, so the keys are compared.
+      expect(Object.keys(report.backgroundRSSI ?? {})).toEqual(['rssiChannel0', 'rssiChannel1']);
+    });
+
+    it('falls back to the known lifeline routes when the node has no statistics yet', async () => {
+      mockDriver.controller.getKnownLifelineRoutes = jest.fn().mockReturnValue(
+        new Map([[5, { lwr: { repeaters: [4], rssi: -91, protocolDataRate: 2 } }]]),
+      );
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode({ statistics: undefined });
+
+      const report = await controller.getNodeRouteDiagnostics(5);
+
+      expect(report.lastWorkingRoute).toMatchObject({ repeaters: [4], direct: false, ackRSSI: -91 });
+      expect(report.nextToLastWorkingRoute).toBeUndefined();
+      expect(report.lastSeen).toBeUndefined();
+    });
+
+    it('names a node by its label when it has no name', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode({ name: undefined, label: 'Somfy Motorized Shade' });
+
+      expect((await controller.getNodeRouteDiagnostics(5)).name).toBe('Somfy Motorized Shade');
+    });
+
+    it('rejects a node it does not know', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      await expect(controller.getNodeRouteDiagnostics(99)).rejects.toThrow('Node 99 not found');
+      await expect(controller.getNodeRouteDiagnostics(Number.NaN)).rejects.toThrow('not found');
+    });
+
+    it('rejects when the driver has not started', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+
+      await expect(controller.getNodeRouteDiagnostics(5)).rejects.toThrow('Driver not started');
+    });
+  });
+
   describe('network heal lifecycle', () => {
     const addNode = (nodeId: number, status: number) => {
       const node = new EventEmitter() as any;
