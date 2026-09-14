@@ -4,6 +4,7 @@ import { IZWaveNode, ZWaveValueEvent } from '../zwave/interfaces';
 import { ZWaveUsbPlatform } from '../platform/ZWaveUsbPlatform';
 import { CONFIGURED_NAME_COMPAT_SERVICE_UUIDS, ZWaveFeature } from '../features/ZWaveFeature';
 import { OBSOLETE_CHAR_UUIDS } from '../platform/settings';
+import { findDeviceOverride } from '../devices/deviceOverrides';
 
 export const ACCESSORY_CACHE_REPAIR_VERSION = 1;
 
@@ -236,7 +237,9 @@ export class ZWaveAccessory {
     }
   }
 
-  public initialize(options: { pruneUnmanagedServices?: boolean } = {}): void {
+  public initialize(
+    options: { pruneUnmanagedServices?: boolean; removeSupersededServices?: boolean } = {},
+  ): void {
     if (this.initialized) {
       this.platform.log.debug(`Node ${this.node.nodeId} already initialized, refreshing...`);
       this.refresh();
@@ -252,6 +255,8 @@ export class ZWaveAccessory {
 
       if (options.pruneUnmanagedServices) {
         this.pruneUnmanagedServices();
+      } else if (options.removeSupersededServices) {
+        this.removeSupersededServices();
       }
 
       this.ensurePrimaryService();
@@ -381,6 +386,76 @@ export class ZWaveAccessory {
     if (configuredName.value === undefined || configuredName.value === '') {
       configuredName.updateValue(name);
     }
+  }
+
+  /**
+   * Removes only the services a changed classification has directly replaced.
+   *
+   * A covering driven through Multilevel Switch CC used to be published as a Lightbulb, so the
+   * obsolete Lightbulb has to go or HomeKit keeps offering brightness for a shade. Everything
+   * else is left alone: a service this plugin created for another reason, such as a sensor whose
+   * discovery happened to be incomplete on this pass, must survive a rebuild rather than being
+   * deleted because nothing claimed it this time.
+   */
+  private removeSupersededServices(): void {
+    /**
+     * Only an override can supersede anything. A device that implements Window Covering CC was
+     * always a covering, so a Lightbulb in its cache was not replaced by this change and is not
+     * this change's business.
+     */
+    const override = findDeviceOverride(this.node);
+    if (!override?.multilevelSwitchDrivesCovering) {
+      return;
+    }
+
+    const covering = this.platform.Service.WindowCovering as unknown as { UUID?: string };
+    const lightbulb = this.platform.Service.Lightbulb as unknown as { UUID?: string };
+    if (!covering?.UUID || !lightbulb?.UUID) {
+      return;
+    }
+
+    /**
+     * Only services this pass built can supersede anything, and none of them can be the thing
+     * superseded. Deciding from what happens to be on the accessory instead would let a stale
+     * cached covering condemn the Lightbulb that replaced it, or let a covering delete a
+     * Lightbulb another feature legitimately created at the same endpoint.
+     */
+    const managed = new Set<Service>();
+    for (const feature of this.features) {
+      for (const service of feature.getServices()) {
+        managed.add(service);
+      }
+    }
+
+    /**
+     * Endpoint 0 has an absent subtype today and a literal '0' in caches written before 3.6.0,
+     * so the two have to compare equal: otherwise the obsolete Lightbulb on an older cache
+     * survives alongside its replacement, permanently.
+     */
+    const endpointOf = (service: Service) =>
+      service.subtype === undefined || service.subtype === '' ? '0' : service.subtype;
+
+    const coveringEndpoints = new Set(
+      [...managed].filter((service) => service.UUID === covering.UUID).map(endpointOf),
+    );
+
+    this.platformAccessory.services
+      .slice()
+      .filter(
+        (service) =>
+          service.UUID === lightbulb.UUID &&
+          !managed.has(service) &&
+          coveringEndpoints.has(endpointOf(service)),
+      )
+      .forEach((service) => {
+        this.platform.log.info(
+          `Removing the Lightbulb service superseded by a window covering on Node ${
+            this.node.nodeId
+          } endpoint ${endpointOf(service)} (${override.label}). HomeKit automations that ` +
+            'referenced it have to be rebuilt against the new service.',
+        );
+        this.platformAccessory.removeService(service);
+      });
   }
 
   private pruneUnmanagedServices(): void {

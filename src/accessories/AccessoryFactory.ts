@@ -19,6 +19,7 @@ import { WindowCoveringFeature } from '../features/WindowCoveringFeature';
 import { GarageDoorFeature } from '../features/GarageDoorFeature';
 import { ColorSwitchFeature } from '../features/ColorSwitchFeature';
 import { SirenFeature } from '../features/SirenFeature';
+import { multilevelSwitchDrivesCovering } from '../devices/deviceOverrides';
 
 export class AccessoryFactory {
   private static readonly FEATURE_CATEGORY_PRIORITY: Array<[string, number]> = [
@@ -310,7 +311,14 @@ export class AccessoryFactory {
     }
 
     if (hasMultilevelSwitch && !handledAsActuator) {
-      featureKinds.push('multilevel-switch');
+      /**
+       * Some coverings expose Multilevel Switch CC instead of Window Covering CC. Without this
+       * check they would be published as dimmable lights. WindowCoveringFeature already drives
+       * Multilevel Switch CC, so only the classification differs.
+       */
+      featureKinds.push(
+        multilevelSwitchDrivesCovering(node) ? 'window-covering' : 'multilevel-switch',
+      );
       handledAsActuator = true;
     }
 
