@@ -66,6 +66,25 @@ describe('homebridge-ui security key helpers', () => {
       S2_AccessControl_LR: '',
     });
   });
+
+  it('should carry the sleeping-device heal policy through to the saved config', () => {
+    const base = {
+      name: 'Plugin',
+      serialPort: '/dev/tty',
+      inclusionTimeoutSeconds: 60,
+      debug: false,
+      securityKeys: {},
+    };
+
+    expect(
+      buildPluginConfig({}, { ...base, healIncludesSleepingDevices: true }).config
+        .healIncludesSleepingDevices,
+    ).toBe(true);
+    expect(
+      buildPluginConfig({}, { ...base, healIncludesSleepingDevices: false }).config
+        .healIncludesSleepingDevices,
+    ).toBe(false);
+  });
 });
 
 describe('homebridge-ui HTML escaping', () => {

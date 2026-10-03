@@ -88,6 +88,12 @@
               "type": "boolean",
               "default": false,
               "description": "If true, redirects all Z-Wave JS driver logs to Homebridge."
+            },
+            "healIncludesSleepingDevices": {
+              "title": "Heal Network Includes Sleeping Devices",
+              "type": "boolean",
+              "default": false,
+              "description": "Heal Network rebuilds routes for devices that are always reachable and reports sleeping devices as skipped, so it finishes in a predictable time. Turn this on to rebuild sleeping devices too: each one is only reachable when it next wakes, so the run can take days and the inactivity timeout is disabled while it is on. Battery devices that listen frequently, such as many locks, stay reachable and are rebuilt either way. Dead devices and devices with priority return routes are always reported as skipped."
             }
           },
           "required": [
@@ -120,7 +126,7 @@
             "type": "fieldset",
             "title": "Advanced",
             "expandable": true,
-            "items": ["inclusionTimeoutSeconds", "debug"]
+            "items": ["inclusionTimeoutSeconds", "debug", "healIncludesSleepingDevices"]
           }
         ]
       }

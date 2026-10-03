@@ -1,4 +1,5 @@
 import { PlatformAccessory, Service, CharacteristicValue, Characteristic } from 'homebridge';
+import { RebuildRoutesStatus } from 'zwave-js';
 import { ZWaveUsbPlatform } from '../platform/ZWaveUsbPlatform';
 import { IZWaveController } from '../zwave/interfaces';
 import {
@@ -9,6 +10,14 @@ import {
   HAPPerm,
 } from '../platform/settings';
 import { NodeStatus } from '@zwave-js/core';
+import { formatRebuildRoutesSummary, summarizeRebuildRoutes } from '../zwave/rebuildRoutes';
+
+/**
+ * Deferral on the switch reset that follows a completed heal, added in 2.0.3 so HomeKit and the
+ * Homebridge UI register the change to Off. Kept rather than dropped, because nothing here can
+ * verify the controllers it was added for.
+ */
+const HEAL_SWITCH_RESET_DELAY_MS = 500;
 
 export const CONTROLLER_CACHE_REPAIR_VERSION = 2;
 
@@ -27,6 +36,12 @@ export class ControllerAccessory {
   private isInclusionActive = false;
   private isExclusionActive = false;
   private isHealActive = false;
+  private isHealStarting = false;
+  /**
+   * Incremented whenever the desired heal state changes. A start sequence re-reads it after
+   * every await and abandons itself if the user has since asked for something else.
+   */
+  private healGeneration = 0;
   private isPruneActive = false;
 
   // Track listeners for cleanup
@@ -405,22 +420,21 @@ export class ControllerAccessory {
         }
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
       },
-      'heal network progress': (progress: Map<number, unknown>) => {
-        const doneCount = Array.from(progress.values()).filter((v) => v !== 0).length;
-        const total = progress.size;
-        this.statusChar.updateValue(`Heal: ${doneCount}/${total}`);
-
-        // Safety: If we hit 100%, and the 'done' event hasn't fired yet, we'll wait for it.
-        // But if it stays at 100% and we are still 'active', the 'heal network done' handler will take care of it.
+      'heal network progress': (progress: ReadonlyMap<number, RebuildRoutesStatus>) => {
+        const summary = summarizeRebuildRoutes(progress);
+        this.statusChar.updateValue(`Heal: ${summary.completed}/${summary.total}`);
       },
-      'heal network done': () => {
-        this.platform.log.info('Controller event: Heal Network Done. Resetting UI switch.');
-        this.isHealActive = false;
-        // Use a slight delay to ensure HomeKit UI catches the state change correctly
-        setTimeout(() => {
-          this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
-          this.platform.log.debug('Heal Network switch set to OFF');
-        }, 500);
+      'heal network done': (result: ReadonlyMap<number, RebuildRoutesStatus>) => {
+        const summary = summarizeRebuildRoutes(result);
+        this.platform.log.info(
+          `Controller event: Heal Network Done - ${formatRebuildRoutesSummary(summary)}. ` +
+            'Resetting UI switch.',
+        );
+        this.resetHealSwitch(HEAL_SWITCH_RESET_DELAY_MS);
+      },
+      'heal network stopped': (reason: 'cancelled' | 'timeout') => {
+        this.platform.log.info(`Controller event: Heal Network ${reason}. Resetting UI switch.`);
+        this.resetHealSwitch();
       },
     };
 
@@ -474,15 +488,14 @@ export class ControllerAccessory {
     try {
       if (value) {
         const wasExclusionActive = this.isExclusionActive;
-        const wasHealActive = this.isHealActive;
+        const wasHealActive = this.isHealInFlight();
 
         this.isInclusionActive = true;
         this.isExclusionActive = false;
-        this.isHealActive = false;
+        this.resetHealSwitch();
         this.isPruneActive = false;
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
         this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
         // MUTEX: Turn off others
@@ -534,15 +547,14 @@ export class ControllerAccessory {
     try {
       if (value) {
         const wasInclusionActive = this.isInclusionActive;
-        const wasHealActive = this.isHealActive;
+        const wasHealActive = this.isHealInFlight();
 
         this.isExclusionActive = true;
         this.isInclusionActive = false;
-        this.isHealActive = false;
+        this.resetHealSwitch();
         this.isPruneActive = false;
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
         this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
 
         // MUTEX: Turn off others
@@ -581,46 +593,133 @@ export class ControllerAccessory {
     }
   }
 
-  private async handleSetHeal(value: CharacteristicValue) {
-    try {
-      if (value) {
-        const wasInclusionActive = this.isInclusionActive;
-        const wasExclusionActive = this.isExclusionActive;
+  /**
+   * Retires whatever heal is in flight and turns the switch off. Bumping the generation is what
+   * stops a start sequence that is still suspended on one of its awaits from going on to rebuild
+   * the mesh after the user has moved on to something else.
+   */
+  private resetHealSwitch(deferMs = 0): void {
+    this.healGeneration += 1;
+    this.isHealActive = false;
+    this.isHealStarting = false;
 
-        this.isHealActive = true;
-        this.isInclusionActive = false;
-        this.isExclusionActive = false;
-        this.isPruneActive = false;
-        this.healService.updateCharacteristic(this.platform.Characteristic.On, true);
-        this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
+    if (deferMs <= 0) {
+      this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
+      return;
+    }
 
-        // MUTEX
-        if (wasInclusionActive) {
-          await this.controller.stopInclusion();
-        }
-        if (wasExclusionActive) {
-          await this.controller.stopExclusion();
-        }
-
-        this.platform.log.info('Requesting Heal Network ON');
-        const started = await this.controller.startHealing();
-        if (!started) {
-          this.platform.log.warn(
-            'Heal start request returned false (possibly already active). Keeping UI state ON.',
-          );
-        }
-      } else {
-        this.platform.log.info('Requesting Heal Network OFF');
-        this.isHealActive = false;
-        this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
-        await this.controller.stopHealing();
+    const generation = this.healGeneration;
+    setTimeout(() => {
+      // A heal started inside the deferral window owns the switch now.
+      if (generation !== this.healGeneration) {
+        return;
       }
+      this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
+      this.platform.log.debug('Heal Network switch set to OFF');
+    }, deferMs).unref();
+  }
+
+  /** True when a heal is running or still starting, so a sibling switch has to stop it first. */
+  private isHealInFlight(): boolean {
+    return this.isHealActive || this.isHealStarting;
+  }
+
+  private async handleSetHeal(value: CharacteristicValue) {
+    if (!value) {
+      this.platform.log.info('Requesting Heal Network OFF');
+      this.resetHealSwitch();
+      try {
+        await this.controller.stopHealing();
+      } catch (err) {
+        this.platform.log.error('Failed to stop the network heal:', err);
+      }
+      return;
+    }
+
+    /**
+     * HomeKit can deliver the same ON write more than once. The in-flight flag is set before
+     * any await so a duplicate can never reach the controller and start a second rebuild.
+     */
+    if (this.isHealStarting || this.isHealActive) {
+      this.platform.log.info('Heal Network is already running; ignoring the duplicate ON request.');
+      this.healService.updateCharacteristic(this.platform.Characteristic.On, true);
+      return;
+    }
+
+    this.isHealStarting = true;
+    const generation = ++this.healGeneration;
+
+    try {
+      const wasInclusionActive = this.isInclusionActive;
+      const wasExclusionActive = this.isExclusionActive;
+
+      this.isInclusionActive = false;
+      this.isExclusionActive = false;
+      this.isPruneActive = false;
+      this.healService.updateCharacteristic(this.platform.Characteristic.On, true);
+      this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
+      this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
+      this.pruneService.updateCharacteristic(this.platform.Characteristic.On, false);
+
+      // MUTEX
+      if (wasInclusionActive) {
+        await this.controller.stopInclusion();
+      }
+      if (wasExclusionActive) {
+        await this.controller.stopExclusion();
+      }
+
+      /**
+       * Stopping inclusion or exclusion is a real round trip to the controller, and HomeKit
+       * delivers writes without waiting for the previous one, so the user can turn the switch
+       * back off while this sequence is suspended. Starting the rebuild anyway would run the
+       * very thing they just cancelled.
+       */
+      if (generation !== this.healGeneration) {
+        this.platform.log.info('Heal Network was cancelled before it started; not starting it.');
+        return;
+      }
+
+      this.platform.log.info('Requesting Heal Network ON');
+      const started = await this.controller.startHealing();
+
+      if (generation !== this.healGeneration) {
+        this.platform.log.info('Heal Network was cancelled while starting; stopping it again.');
+        await this.controller.stopHealing();
+        return;
+      }
+
+      /**
+       * Unlike inclusion and exclusion, which keep the switch on and let events converge, there
+       * is no event coming for either of these: nothing this plugin tracks is running, so the
+       * switch goes off rather than waiting. The two reasons are logged differently because
+       * `busy` means the mesh is being rebuilt, just not by this request.
+       */
+      if (started === 'busy') {
+        this.platform.log.warn(
+          'A route rebuild from an earlier request is still finishing, so this one did not ' +
+            'start. Try again once it has.',
+        );
+        this.resetHealSwitch();
+        return;
+      }
+
+      if (started === 'refused') {
+        this.platform.log.error(
+          'The controller did not start a network heal. Resetting the switch.',
+        );
+        this.resetHealSwitch();
+        return;
+      }
+
+      this.isHealActive = true;
     } catch (err) {
       this.platform.log.error('Failed to set heal state:', err);
-      this.isHealActive = false;
-      this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
+      this.resetHealSwitch();
+    } finally {
+      if (generation === this.healGeneration) {
+        this.isHealStarting = false;
+      }
     }
   }
 
@@ -629,16 +728,15 @@ export class ControllerAccessory {
       if (value) {
         const wasInclusionActive = this.isInclusionActive;
         const wasExclusionActive = this.isExclusionActive;
-        const wasHealActive = this.isHealActive;
+        const wasHealActive = this.isHealInFlight();
 
         this.isPruneActive = true;
         this.isInclusionActive = false;
         this.isExclusionActive = false;
-        this.isHealActive = false;
+        this.resetHealSwitch();
         this.pruneService.updateCharacteristic(this.platform.Characteristic.On, true);
         this.inclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
         this.exclusionService.updateCharacteristic(this.platform.Characteristic.On, false);
-        this.healService.updateCharacteristic(this.platform.Characteristic.On, false);
 
         /**
          * MUTEX FIX: Ensure only one management task is active.

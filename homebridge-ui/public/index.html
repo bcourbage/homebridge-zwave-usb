@@ -170,6 +170,19 @@
                 <input type="checkbox" class="form-check-input" id="debug" />
                 <label class="form-check-label" for="debug">Enable Verbose Driver Logging</label>
               </div>
+
+              <div class="form-check mt-3">
+                <input type="checkbox" class="form-check-input" id="healIncludesSleepingDevices" />
+                <label class="form-check-label" for="healIncludesSleepingDevices">
+                  Heal Network Includes Sleeping Devices
+                </label>
+                <div class="small text-muted">
+                  Off by default, so Heal Network finishes in a predictable time and reports
+                  sleeping devices as skipped. Turning it on rebuilds them too, which waits for
+                  each one to wake and can take days. Battery devices that stay reachable, such
+                  as many locks, are rebuilt either way.
+                </div>
+              </div>
             </fieldset>
           </form>
         </div>
@@ -284,6 +297,8 @@
           serialPort: document.getElementById('serialPort').value,
           inclusionTimeoutSeconds: getInt('inclusionTimeoutSeconds', 60),
           debug: document.getElementById('debug').checked,
+          healIncludesSleepingDevices: document.getElementById('healIncludesSleepingDevices')
+            .checked,
           securityKeys: {
             S0_Legacy: document.getElementById('S0_Legacy').value,
             S2_Unauthenticated: document.getElementById('S2_Unauthenticated').value,
@@ -555,6 +570,8 @@
         document.getElementById('inclusionTimeoutSeconds').value =
           config.inclusionTimeoutSeconds || 60;
         document.getElementById('debug').checked = config.debug || false;
+        document.getElementById('healIncludesSleepingDevices').checked =
+          config.healIncludesSleepingDevices || false;
 
         // Auto-save on change
         document.getElementById('configForm').addEventListener('input', updateConfig);

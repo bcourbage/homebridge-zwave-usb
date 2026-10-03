@@ -66,6 +66,7 @@
       serialPort: formValues.serialPort,
       inclusionTimeoutSeconds: formValues.inclusionTimeoutSeconds,
       debug: formValues.debug,
+      healIncludesSleepingDevices: formValues.healIncludesSleepingDevices,
     };
 
     if (!anySecurityKeysEntered) {

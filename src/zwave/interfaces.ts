@@ -9,6 +9,12 @@ import {
   SetValueResult,
 } from 'zwave-js';
 
+/**
+ * `busy` is distinct from `refused`: the driver is rebuilding routes from a request this plugin
+ * no longer tracks, so a rebuild is running even though this one did not start.
+ */
+export type HealStartResult = 'started' | 'busy' | 'refused';
+
 export interface ZWaveValueEvent {
   commandClass: number;
   endpoint?: number;
@@ -27,8 +33,10 @@ export interface IZWaveController extends EventEmitter {
   stopInclusion(): Promise<boolean>;
   startExclusion(): Promise<boolean>;
   stopExclusion(): Promise<boolean>;
-  startHealing(): Promise<boolean>;
+  startHealing(): Promise<HealStartResult>;
   stopHealing(): Promise<boolean>;
+  /** Whether a route rebuild this plugin started is still in progress. */
+  isHealing(): boolean;
   removeFailedNode(nodeId: number): Promise<void>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
@@ -52,6 +60,7 @@ export interface IZWaveController extends EventEmitter {
     event: 'heal network done',
     listener: (result: ReadonlyMap<number, RebuildRoutesStatus>) => void,
   ): this;
+  on(event: 'heal network stopped', listener: (reason: 'cancelled' | 'timeout') => void): this;
   on(event: 'node added', listener: (node: ZWaveNode) => void): this;
   on(event: 'node ready', listener: (node: ZWaveNode) => void): this;
   on(event: 'node updated', listener: (node: ZWaveNode) => void): this;

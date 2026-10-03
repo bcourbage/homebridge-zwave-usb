@@ -2,6 +2,7 @@ import { API, HAP, PlatformConfig } from 'homebridge';
 import { ZWaveUsbPlatform } from '../src/platform/ZWaveUsbPlatform';
 import { PLATFORM_NAME } from '../src/platform/settings';
 import { AccessoryFactory } from '../src/accessories/AccessoryFactory';
+import { ZWaveController } from '../src/zwave/ZWaveController';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
@@ -689,5 +690,34 @@ describe('ZWaveUsbPlatform', () => {
       [cachedAccessory],
     );
     expect((platform as any).accessories).toEqual([]);
+  });
+  it('should forward the sleeping-device heal policy to the controller', () => {
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const constructorMock = ZWaveController as unknown as jest.Mock;
+    const lastOptions = () => constructorMock.mock.calls[constructorMock.mock.calls.length - 1][2];
+
+    // PlatformConfig has an index signature, so a misspelled key would compile and read undefined.
+    new ZWaveUsbPlatform(
+      log,
+      {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+        healIncludesSleepingDevices: true,
+      } as PlatformConfig,
+      api,
+    );
+    expect(lastOptions()).toMatchObject({ healIncludesSleepingDevices: true });
+
+    new ZWaveUsbPlatform(
+      log,
+      {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      } as PlatformConfig,
+      api,
+    );
+    expect(lastOptions().healIncludesSleepingDevices).toBeUndefined();
   });
 });
