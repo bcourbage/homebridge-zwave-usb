@@ -13,11 +13,25 @@ interface BatteryContext {
   batteryLevels?: Record<string, number>;
 }
 
+/**
+ * Battery CC encodes "low battery warning" as level 0xFF rather than as a percentage. Treating
+ * it as a number means clamping it to 100, which reports a flat battery as a full one.
+ */
+const BATTERY_LOW_WARNING_LEVEL = 0xff;
+
 export class BatteryFeature extends BaseFeature {
   private service!: Service;
   private lastKnownLevel?: number;
   private refreshInFlight = false;
   private lastRefreshAt = 0;
+  /** The device last reported the low-battery warning sentinel rather than a percentage. */
+  private lowBatteryWarning = false;
+  /**
+   * The percentage that was current when the sentinel arrived, used to tell a passive resync
+   * apart from a fresh reading. zwave-js keeps its cached percentage when a report carries
+   * 0xFF, so re-reading that same value is not evidence that the battery recovered.
+   */
+  private levelAtWarning?: number;
 
   constructor(
     platform: ZWaveUsbPlatform,
@@ -68,6 +82,12 @@ export class BatteryFeature extends BaseFeature {
     if (args && args.commandClass === CommandClasses.Notification) {
       const alarmState = this.getLowBatteryAlarmStateFromEvent(args);
       if (alarmState !== undefined) {
+        // The notification is newer than any remembered sentinel, so it settles it. Without
+        // this the pushed value and a subsequent read of the same characteristic disagree.
+        this.lowBatteryWarning = alarmState;
+        if (!alarmState) {
+          this.levelAtWarning = undefined;
+        }
         this.service.updateCharacteristic(
           this.platform.Characteristic.StatusLowBattery,
           alarmState
@@ -81,6 +101,10 @@ export class BatteryFeature extends BaseFeature {
     const cachedLevel = this.readCachedLevel();
 
     if (cachedLevel !== undefined) {
+      if (this.lowBatteryWarning && this.supersedesWarning(args, cachedLevel)) {
+        this.lowBatteryWarning = false;
+        this.levelAtWarning = undefined;
+      }
       this.platform.log.debug(
         `Battery [Node ${this.node.nodeId} endpoint ${this.endpoint.index}]: ` +
           `report with numeric level ${cachedLevel}%.`,
@@ -153,11 +177,48 @@ export class BatteryFeature extends BaseFeature {
       return;
     }
 
+    if (report.level === BATTERY_LOW_WARNING_LEVEL) {
+      /**
+       * 0xFF is the low-battery warning, not 255 percent. The percentage is unknown, so the last
+       * known one is kept if there is one, and the warning is published either way.
+       */
+      this.lowBatteryWarning = true;
+      this.levelAtWarning = this.lastKnownLevel;
+      this.platform.log.warn(
+        `${label}: report says the battery is low without giving a level (${reason}).`,
+      );
+      this.publishLastKnownLevel();
+      return;
+    }
+
+    this.lowBatteryWarning = false;
+    this.levelAtWarning = undefined;
 
     this.platform.log.debug(
       `${label}: report received with numeric level ${report.level}% (${reason}).`,
     );
     this.publishLevel(report.level);
+  }
+
+  /**
+   * Whether a level update is evidence that the remembered low-battery warning no longer holds.
+   *
+   * A report the device just sent settles the question by itself: a percentage supersedes the
+   * warning even when it equals the level the sentinel interrupted, and the sentinel restates
+   * the warning rather than lifting it. A passive resync brings no new report, and zwave-js
+   * replaces 0xFF with the previous percentage before persisting it, so an unchanged cached
+   * value there is the sentinel's own aftermath rather than a fresh reading.
+   */
+  private supersedesWarning(args: ZWaveValueEvent | undefined, cachedLevel: number): boolean {
+    if (
+      args?.commandClass === CommandClasses.Battery &&
+      args.property === 'level' &&
+      typeof args.newValue === 'number'
+    ) {
+      return args.newValue !== BATTERY_LOW_WARNING_LEVEL;
+    }
+
+    return cachedLevel !== this.levelAtWarning;
   }
 
   private readCachedLevel(): number | undefined {
@@ -192,7 +253,20 @@ export class BatteryFeature extends BaseFeature {
   }
 
   private publishLastKnownLevel(): void {
-    if (this.lastKnownLevel === undefined || !this.service) {
+    if (!this.service) {
+      return;
+    }
+
+    /**
+     * The low-battery warning is publishable even when no percentage has ever been known, so the
+     * status is refreshed before the level is considered.
+     */
+    const lowBattery = this.resolveStatusLowBattery(this.lastKnownLevel);
+    if (lowBattery !== undefined) {
+      this.service.updateCharacteristic(this.platform.Characteristic.StatusLowBattery, lowBattery);
+    }
+
+    if (this.lastKnownLevel === undefined) {
       return;
     }
 
@@ -222,6 +296,10 @@ export class BatteryFeature extends BaseFeature {
    * percentage: zero is a real battery level and must never stand in for "unknown".
    */
   private resolveStatusLowBattery(level: number | undefined): number | undefined {
+    if (this.lowBatteryWarning) {
+      return this.platform.Characteristic.StatusLowBattery.BATTERY_LEVEL_LOW;
+    }
+
     const alarmState = this.getLowBatteryAlarmStateFromCache();
     if (alarmState !== undefined) {
       return alarmState
