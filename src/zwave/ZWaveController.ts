@@ -1,16 +1,38 @@
 import { Logger } from 'homebridge';
-import { Driver, ZWaveNode, InclusionStrategy } from 'zwave-js';
+import { Driver, ZWaveNode, InclusionStrategy, RebuildRoutesStatus } from 'zwave-js';
 import { CommandClasses } from '@zwave-js/core';
 import { EventEmitter } from 'events';
-import { IZWaveController, ZWaveValueEvent } from './interfaces';
+import { HealStartResult, IZWaveController, ZWaveValueEvent } from './interfaces';
+import { formatRebuildRoutesSummary, summarizeRebuildRoutes } from './rebuildRoutes';
 import path from 'path';
 import fs from 'fs';
 
 const MANUFACTURER_SPECIFIC_SERIAL_NUMBER_TYPE = 1;
 
+/**
+ * How long a route rebuild may go without reporting progress before it is treated as wedged.
+ * This is an inactivity timeout rather than a total-runtime cap: a large network can legitimately
+ * take much longer than any fixed budget, and cancelling a rebuild that is still working would
+ * leave nodes with stale routes.
+ */
+const REBUILD_ROUTES_IDLE_TIMEOUT_MS = 10 * 60 * 1000;
+
+/** How long the status characteristic keeps showing how a heal ended before going back to idle. */
+const HEAL_STATUS_LINGER_MS = 5000;
+
+type HealState = 'idle' | 'starting' | 'active';
+
 export interface ZWaveControllerOptions {
   debug?: boolean;
   storagePath?: string;
+  /**
+   * Include sleeping devices in a Heal Network run. Off by default: a sleeping node's rebuild
+   * waits on `waitForWakeup()` before doing any work, so one of them holds the rebuild open
+   * until it happens to wake, and the operation stops looking finite to the user. Turning it on
+   * also disables the inactivity watchdog, because the driver reports no progress at all while
+   * it waits for a device to wake.
+   */
+  healIncludesSleepingDevices?: boolean;
   securityKeys?: {
     S0_Legacy?: string;
     S2_Unauthenticated?: string;
@@ -29,7 +51,9 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
   private driver: Driver | undefined;
   public readonly nodes = new Map<number, ZWaveNode>();
   private pendingS2Pin: string | undefined;
-  private healSafetyTimer: NodeJS.Timeout | undefined;
+  private healState: HealState = 'idle';
+  private healWatchdog: NodeJS.Timeout | undefined;
+  private healStatusLinger: NodeJS.Timeout | undefined;
 
   private nodeListeners = new Map<
     number,
@@ -100,35 +124,41 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
             this.emit('status updated', 'Driver Ready');
             this.emit('exclusion stopped');
           },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          'rebuild routes progress': (progress: any) => {
-            const done = Array.from(progress.values()).filter((v) => v !== 0).length;
-            const total = progress.size;
-            this.log.info(`Heal Network Progress: ${done}/${total} nodes completed`);
-            this.emit('status updated', `Heal: ${done}/${total}`);
-            this.emit('heal network progress', progress);
+          'rebuild routes progress': (progress: ReadonlyMap<number, RebuildRoutesStatus>) => {
+            /**
+             * Only a heal this plugin started counts. Cancelling one leaves the library's task
+             * briefly alive, and it emits a last progress event on its way out; treating that as
+             * evidence of a running rebuild would revive a heal the user had just stopped.
+             */
+            if (this.healState === 'idle') {
+              return;
+            }
 
-            // Safety: if we are at 100%, but no 'done' event arrives within 5s, auto-complete
-            if (done === total && total > 0) {
-              if (this.healSafetyTimer) {
-                clearTimeout(this.healSafetyTimer);
-              }
-              this.healSafetyTimer = setTimeout(() => {
-                this.log.info('Heal Network Safety Timeout: Triggering completion.');
-                // eslint-disable-next-line @typescript-eslint/no-explicit-any
-                (this.driver?.controller as any).emit('rebuild routes done', new Map());
-              }, 5000);
-            }
+            // Progress is the evidence that the rebuild is still working, so it restarts the clock.
+            this.startHealWatchdog();
+
+            const summary = summarizeRebuildRoutes(progress);
+            this.log.info(`Heal Network Progress: ${formatRebuildRoutesSummary(summary)}`);
+            this.emit('status updated', `Heal: ${summary.completed}/${summary.total}`);
+            this.emit('heal network progress', progress);
           },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          'rebuild routes done': (result: any) => {
-            if (this.healSafetyTimer) {
-              clearTimeout(this.healSafetyTimer);
-              this.healSafetyTimer = undefined;
+          'rebuild routes done': (result: ReadonlyMap<number, RebuildRoutesStatus>) => {
+            /**
+             * A cancelled rebuild can outlive the stop that was supposed to end it, and it
+             * finishes against a progress map the driver already cleared. Reporting that as a
+             * completion would announce a fabricated 100%, which is what this handler exists
+             * to stop doing.
+             */
+            if (this.healState === 'idle') {
+              return;
             }
-            this.log.info('Heal Network Complete');
-            this.emit('status updated', 'Heal Network Done');
-            setTimeout(() => this.emit('status updated', 'Driver Ready'), 5000);
+
+            this.clearHealWatchdog();
+            this.healState = 'idle';
+
+            const summary = summarizeRebuildRoutes(result);
+            this.log.info(`Heal Network Complete: ${formatRebuildRoutesSummary(summary)}`);
+            this.announceHealEnded('Heal Network Done');
             this.emit('heal network done', result);
           },
           'node added': (node: ZWaveNode) => {
@@ -647,10 +677,8 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
 
   public async stop(): Promise<void> {
     this.log.debug('Stopping Z-Wave controller and cleaning up listeners...');
-    if (this.healSafetyTimer) {
-      clearTimeout(this.healSafetyTimer);
-      this.healSafetyTimer = undefined;
-    }
+    this.clearHealWatchdog();
+    this.healState = 'idle';
     for (const [nodeId, node] of this.nodes) {
       const listeners = this.nodeListeners.get(nodeId);
       if (listeners) {
@@ -779,18 +807,76 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
     }
   }
 
-  public async startHealing(): Promise<boolean> {
+  /**
+   * Whether a route rebuild this plugin started is still in progress. This is the plugin's own
+   * view of the lifecycle, which can differ from the driver's: see `startHealing` for why.
+   */
+  public isHealing(): boolean {
+    return this.healState !== 'idle';
+  }
+
+  /**
+   * Starts a route rebuild. `started` covers a rebuild this plugin owns, including one already
+   * running from an earlier request here. `busy` means the driver is still rebuilding from a
+   * request this plugin no longer tracks, which is a different situation for the caller: work
+   * is happening, it just is not this one. A second request never starts a second rebuild.
+   */
+  public async startHealing(): Promise<HealStartResult> {
     if (!this.driver) {
-      return false;
+      return 'refused';
     }
+
+    if (this.healState !== 'idle') {
+      this.log.info(
+        `Z-Wave Controller: Heal already ${this.healState}; ignoring duplicate start request.`,
+      );
+      return 'started';
+    }
+
+    /**
+     * The driver is the authority on whether a rebuild is running, and it can disagree with this
+     * plugin. `stopRebuildingRoutes` removes the task asynchronously, and when the parent task is
+     * waiting on a node it is not in the scheduler's queue to be removed, so it resumes and keeps
+     * rebuilding the nodes that are left. Starting another rebuild on top of that one would run
+     * two in parallel over the same mesh.
+     */
+    if (this.driver.controller.isRebuildingRoutes === true) {
+      this.log.warn(
+        'Z-Wave Controller: The driver is still rebuilding routes from an earlier request, so ' +
+          'this one was not started. Try again once it has finished.',
+      );
+      return 'busy';
+    }
+
+    this.healState = 'starting';
     this.log.info('Z-Wave Controller: Requesting rebuild of all routes (Network Heal)...');
+
     try {
-      const started = await this.driver.controller.beginRebuildingRoutes();
-      this.log.info(`Z-Wave Controller: Heal started: ${started}`);
-      return started;
+      /**
+       * Sleeping nodes are skipped: zwave-js would otherwise hold the rebuild open until every
+       * sleepy device happens to wake up, which can take days and never reports completion.
+       */
+      const started = this.driver.controller.beginRebuildingRoutes({
+        includeSleeping: this.options.healIncludesSleepingDevices === true,
+      });
+
+      if (!started) {
+        // An already-running rebuild was handled above, so this is a genuine refusal.
+        this.healState = 'idle';
+        this.clearHealWatchdog();
+        this.log.warn('Z-Wave Controller: The controller refused to start a route rebuild.');
+        return 'refused';
+      }
+
+      this.healState = 'active';
+      this.startHealWatchdog();
+      this.log.info('Z-Wave Controller: Heal started.');
+      return 'started';
     } catch (err) {
+      this.healState = 'idle';
+      this.clearHealWatchdog();
       this.log.error('Failed to start network heal:', err);
-      return false;
+      return 'refused';
     }
   }
 
@@ -799,13 +885,115 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
       return false;
     }
     this.log.info('Z-Wave Controller: Requesting to stop network heal...');
+    this.clearHealWatchdog();
+
     try {
-      const stopped = await this.driver.controller.stopRebuildingRoutes();
+      const stopped = this.driver.controller.stopRebuildingRoutes();
       this.log.info(`Z-Wave Controller: Heal stopped: ${stopped}`);
       return stopped;
     } catch (err) {
       this.log.error('Failed to stop network heal:', err);
       return false;
+    } finally {
+      /**
+       * The library reports nothing when a rebuild is cancelled, so the lifecycle is closed
+       * optimistically here. Only announce it if one was actually running: an OFF write against
+       * an idle switch, or a mutex path, must not look like a cancellation.
+       */
+      const wasRunning = this.healState !== 'idle';
+      this.healState = 'idle';
+      if (wasRunning) {
+        this.announceHealEnded('Heal Network Stopped');
+        this.emit('heal network stopped', 'cancelled');
+      }
+    }
+  }
+
+  /**
+   * Reports how a heal ended and then returns the status to idle, so a cancelled or timed-out
+   * heal does not leave its last progress count on the characteristic indefinitely.
+   *
+   * The pending reset belongs to the heal that ended. A new heal started inside the window
+   * cancels it, and the callback checks again on the way out, so one heal's epilogue can never
+   * overwrite the next one's progress.
+   */
+  private announceHealEnded(status: string): void {
+    this.clearHealStatusLinger();
+    this.emit('status updated', status);
+    this.healStatusLinger = setTimeout(() => {
+      this.healStatusLinger = undefined;
+      if (this.healState !== 'idle') {
+        return;
+      }
+      this.emit('status updated', 'Driver Ready');
+    }, HEAL_STATUS_LINGER_MS);
+    this.healStatusLinger.unref();
+  }
+
+  private clearHealStatusLinger(): void {
+    if (this.healStatusLinger) {
+      clearTimeout(this.healStatusLinger);
+      this.healStatusLinger = undefined;
+    }
+  }
+
+  private startHealWatchdog(): void {
+    this.clearHealWatchdog();
+
+    /**
+     * With sleeping devices included the driver emits nothing at all while it waits for one to
+     * wake, so an inactivity watchdog would cancel a rebuild that is working exactly as asked.
+     * The heal switch remains the way out of a run that is taking too long.
+     */
+    if (this.options.healIncludesSleepingDevices === true) {
+      return;
+    }
+    this.healWatchdog = setTimeout(() => {
+      void this.handleHealTimeout().catch((err) => {
+        this.log.error(
+          `Network heal timeout handling failed: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      });
+    }, REBUILD_ROUTES_IDLE_TIMEOUT_MS);
+    this.healWatchdog.unref();
+  }
+
+  /**
+   * Ends a heal that never reported completion. Stopping the rebuild can itself fail, and the
+   * lifecycle has to close either way, so the failure is logged and the timeout is still
+   * reported rather than being left to surface as an unhandled rejection.
+   */
+  private async handleHealTimeout(): Promise<void> {
+    this.healWatchdog = undefined;
+    if (this.healState === 'idle') {
+      return;
+    }
+
+    this.log.error(
+      `Network heal reported no progress for ${Math.round(
+        REBUILD_ROUTES_IDLE_TIMEOUT_MS / 60000,
+      )} minutes. Stopping it and reporting a timeout.`,
+    );
+    this.healState = 'idle';
+
+    try {
+      this.driver?.controller.stopRebuildingRoutes();
+    } catch (err) {
+      this.log.error(
+        `Failed to stop the timed-out heal: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    this.announceHealEnded('Heal Network Timed Out');
+    this.emit('heal network stopped', 'timeout');
+  }
+
+  private clearHealWatchdog(): void {
+    if (this.healWatchdog) {
+      clearTimeout(this.healWatchdog);
+      this.healWatchdog = undefined;
     }
   }
 
