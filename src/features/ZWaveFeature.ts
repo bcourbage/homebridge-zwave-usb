@@ -6,7 +6,7 @@ import { ZWaveUsbPlatform } from '../platform/ZWaveUsbPlatform';
 import { describeSetValueResult } from '../zwave/setValueResult';
 
 /** HAP SERVICE_COMMUNICATION_FAILURE. */
-const HAP_COMMUNICATION_FAILURE = -70402;
+export const HAP_COMMUNICATION_FAILURE = -70402;
 
 export interface ActuatorWrite {
   /** HomeKit characteristic being written, used for log correlation. */

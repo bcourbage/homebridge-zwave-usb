@@ -17,6 +17,7 @@ Finalized architecture and decisions for the Z-Wave USB platform plugin.
 - `src/accessories/ZWaveAccessory.ts`: Encapsulates a Z-Wave node as a HomeKit accessory.
 - `src/accessories/ControllerAccessory.ts`: Provides Inclusion/Exclusion/Heal switches in HomeKit.
 - `src/features/*`: Implementation of specific HomeKit services (Switch, Lock, Sensors, etc.).
+- `src/zwave/nodeApi.ts`: Runtime accessors for Command Class APIs that are not part of the node interface, so node mocks stay small.
 
 ## Key Features
 
