@@ -37,6 +37,8 @@ A high-performance, production-grade [Homebridge](https://homebridge.io) integra
 
 ## 📦 Prerequisites & Linux Setup
 
+Version 4 requires Node.js **22.12 or later in the Node 22 line**, Node **24**, or Node **26**. Node 18 and 20 are no longer supported because the installed dependencies require newer runtimes. Upgrade Node before installing v4.
+
 ### 1. Hardware
 - A compatible Z-Wave USB Stick (e.g., **Aeotec Z-Stick Gen5/Gen7**, **Zooz 800 Series**, **Silicon Labs UZB**).
 - A host system running Homebridge (Raspberry Pi, Linux, macOS, or Windows).

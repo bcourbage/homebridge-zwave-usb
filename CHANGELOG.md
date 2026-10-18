@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [4.0.0] - 2026-10-18
+
+### Breaking changes
+- Require Node 22.12+, 24, or 26 to match the locked dependency requirements. Node 18 and 20 are no longer supported (#12). Upgrade Node before installing v4.
+
+### Added
+- Node 26 support and CI coverage for Node 22.12.0, latest 22, 24, and 26 (#13, #12).
+- An Advanced option to include sleeping devices in Heal Network (#10).
+
+### Fixed
+- Count actual terminal heal statuses, wait for driver completion, prevent duplicate starts, honor cancellation during startup, and time out runs after ten minutes without progress (#10).
+- Publish the Springs Window Fashions RSZ1 as a window covering and remove its superseded Lightbulb service without removing unrelated services (#11).
+- Report unknown battery levels as unavailable, retain last-known percentages across restarts, and publish low-battery warnings from Battery Get reports containing 0xFF (#14).
+
+### Upgrade notes
+- Heal Network skips sleeping devices by default. Enable Heal Network Includes Sleeping Devices to restore their inclusion; the inactivity timeout is disabled for those runs. Driver cancellation remains best effort while an earlier rebuild drains.
+- Rebuild HomeKit scenes and automations that referenced an RSZ1's old Lightbulb service against its new WindowCovering service. The accessory identity is preserved.
+- Battery reporting may send additional event-driven Battery Get requests, with a ten-minute minimum interval per feature endpoint. Sleeping devices respond when they wake; retained percentages are last-known readings.
+
+Thanks to Bruno Courbage (@bcourbage) for the heal, shade, and battery fixes and the engine-floor report, and Joshua Appleman (@applemanj) for Node 26 support and expanded CI.
+
 ## [3.6.8] - 2026-09-24
 
 ### Fixed
