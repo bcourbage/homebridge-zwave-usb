@@ -8,6 +8,8 @@ import { IZWaveNode } from '../../src/zwave/interfaces';
 import { ContactSensorFeature } from '../../src/features/ContactSensorFeature';
 import { MotionSensorFeature } from '../../src/features/MotionSensorFeature';
 import { SmokeSensorFeature } from '../../src/features/SmokeSensorFeature';
+import { MultilevelSwitchFeature } from '../../src/features/MultilevelSwitchFeature';
+import { WindowCoveringFeature } from '../../src/features/WindowCoveringFeature';
 
 describe('AccessoryFactory', () => {
   let platform: any;
@@ -417,6 +419,154 @@ describe('AccessoryFactory', () => {
     expect(hasMotion).toBe(false);
 
     addFeatureSpy.mockRestore();
+  });
+
+  describe('Multilevel Switch classification', () => {
+    const multilevelSwitchEndpoint = () => ({
+      index: 0,
+      supportsCC: jest.fn().mockImplementation((cc) => cc === CommandClasses['Multilevel Switch']),
+    });
+
+    const definedValues = [
+      {
+        endpoint: 0,
+        commandClass: CommandClasses['Multilevel Switch'],
+        property: 'currentValue',
+      },
+    ];
+
+    it('should classify the RSZ1 shade as a window covering despite exposing Multilevel Switch', () => {
+      const addFeatureSpy = jest.spyOn(ZWaveAccessory.prototype, 'addFeature');
+
+      node.manufacturerId = 0x026e;
+      node.productType = 0x5253;
+      node.productId = 0x5a31;
+      node.getAllEndpoints.mockReturnValue([multilevelSwitchEndpoint()]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      expect(AccessoryFactory.getGraphSignature(node as IZWaveNode)).toContain('window-covering');
+
+      AccessoryFactory.create(platform, node as IZWaveNode, 123);
+
+      expect(
+        addFeatureSpy.mock.calls.some(([feature]) => feature instanceof WindowCoveringFeature),
+      ).toBe(true);
+      expect(
+        addFeatureSpy.mock.calls.some(([feature]) => feature instanceof MultilevelSwitchFeature),
+      ).toBe(false);
+
+      addFeatureSpy.mockRestore();
+    });
+
+    it('should assign the WINDOW_COVERING category to the RSZ1 shade', () => {
+      node.manufacturerId = 0x026e;
+      node.productType = 0x5253;
+      node.productId = 0x5a31;
+      node.getAllEndpoints.mockReturnValue([multilevelSwitchEndpoint()]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      AccessoryFactory.create(platform, node as IZWaveNode, 123);
+
+      expect(platform.api.platformAccessory).toHaveBeenCalledWith(
+        expect.any(String),
+        'test-uuid',
+        Categories.WINDOW_COVERING,
+      );
+    });
+
+    it('should keep an ordinary dimmer classified as a light', () => {
+      const addFeatureSpy = jest.spyOn(ZWaveAccessory.prototype, 'addFeature');
+
+      node.manufacturerId = 0x0086;
+      node.productType = 0x0003;
+      node.productId = 0x0062;
+      node.getAllEndpoints.mockReturnValue([multilevelSwitchEndpoint()]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      expect(AccessoryFactory.getGraphSignature(node as IZWaveNode)).toContain('multilevel-switch');
+
+      AccessoryFactory.create(platform, node as IZWaveNode, 123);
+
+      expect(
+        addFeatureSpy.mock.calls.some(([feature]) => feature instanceof MultilevelSwitchFeature),
+      ).toBe(true);
+      expect(
+        addFeatureSpy.mock.calls.some(([feature]) => feature instanceof WindowCoveringFeature),
+      ).toBe(false);
+      expect(platform.api.platformAccessory).toHaveBeenCalledWith(
+        expect.any(String),
+        'test-uuid',
+        Categories.LIGHTBULB,
+      );
+
+      addFeatureSpy.mockRestore();
+    });
+
+    it('should leave an unrecognised motor classified as a light', () => {
+      // Only a verified fingerprint reclassifies a device, because swapping the HomeKit service
+      // breaks the automations built on the old one.
+      node.manufacturerId = 0x1234;
+      node.productType = 0x0001;
+      node.productId = 0x0001;
+      node.getAllEndpoints.mockReturnValue([multilevelSwitchEndpoint()]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      expect(AccessoryFactory.getGraphSignature(node as IZWaveNode)).toContain('multilevel-switch');
+      expect(AccessoryFactory.getGraphSignature(node as IZWaveNode)).not.toContain(
+        'window-covering',
+      );
+    });
+
+    it('should publish one covering when an overridden device also implements the CC', () => {
+      node.manufacturerId = 0x026e;
+      node.productType = 0x5253;
+      node.productId = 0x5a31;
+      node.getAllEndpoints.mockReturnValue([
+        {
+          index: 0,
+          supportsCC: jest
+            .fn()
+            .mockImplementation(
+              (cc) =>
+                cc === CommandClasses['Window Covering'] ||
+                cc === CommandClasses['Multilevel Switch'],
+            ),
+        },
+      ]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      const signature = AccessoryFactory.getGraphSignature(node as IZWaveNode);
+      expect(signature.match(/window-covering/g)).toHaveLength(1);
+      expect(signature).not.toContain('multilevel-switch');
+    });
+
+    it('should prefer Window Covering CC when the device implements it', () => {
+      const addFeatureSpy = jest.spyOn(ZWaveAccessory.prototype, 'addFeature');
+
+      node.getAllEndpoints.mockReturnValue([
+        {
+          index: 0,
+          supportsCC: jest
+            .fn()
+            .mockImplementation(
+              (cc) =>
+                cc === CommandClasses['Window Covering'] ||
+                cc === CommandClasses['Multilevel Switch'],
+            ),
+        },
+      ]);
+      node.getDefinedValueIDs.mockReturnValue(definedValues);
+
+      const signature = AccessoryFactory.getGraphSignature(node as IZWaveNode);
+      AccessoryFactory.create(platform, node as IZWaveNode, 123);
+
+      expect(JSON.parse(signature)[0].features).toEqual(['window-covering']);
+      expect(
+        addFeatureSpy.mock.calls.filter(([feature]) => feature instanceof WindowCoveringFeature),
+      ).toHaveLength(1);
+
+      addFeatureSpy.mockRestore();
+    });
   });
 
   it('should keep graph signature and attached features aligned for notification-backed sensors', () => {

@@ -444,10 +444,16 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     if (existing || this.discoveryInFlight.has(node.nodeId)) {
       if (existing) {
         if (node.ready && !existing.isInitialized()) {
+          /**
+           * The accessory was materialised from the HomeKit cache before the interview finished,
+           * so its services still describe whatever the previous run believed the node to be.
+           * Building the graph again replaces the stored signature, which is why the reconcile
+           * has to be requested here rather than inferred from a later comparison.
+           */
           existing.stop();
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId);
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
-          hydratedAccessory.initialize();
+          hydratedAccessory.initialize({ removeSupersededServices: true });
           return;
         }
 
@@ -496,7 +502,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       this.zwaveAccessories.set(node.nodeId, accessory);
 
       if (node.ready) {
-        accessory.initialize(); // Initialize first to create functional services
+        /**
+         * A cached accessory can still carry services from a previous plugin version whose
+         * classification differed, so the graph is reconciled as part of the first build.
+         */
+        accessory.initialize({ removeSupersededServices: true });
       } else {
         accessory.refresh();
       }

@@ -720,4 +720,100 @@ describe('ZWaveUsbPlatform', () => {
     );
     expect(lastOptions().healIncludesSleepingDevices).toBeUndefined();
   });
+  it('should reconcile the service graph when hydrating a cached accessory that becomes ready', () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const node = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      deviceConfig: { label: 'RSZ1', manufacturer: 'Springs Window Fashions' },
+      ready: true,
+      status: 4,
+      getDefinedValueIDs: jest.fn().mockReturnValue([]),
+      getAllEndpoints: jest
+        .fn()
+        .mockReturnValue([{ index: 0, supportsCC: jest.fn().mockReturnValue(false) }]),
+      getValueMetadata: jest.fn(),
+      getValue: jest.fn(),
+      supportsCC: jest.fn().mockReturnValue(false),
+    };
+
+    // The accessory was materialised from the cache while the node was still interviewing.
+    const existing = {
+      isInitialized: jest.fn().mockReturnValue(false),
+      getGraphSignature: jest.fn().mockReturnValue('cached-graph'),
+      stop: jest.fn(),
+      updateNode: jest.fn(),
+      refresh: jest.fn(),
+    };
+    const hydrated = { initialize: jest.fn(), stop: jest.fn() };
+
+    (platform as any).zwaveController.homeId = 100;
+    (platform as any).zwaveAccessories.set(5, existing);
+
+    const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(hydrated as any);
+
+    try {
+      (platform as any).handleNodeReady(node);
+
+      expect(existing.stop).toHaveBeenCalled();
+      expect(hydrated.initialize).toHaveBeenCalledWith({ removeSupersededServices: true });
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
+
+  it('should reconcile the service graph when first building a ready node from cache', () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const node = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      deviceConfig: { label: 'RSZ1', manufacturer: 'Springs Window Fashions' },
+      ready: true,
+      status: 4,
+      getDefinedValueIDs: jest.fn().mockReturnValue([]),
+      getAllEndpoints: jest
+        .fn()
+        .mockReturnValue([{ index: 0, supportsCC: jest.fn().mockReturnValue(false) }]),
+      getValueMetadata: jest.fn(),
+      getValue: jest.fn(),
+      supportsCC: jest.fn().mockReturnValue(false),
+    };
+
+    const created = { initialize: jest.fn(), stop: jest.fn(), refresh: jest.fn() };
+    (platform as any).zwaveController.homeId = 100;
+
+    const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(created as any);
+
+    try {
+      (platform as any).handleNodeReady(node);
+
+      expect(created.initialize).toHaveBeenCalledWith({ removeSupersededServices: true });
+    } finally {
+      createSpy.mockRestore();
+    }
+  });
 });
