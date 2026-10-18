@@ -74,6 +74,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         securityKeys: this.config.securityKeys,
         debug: this.config.debug,
         storagePath: this.api.user.storagePath(),
+        healIncludesSleepingDevices: this.config.healIncludesSleepingDevices,
       });
 
       // Setup listeners

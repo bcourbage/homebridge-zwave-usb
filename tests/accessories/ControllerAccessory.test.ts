@@ -118,7 +118,7 @@ mockController.startInclusion = jest.fn().mockResolvedValue(true);
 mockController.stopInclusion = jest.fn().mockResolvedValue(true);
 mockController.startExclusion = jest.fn().mockResolvedValue(true);
 mockController.stopExclusion = jest.fn().mockResolvedValue(true);
-mockController.startHealing = jest.fn().mockResolvedValue(true);
+mockController.startHealing = jest.fn().mockResolvedValue('started');
 mockController.stopHealing = jest.fn().mockResolvedValue(true);
 mockController.removeFailedNode = jest.fn().mockResolvedValue(undefined);
 mockController.setS2Pin = jest.fn();
@@ -191,31 +191,245 @@ describe('ControllerAccessory', () => {
     expect(mockController.removeFailedNode).toHaveBeenCalledWith(5);
   });
 
+  it('should start only one heal for duplicate ON writes', async () => {
+    await Promise.all([
+      (accessory as any).handleSetHeal(true),
+      (accessory as any).handleSetHeal(true),
+      (accessory as any).handleSetHeal(true),
+    ]);
+
+    expect(mockController.startHealing).toHaveBeenCalledTimes(1);
+  });
+
+  it('should not start a second heal while one is already active', async () => {
+    await (accessory as any).handleSetHeal(true);
+    mockController.startHealing.mockClear();
+
+    await (accessory as any).handleSetHeal(true);
+
+    expect(mockController.startHealing).not.toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(true);
+  });
+
+  it('should not start a heal the user cancelled while inclusion was being stopped', async () => {
+    let releaseStopInclusion: () => void = () => undefined;
+    mockController.stopInclusion.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseStopInclusion = () => resolve(true);
+        }),
+    );
+    (accessory as any).isInclusionActive = true;
+
+    const on = (accessory as any).handleSetHeal(true);
+    await (accessory as any).handleSetHeal(false);
+    releaseStopInclusion();
+    await on;
+
+    expect(mockController.startHealing).not.toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(false);
+    expect((accessory as any).healService.updateCharacteristic).toHaveBeenLastCalledWith(
+      mockPlatform.Characteristic.On,
+      false,
+    );
+  });
+
+  it('should not start a heal that inclusion cancelled while it was still starting', async () => {
+    /**
+     * The sibling switches have to see a heal that is still starting, not only one that has
+     * already begun. Otherwise turning inclusion on during the mutex round trip lets the heal
+     * resume afterwards and rebuild the mesh with inclusion mode open.
+     */
+    let releaseStopExclusion: () => void = () => undefined;
+    mockController.stopExclusion.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseStopExclusion = () => resolve(true);
+        }),
+    );
+    (accessory as any).isExclusionActive = true;
+
+    const healOn = (accessory as any).handleSetHeal(true);
+    await (accessory as any).handleSetInclusion(true);
+    releaseStopExclusion();
+    await healOn;
+
+    expect(mockController.startHealing).not.toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(false);
+  });
+
+  it.each([
+    ['exclusion', 'handleSetExclusion'],
+    ['prune', 'handleSetPrune'],
+  ])('should cancel a starting heal when %s is turned on', async (_name, handler) => {
+    let releaseStopInclusion: () => void = () => undefined;
+    mockController.stopInclusion.mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          releaseStopInclusion = () => resolve(true);
+        }),
+    );
+    (accessory as any).isInclusionActive = true;
+
+    const healOn = (accessory as any).handleSetHeal(true);
+    await (accessory as any)[handler](true);
+    releaseStopInclusion();
+    await healOn;
+
+    expect(mockController.startHealing).not.toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(false);
+  });
+
+  it('should stop a running heal when a sibling mode is turned on', async () => {
+    // The other half of the mutex: a heal that is genuinely active has to be told to stop.
+    await (accessory as any).handleSetHeal(true);
+    expect((accessory as any).isHealActive).toBe(true);
+
+    await (accessory as any).handleSetInclusion(true);
+
+    expect(mockController.stopHealing).toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(false);
+  });
+
+  it('should reset the heal switch when the controller refuses to start', async () => {
+    mockController.startHealing.mockResolvedValueOnce('refused');
+
+    await (accessory as any).handleSetHeal(true);
+
+    expect((accessory as any).isHealActive).toBe(false);
+    expect((accessory as any).isHealStarting).toBe(false);
+    expect((accessory as any).healService.updateCharacteristic).toHaveBeenLastCalledWith(
+      mockPlatform.Characteristic.On,
+      false,
+    );
+  });
+
+  it('should say a rebuild is still finishing rather than that none started', async () => {
+    mockController.startHealing.mockResolvedValueOnce('busy');
+
+    await (accessory as any).handleSetHeal(true);
+
+    expect(mockPlatform.log.warn).toHaveBeenCalledWith(expect.stringContaining('still finishing'));
+    expect(mockPlatform.log.error).not.toHaveBeenCalled();
+    expect((accessory as any).isHealActive).toBe(false);
+    expect((accessory as any).healService.updateCharacteristic).toHaveBeenLastCalledWith(
+      mockPlatform.Characteristic.On,
+      false,
+    );
+  });
+
+  it('should reset the heal switch once on genuine completion', async () => {
+    jest.useFakeTimers();
+    try {
+      await (accessory as any).handleSetHeal(true);
+      const healService = (accessory as any).healService;
+      healService.updateCharacteristic.mockClear();
+
+      mockController.emit(
+        'heal network done',
+        new Map([
+          [4, 'done'],
+          [5, 'done'],
+          [6, 'skipped'],
+        ]),
+      );
+
+      // The accessory stops believing a heal is running straight away.
+      expect((accessory as any).isHealActive).toBe(false);
+
+      /**
+       * The characteristic write is deferred, which the plugin has done since 2.0.3 so HomeKit
+       * and the Homebridge UI register the change to Off.
+       */
+      expect(healService.updateCharacteristic).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(500);
+
+      expect(healService.updateCharacteristic).toHaveBeenCalledTimes(1);
+      expect(healService.updateCharacteristic).toHaveBeenCalledWith(
+        mockPlatform.Characteristic.On,
+        false,
+      );
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not let a finished heal switch off one started inside the reset delay', async () => {
+    jest.useFakeTimers();
+    try {
+      await (accessory as any).handleSetHeal(true);
+      mockController.emit('heal network done', new Map([[4, 'done']]));
+
+      // A new heal begins before the deferred switch-off from the previous one has fired.
+      jest.advanceTimersByTime(200);
+      await (accessory as any).handleSetHeal(true);
+      const healService = (accessory as any).healService;
+      healService.updateCharacteristic.mockClear();
+
+      jest.advanceTimersByTime(500);
+
+      expect(healService.updateCharacteristic).not.toHaveBeenCalledWith(
+        mockPlatform.Characteristic.On,
+        false,
+      );
+      expect((accessory as any).isHealActive).toBe(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should reset the heal switch when the heal is stopped or times out', async () => {
+    await (accessory as any).handleSetHeal(true);
+
+    mockController.emit('heal network stopped', 'timeout');
+
+    expect((accessory as any).isHealActive).toBe(false);
+    expect((accessory as any).healService.updateCharacteristic).toHaveBeenLastCalledWith(
+      mockPlatform.Characteristic.On,
+      false,
+    );
+  });
+
+  it('should allow a new heal after the previous one finished', async () => {
+    await (accessory as any).handleSetHeal(true);
+    mockController.emit('heal network done', new Map([[4, 'done']]));
+    mockController.startHealing.mockClear();
+
+    await (accessory as any).handleSetHeal(true);
+
+    expect(mockController.startHealing).toHaveBeenCalledTimes(1);
+  });
+
   it('should update status on controller events', () => {
     mockController.emit('status updated', 'Testing Status');
     const statusService = (accessory as any).statusService;
     expect(statusService.getCharacteristic().updateValue).toHaveBeenCalledWith('Testing Status');
   });
 
-  it('should update progress on heal network progress', () => {
-    const progressMap = new Map();
-    progressMap.set(1, 'pending');
-    progressMap.set(2, 'done');
-    
-    mockController.emit('heal network progress', progressMap);
+  it('should count only terminal statuses as completed heal progress', () => {
+    const progress = new Map<number, string>([
+      [4, 'done'],
+      [5, 'failed'],
+      [6, 'skipped'],
+      [8, 'pending'],
+    ]);
+
+    mockController.emit('heal network progress', progress);
+
     const statusService = (accessory as any).statusService;
-    // 2 items total, 2 non-zero values (assuming the mock behavior passes map values directly)
-    // The implementation counts non-zero values. Let's assume 'pending' and 'done' are treated as truthy/non-zero in this context 
-    // or more accurately, the real event sends status codes.
-    // If we mock strict behavior:
-    const strictMap = new Map();
-    strictMap.set(2, 1); // Pending
-    strictMap.set(3, 0); // Pending (0 usually means pending/waiting in some contexts, but let's check code)
-    // Code: .filter((v) => v !== 0)
-    // So 0 is skipped.
-    
-    mockController.emit('heal network progress', strictMap);
-    expect(statusService.getCharacteristic().updateValue).toHaveBeenCalledWith('Heal: 1/2');
+    expect(statusService.getCharacteristic().updateValue).toHaveBeenCalledWith('Heal: 3/4');
+  });
+
+  it('should not report progress for a freshly started heal where every node is pending', () => {
+    const progress = new Map<number, string>([
+      [4, 'pending'],
+      [5, 'pending'],
+    ]);
+
+    mockController.emit('heal network progress', progress);
+
+    const statusService = (accessory as any).statusService;
+    expect(statusService.getCharacteristic().updateValue).toHaveBeenCalledWith('Heal: 0/2');
   });
 
   it('should register the custom S2 pin characteristic on the status service, not on switch services', () => {
