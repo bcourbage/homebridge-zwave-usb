@@ -37,6 +37,11 @@ export interface IZWaveController extends EventEmitter {
   stopHealing(): Promise<boolean>;
   /** Whether a route rebuild this plugin started is still in progress. */
   isHealing(): boolean;
+  /**
+   * Whether the driver is rebuilding routes, whoever asked for it. A rebuild started before
+   * this plugin began tracking one is invisible to `isHealing` but is still running.
+   */
+  isRebuildingRoutes(): boolean;
   removeFailedNode(nodeId: number): Promise<void>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;

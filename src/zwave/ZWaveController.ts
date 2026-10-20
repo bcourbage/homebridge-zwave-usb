@@ -811,6 +811,10 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
    * Whether a route rebuild this plugin started is still in progress. This is the plugin's own
    * view of the lifecycle, which can differ from the driver's: see `startHealing` for why.
    */
+  public isRebuildingRoutes(): boolean {
+    return this.driver?.controller.isRebuildingRoutes === true;
+  }
+
   public isHealing(): boolean {
     return this.healState !== 'idle';
   }

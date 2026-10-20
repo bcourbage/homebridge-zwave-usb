@@ -23,6 +23,14 @@ class UiServer extends HomebridgePluginUiServer {
       return await this.ipcRequest('/accessories/prune-stale', 'POST');
     });
 
+    this.onRequest('heal-network', async () => {
+      return await this.ipcRequest('/network/heal', 'POST');
+    });
+
+    this.onRequest('heal-network-status', async () => {
+      return await this.ipcRequest('/network/heal/status', 'GET');
+    });
+
     this.onRequest('check-firmware', async (nodeId) => {
       return await this.ipcRequest(`/firmware/updates/${nodeId}`, 'GET');
     });

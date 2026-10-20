@@ -3,6 +3,8 @@ const {
   normalizeSecurityKey,
   getInvalidSecurityKeyFields,
   buildPluginConfig,
+  describeHealStart,
+  healIsRunning,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -118,5 +120,46 @@ describe('homebridge-ui HTML escaping', () => {
   it('renders a missing value as an empty string rather than "undefined"', () => {
     expect(escapeHtml(undefined)).toBe('');
     expect(escapeHtml(null)).toBe('');
+  });
+});
+
+describe('route rebuild helpers', () => {
+  it('watches for the rebuild to end when one was started', () => {
+    expect(describeHealStart('started')).toEqual({
+      status: expect.stringContaining('Rebuilding routes'),
+      watch: true,
+    });
+  });
+
+  it('waits for a rebuild that was already running elsewhere', () => {
+    // busy is not a failure: the driver is rebuilding from a request this plugin no longer
+    // tracks, so there is something to wait for.
+    const outcome = describeHealStart('busy');
+
+    expect(outcome.watch).toBe(true);
+    expect(outcome.status).toContain('already running');
+  });
+
+  it('does not watch when the controller refused', () => {
+    expect(describeHealStart('refused')).toEqual({
+      status: 'The controller did not start a route rebuild.',
+      watch: false,
+    });
+  });
+
+  it('treats an unrecognized outcome as refused rather than watching forever', () => {
+    expect(describeHealStart('something new' as never).watch).toBe(false);
+  });
+
+  it.each([
+    [{ healing: true, rebuilding: false }, true],
+    [{ healing: false, rebuilding: true }, true],
+    [{ healing: true, rebuilding: true }, true],
+    [{ healing: false, rebuilding: false }, false],
+    [undefined, false],
+  ])('reads %p as running=%p', (state, running) => {
+    // A rebuild this plugin did not start shows only in rebuilding, which is the whole reason
+    // the status route reports both.
+    expect(healIsRunning(state as never)).toBe(running);
   });
 });

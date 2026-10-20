@@ -163,6 +163,7 @@ The plugin includes a dedicated **Maintenance** tab within the Homebridge custom
 - **Battery Device Support**: Firmware updates are supported for battery-powered devices. You will be prompted to manually wake the device after starting the process to initiate the transfer.
 - **Real-time Progress**: Monitor the progress of the firmware transfer via a live progress bar.
 - **Clean Up Stale Accessories**: Remove stale cached Homebridge accessories explicitly from the maintenance UI instead of relying on automatic startup pruning.
+- **Rebuild Routes**: Start a network route rebuild from the maintenance UI and watch it run. Sleeping devices are skipped unless Heal Network Includes Sleeping Devices is turned on. If a rebuild started elsewhere is already running, the button waits for that one to finish instead of starting a second.
 
 ## ❓ Troubleshooting
 
