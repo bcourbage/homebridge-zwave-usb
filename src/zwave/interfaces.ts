@@ -22,6 +22,13 @@ export interface ZWaveValueEvent {
   propertyKey?: string | number;
   newValue?: unknown;
   prevValue?: unknown;
+  /**
+   * Provenance, when the emitter has it. zwave-js tags an optimistic cache write as 'driver' on
+   * its internal value DB, but its node-level 'value updated' event deletes the field before
+   * emitting (`translateValueEvent`, checked in 15.20.1 and 15.27.1), so events from a node
+   * arrive without it and the controller classifies echoes by value instead.
+   */
+  source?: 'driver' | 'node';
 }
 
 export interface IZWaveController extends EventEmitter {

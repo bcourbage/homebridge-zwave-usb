@@ -1,3 +1,6 @@
+import { ValueID } from 'zwave-js';
+import { IZWaveNode } from './interfaces';
+
 /**
  * The decoded contents of a Battery CC Report as returned by the zwave-js Battery CC API.
  * The API hands back the parsed report itself, which still carries the level even in the cases
@@ -16,6 +19,7 @@ export interface BatteryReport {
 }
 
 type BatteryApi = { get?: () => Promise<BatteryReport | undefined> };
+type PollableNode = { pollValue?: (valueId: ValueID) => Promise<unknown> };
 
 /**
  * Command Class APIs are not part of the node interface so that node mocks stay small. These
@@ -31,4 +35,18 @@ export function getBatteryApi(
   const api = source?.commandClasses?.['Battery'] as BatteryApi | undefined;
 
   return typeof api?.get === 'function' ? api : undefined;
+}
+
+/** Whether the node can be asked for a value at all, as opposed to only reporting on its own. */
+export function canPollNodeValues(node: IZWaveNode): boolean {
+  return typeof (node as IZWaveNode & PollableNode).pollValue === 'function';
+}
+
+export async function pollNodeValue(node: IZWaveNode, valueId: ValueID): Promise<unknown> {
+  const pollValue = (node as IZWaveNode & PollableNode).pollValue;
+  if (typeof pollValue !== 'function') {
+    return undefined;
+  }
+
+  return pollValue.call(node, valueId);
 }
