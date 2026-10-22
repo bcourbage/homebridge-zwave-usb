@@ -69,6 +69,8 @@ describe('homebridge-ui server request wiring', () => {
     serverInstance!.ipcRequest = ipcRequest;
 
     await requests.get('get-nodes')!();
+    await requests.get('heal-network')!();
+    await requests.get('heal-network-status')!();
     await requests.get('rename-node')!({ nodeId: 9, name: 'Office' });
     await requests.get('refresh-node-info')!(9);
     await requests.get('check-firmware')!(9);
@@ -76,16 +78,91 @@ describe('homebridge-ui server request wiring', () => {
     await requests.get('abort-update')!(9);
 
     expect(ipcRequest).toHaveBeenNthCalledWith(1, '/nodes', 'GET');
-    expect(ipcRequest).toHaveBeenNthCalledWith(2, '/nodes/9/name', 'POST', { name: 'Office' });
-    expect(ipcRequest).toHaveBeenNthCalledWith(3, '/nodes/9/refresh-info', 'POST');
-    expect(ipcRequest).toHaveBeenNthCalledWith(4, '/firmware/updates/9', 'GET');
-    expect(ipcRequest).toHaveBeenNthCalledWith(
-      5,
-      '/firmware/update/9',
-      'POST',
-      { version: '1.2.3' },
-    );
-    expect(ipcRequest).toHaveBeenNthCalledWith(6, '/firmware/abort/9', 'POST');
+    expect(ipcRequest).toHaveBeenNthCalledWith(2, '/network/heal', 'POST');
+    expect(ipcRequest).toHaveBeenNthCalledWith(3, '/network/heal/status', 'GET');
+    expect(ipcRequest).toHaveBeenNthCalledWith(4, '/nodes/9/name', 'POST', { name: 'Office' });
+    expect(ipcRequest).toHaveBeenNthCalledWith(5, '/nodes/9/refresh-info', 'POST');
+    expect(ipcRequest).toHaveBeenNthCalledWith(6, '/firmware/updates/9', 'GET');
+    expect(ipcRequest).toHaveBeenNthCalledWith(7, '/firmware/update/9', 'POST', {
+      version: '1.2.3',
+    });
+    expect(ipcRequest).toHaveBeenNthCalledWith(8, '/firmware/abort/9', 'POST');
+  });
+
+  it('should forward the node diagnostics request to the IPC endpoint', async () => {
+    const requests = new Map<string, (...args: any[]) => Promise<unknown>>();
+    let serverInstance: { ipcRequest?: jest.Mock } | undefined;
+
+    jest.doMock('@homebridge/plugin-ui-utils', () => {
+      return {
+        HomebridgePluginUiServer: class {
+          homebridgeStoragePath = '/tmp';
+          constructor() {
+            serverInstance = this as { ipcRequest?: jest.Mock };
+          }
+          onRequest(name: string, handler: (...args: any[]) => Promise<unknown>) {
+            requests.set(name, handler);
+          }
+          ready() {
+            return undefined;
+          }
+        },
+      };
+    });
+
+    jest.isolateModules(() => {
+      require('../homebridge-ui/server.js');
+    });
+
+    const ipcRequest = jest.fn().mockResolvedValue({ ok: true });
+    serverInstance!.ipcRequest = ipcRequest;
+
+    await requests.get('node-diagnostics')!(5);
+
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/diagnostics', 'GET');
+
+    await requests.get('test-covering-position')!({ nodeId: 5, position: 25 });
+    await requests.get('stop-covering')!(5);
+
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/test-position', 'POST', { position: 25 });
+    expect(ipcRequest).toHaveBeenCalledWith('/nodes/5/test-stop', 'POST');
+  });
+
+  it('should forward the failed-node removal requests', async () => {
+    const requests = new Map<string, (...args: any[]) => Promise<unknown>>();
+    let serverInstance: { ipcRequest?: jest.Mock } | undefined;
+
+    jest.doMock('@homebridge/plugin-ui-utils', () => {
+      return {
+        HomebridgePluginUiServer: class {
+          homebridgeStoragePath = '/tmp';
+          constructor() {
+            serverInstance = this as { ipcRequest?: jest.Mock };
+          }
+          onRequest(name: string, handler: (...args: any[]) => Promise<unknown>) {
+            requests.set(name, handler);
+          }
+          ready() {
+            return undefined;
+          }
+        },
+      };
+    });
+
+    jest.isolateModules(() => {
+      require('../homebridge-ui/server.js');
+    });
+
+    const ipcRequest = jest.fn().mockResolvedValue({ ok: true });
+    serverInstance!.ipcRequest = ipcRequest;
+
+    await requests.get('check-node-removal')!(8);
+    await requests.get('remove-failed-node')!({ nodeId: 8, confirmNodeId: 8 });
+
+    expect(ipcRequest).toHaveBeenNthCalledWith(1, '/nodes/8/removal-check', 'GET');
+    expect(ipcRequest).toHaveBeenNthCalledWith(2, '/nodes/8/remove-failed', 'POST', {
+      confirmNodeId: 8,
+    });
   });
 
   it('should reject IPC responses with error status codes', async () => {

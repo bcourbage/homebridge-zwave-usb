@@ -23,6 +23,34 @@ class UiServer extends HomebridgePluginUiServer {
       return await this.ipcRequest('/accessories/prune-stale', 'POST');
     });
 
+    this.onRequest('node-diagnostics', async (nodeId) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/diagnostics`, 'GET');
+    });
+
+    this.onRequest('test-covering-position', async ({ nodeId, position }) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/test-position`, 'POST', { position });
+    });
+
+    this.onRequest('stop-covering', async (nodeId) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/test-stop`, 'POST');
+    });
+
+    this.onRequest('check-node-removal', async (nodeId) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/removal-check`, 'GET');
+    });
+
+    this.onRequest('remove-failed-node', async ({ nodeId, confirmNodeId }) => {
+      return await this.ipcRequest(`/nodes/${nodeId}/remove-failed`, 'POST', { confirmNodeId });
+    });
+
+    this.onRequest('heal-network', async () => {
+      return await this.ipcRequest('/network/heal', 'POST');
+    });
+
+    this.onRequest('heal-network-status', async () => {
+      return await this.ipcRequest('/network/heal/status', 'GET');
+    });
+
     this.onRequest('check-firmware', async (nodeId) => {
       return await this.ipcRequest(`/firmware/updates/${nodeId}`, 'GET');
     });

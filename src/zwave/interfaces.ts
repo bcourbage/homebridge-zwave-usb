@@ -22,6 +22,59 @@ export interface ZWaveValueEvent {
   propertyKey?: string | number;
   newValue?: unknown;
   prevValue?: unknown;
+  /**
+   * Provenance, when the emitter has it. zwave-js tags an optimistic cache write as 'driver' on
+   * its internal value DB, but its node-level 'value updated' event deletes the field before
+   * emitting (`translateValueEvent`, checked in 15.20.1 and 15.27.1), so events from a node
+   * arrive without it and the controller classifies echoes by value instead.
+   */
+  source?: 'driver' | 'node';
+}
+
+/**
+ * The last observed route to a node. Z-Wave picks a route per transmission, so this describes
+ * what was used most recently rather than a permanent connection.
+ */
+export interface ObservedRoute {
+  repeaters: number[];
+  direct: boolean;
+  /**
+   * The RSSI of the ACK the controller received, as a dBm measurement or the words for an RSSI
+   * error state. On a routed transmission it is the controller's first hop.
+   */
+  ackRSSI?: number | string;
+  protocolDataRate?: number;
+  routeFailedBetween?: [number, number];
+}
+
+export interface NodeRouteDiagnostics {
+  nodeId: number;
+  name: string;
+  status: number;
+  neighbors?: number[];
+  lastWorkingRoute?: ObservedRoute;
+  nextToLastWorkingRoute?: ObservedRoute;
+  /**
+   * zwave-js keeps an exponentially weighted average, not the latest reading, of the ACK RSSI the
+   * controller measured. For a routed transmission that is the first hop, not the destination.
+   */
+  averageAckRSSI?: number | string;
+  roundTripTimeMs?: number;
+  commandsTX?: number;
+  commandsRX?: number;
+  commandsDroppedTX?: number;
+  commandsDroppedRX?: number;
+  lastSeen?: string;
+  backgroundRSSI?: Record<string, number | string>;
+}
+
+/** Why a node may or may not be removed from the network. */
+export interface FailedNodeRemovalAssessment {
+  nodeId: number;
+  name: string;
+  status: number;
+  eligible: boolean;
+  reason: string;
 }
 
 export interface IZWaveController extends EventEmitter {
@@ -37,7 +90,14 @@ export interface IZWaveController extends EventEmitter {
   stopHealing(): Promise<boolean>;
   /** Whether a route rebuild this plugin started is still in progress. */
   isHealing(): boolean;
-  removeFailedNode(nodeId: number): Promise<void>;
+  assessFailedNodeRemoval(nodeId: number): Promise<FailedNodeRemovalAssessment>;
+  removeFailedNode(nodeId: number, confirmNodeId: number): Promise<void>;
+  getNodeRouteDiagnostics(nodeId: number): Promise<NodeRouteDiagnostics>;
+  /**
+   * Whether the driver is rebuilding routes, whoever asked for it. A rebuild started before
+   * this plugin began tracking one is invisible to `isHealing` but is still running.
+   */
+  isRebuildingRoutes(): boolean;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
   setS2Pin(pin: string): void;

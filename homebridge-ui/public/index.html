@@ -202,10 +202,16 @@
             <div class="text-muted small">
               Nodes that have not completed interview yet are intentionally held back from HomeKit until their service metadata is stable. Use Refresh Info to force a fresh interview when metadata looks incomplete.
             </div>
-            <button class="btn btn-sm btn-outline-danger" id="cleanupStaleAccessories">
-              Clean Up Stale Accessories
-            </button>
+            <div class="btn-group btn-group-sm">
+              <button class="btn btn-outline-secondary" id="healNetwork">
+                Rebuild Routes
+              </button>
+              <button class="btn btn-outline-danger" id="cleanupStaleAccessories">
+                Clean Up Stale Accessories
+              </button>
+            </div>
           </div>
+          <div class="small text-muted mb-2" id="healStatus" aria-live="polite"></div>
           <div class="table-responsive">
             <table class="table table-sm" id="nodeTable">
               <thead>
@@ -249,6 +255,24 @@
     <div class="text-right">
       <button class="btn btn-sm btn-secondary" id="cancelConfirm">Cancel</button>
       <button class="btn btn-sm btn-primary" id="executeConfirm">OK</button>
+    </div>
+  </div>
+
+  <div id="diagnosticsModal" class="custom-modal">
+    <h6 id="diagnosticsTitle">Radio and Route Diagnostics</h6>
+    <div id="diagnosticsBody" class="small"></div>
+    <div class="text-right mt-2">
+      <button class="btn btn-sm btn-secondary" id="closeDiagnostics">Close</button>
+    </div>
+  </div>
+
+  <div id="removeNodeModal" class="custom-modal">
+    <h6>Remove Node</h6>
+    <p id="removeNodeSummary" class="small"></p>
+    <p id="removeNodeReason" class="small text-muted"></p>
+    <div class="text-right">
+      <button class="btn btn-sm btn-secondary" id="cancelRemoveNode">Cancel</button>
+      <button class="btn btn-sm btn-danger" id="confirmRemoveNode">Remove</button>
     </div>
   </div>
   <script src="./ui-helpers.js"></script>
@@ -373,7 +397,9 @@
                 <div class="btn-group">
                   <button class="btn btn-sm btn-outline-secondary rename-node" data-nodeid="${node.nodeId}">Rename</button>
                   <button class="btn btn-sm btn-outline-secondary refresh-node-info" data-nodeid="${node.nodeId}" data-requires-wakeup="${!node.isListening && !node.isFrequentListening}">Refresh Info</button>
+                  <button class="btn btn-sm btn-outline-secondary node-diagnostics" data-nodeid="${node.nodeId}">Diagnostics</button>
                   <button class="btn btn-sm btn-outline-primary check-update" data-nodeid="${node.nodeId}">Check Update</button>
+                  <button class="btn btn-sm btn-outline-danger remove-node" data-nodeid="${node.nodeId}">Remove</button>
                 </div>
               `;
             }
@@ -407,9 +433,12 @@
       };
 
       const hideModals = () => {
+        coveringRun++;
         document.getElementById('modalBackdrop').style.display = 'none';
         document.getElementById('renameModal').style.display = 'none';
         document.getElementById('confirmModal').style.display = 'none';
+        document.getElementById('diagnosticsModal').style.display = 'none';
+        document.getElementById('removeNodeModal').style.display = 'none';
         isPromptOpen = false;
         activeNodeId = null;
         activeUpdateData = null;
@@ -441,6 +470,59 @@
             ? 'This resets the node interview state and requests fresh metadata. Keep the device awake while the refresh runs so it can answer interview commands.'
             : 'This resets the node interview state and requests fresh metadata from the node. Continue?';
           showModal('confirmModal');
+          return;
+        }
+
+        if (target.classList.contains('node-diagnostics')) {
+          target.disabled = true;
+          try {
+            const d = await window.homebridge.request('node-diagnostics', nodeId);
+            const { title, html } = uiHelpers.renderDiagnostics(d);
+            document.getElementById('diagnosticsTitle').textContent = title;
+            document.getElementById('diagnosticsBody').innerHTML = `
+              ${html}
+              <div class="mt-2" id="positionTestRow" style="display:none;">
+                <div class="small font-weight-bold">Move the covering and report where it stops</div>
+                <div class="btn-group btn-group-sm mt-1">
+                  <button class="btn btn-outline-secondary test-position" data-position="0">0%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="25">25%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="75">75%</button>
+                  <button class="btn btn-outline-secondary test-position" data-position="100">100%</button>
+                  <button class="btn btn-outline-warning stop-covering">Stop</button>
+                </div>
+                <div class="small text-muted mt-1" id="positionTestResult"></div>
+              </div>
+            `;
+            activeNodeId = nodeId;
+            document.getElementById('positionTestRow').style.display =
+              d.isWindowCovering ? 'block' : 'none';
+            showModal('diagnosticsModal');
+          } catch (err) {
+            window.homebridge.toast.error(err.message);
+          } finally {
+            target.disabled = false;
+          }
+          return;
+        }
+
+        if (target.classList.contains('remove-node')) {
+          target.disabled = true;
+          try {
+            const check = await window.homebridge.request('check-node-removal', nodeId);
+            activeNodeId = nodeId;
+            // The name comes from the assessment, which always carries one, so the dialog cannot
+            // show a name the node has since stopped having.
+            const nodeName = check.name;
+            document.getElementById('removeNodeSummary').innerHTML =
+              `Remove <strong>Node ${uiHelpers.escapeHtml(nodeId)}</strong> (${uiHelpers.escapeHtml(nodeName)}) from the Z-Wave network?`;
+            document.getElementById('removeNodeReason').textContent = check.reason || '';
+            document.getElementById('confirmRemoveNode').disabled = !check.eligible;
+            showModal('removeNodeModal');
+          } catch (err) {
+            window.homebridge.toast.error(err.message);
+          } finally {
+            target.disabled = false;
+          }
           return;
         }
 
@@ -524,6 +606,130 @@
           window.homebridge.toast.error(err.message);
           loadNodes();
 	        }
+	      });
+
+	      /**
+	       * One covering operation at a time. A move runs for tens of seconds, so leaving the
+	       * controls live would let a second click drive the same motor while the first is still
+	       * going and make both readings meaningless. The generation counter means a result that
+	       * arrives after the panel has moved on cannot overwrite what is on screen.
+	       */
+	      let coveringRun = 0;
+
+	      const runCoveringControl = async (pending, waitingText) => {
+	        const generation = ++coveringRun;
+	        const resultEl = document.getElementById('positionTestResult');
+	        const controls = document.querySelectorAll('#positionTestRow button');
+	        controls.forEach((control) => {
+	          control.disabled = true;
+	        });
+	        resultEl.textContent = waitingText;
+
+	        try {
+	          const text = await pending();
+	          if (generation === coveringRun) {
+	            resultEl.textContent = text;
+	          }
+	        } catch (err) {
+	          if (generation === coveringRun) {
+	            resultEl.textContent = err.message;
+	          }
+	        } finally {
+	          if (generation === coveringRun) {
+	            controls.forEach((control) => {
+	              control.disabled = false;
+	            });
+	          }
+	        }
+	      };
+
+	      document.getElementById('diagnosticsBody').addEventListener('click', async (e) => {
+	        const stopButton = e.target.closest('.stop-covering');
+	        if (stopButton) {
+	          await runCoveringControl(
+	            async () =>
+	              uiHelpers.describeCoveringStopResult(
+	                await window.homebridge.request('stop-covering', activeNodeId),
+	              ),
+	            'Stopping...',
+	          );
+	          return;
+	        }
+
+	        const target = e.target.closest('.test-position');
+	        if (!target) return;
+
+	        const position = Number(target.getAttribute('data-position'));
+	        await runCoveringControl(
+	          async () =>
+	            uiHelpers.describeCoveringTestResult(
+	              await window.homebridge.request('test-covering-position', {
+	                nodeId: activeNodeId,
+	                position,
+	              }),
+	            ),
+	          `Moving to ${position}%...`,
+	        );
+	      });
+
+	      document.getElementById('closeDiagnostics').addEventListener('click', hideModals);
+
+	      document.getElementById('cancelRemoveNode').addEventListener('click', hideModals);
+	      document.getElementById('confirmRemoveNode').addEventListener('click', async () => {
+	        const nodeId = activeNodeId;
+	        hideModals();
+
+	        try {
+	          await window.homebridge.request('remove-failed-node', {
+	            nodeId,
+	            confirmNodeId: Number(nodeId),
+	          });
+	          window.homebridge.toast.success(`Node ${nodeId} removed from the Z-Wave network.`);
+	        } catch (err) {
+	          window.homebridge.toast.error(err.message);
+	        }
+	        loadNodes();
+	      document.getElementById('healNetwork').addEventListener('click', async (e) => {
+	        const button = e.currentTarget;
+	        const status = document.getElementById('healStatus');
+	        button.disabled = true;
+
+	        const watchUntilItEnds = () => {
+	          let settled = false;
+	          const finish = (text) => {
+	            if (settled) return;
+	            settled = true;
+	            clearInterval(poll);
+	            status.textContent = text;
+	            button.disabled = false;
+	          };
+	          const poll = setInterval(async () => {
+	            try {
+	              const state = await window.homebridge.request('heal-network-status');
+	              if (!uiHelpers.healIsRunning(state)) {
+	                finish('Route rebuild finished. The Homebridge log has the summary.');
+	              }
+	            } catch (err) {
+	              finish(err.message);
+	            }
+	          }, 3000);
+	        };
+
+	        try {
+	          const outcome = uiHelpers.describeHealStart(
+	            (await window.homebridge.request('heal-network')).result,
+	          );
+	          status.textContent = outcome.status;
+	          if (outcome.watch) {
+	            watchUntilItEnds();
+	            return;
+	          }
+	          button.disabled = false;
+	        } catch (err) {
+	          status.textContent = err.message;
+	          button.disabled = false;
+	        }
+	      });
 	      });
 
 	      document.getElementById('cleanupStaleAccessories').addEventListener('click', async () => {

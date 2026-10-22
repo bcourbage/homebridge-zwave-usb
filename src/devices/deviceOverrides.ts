@@ -20,6 +20,20 @@ export interface DeviceOverride {
    * implement Window Covering CC.
    */
   readonly multilevelSwitchDrivesCovering?: true;
+  /**
+   * How long a position request waits for a quieter one to replace it before anything is
+   * transmitted. Dragging a HomeKit slider produces a burst of writes a few hundred milliseconds
+   * apart; without this every one of them becomes a separate command. Left unset, requests are
+   * transmitted as they arrive.
+   */
+  readonly coalescePositionCommandsMs?: number;
+  /**
+   * The least time between the end of one position write and the start of the next. The device
+   * mishandles a command that arrives right behind another (ignoring it, stopping short or
+   * pausing), so a later request is held for the rest of this time and the newest one wins. A
+   * stop is never held.
+   */
+  readonly minPositionCommandGapMs?: number;
 }
 
 export const DEVICE_OVERRIDES: readonly DeviceOverride[] = [
@@ -29,6 +43,12 @@ export const DEVICE_OVERRIDES: readonly DeviceOverride[] = [
     productId: 0x5a31,
     label: 'Springs Window Fashions RSZ1 (Somfy Motorized Shade)',
     multilevelSwitchDrivesCovering: true,
+    /**
+     * Observed slider bursts from this shade arrive 250-420 ms apart, so 600 ms collapses a drag
+     * into one command while leaving a deliberate second request a few seconds later intact.
+     */
+    coalescePositionCommandsMs: 600,
+    minPositionCommandGapMs: 1500,
   },
 ];
 

@@ -94,7 +94,7 @@ const mockPlatform = {
   accessories: [],
   Service: {
     AccessoryInformation: 'AccessoryInformation',
-    Switch: 'Switch',
+    Switch: { UUID: 'Switch' },
     ZWaveManager: class {},
   },
   Characteristic: {
@@ -121,6 +121,7 @@ mockController.stopExclusion = jest.fn().mockResolvedValue(true);
 mockController.startHealing = jest.fn().mockResolvedValue('started');
 mockController.stopHealing = jest.fn().mockResolvedValue(true);
 mockController.removeFailedNode = jest.fn().mockResolvedValue(undefined);
+mockController.getNodeRouteDiagnostics = jest.fn();
 mockController.setS2Pin = jest.fn();
 
 describe('ControllerAccessory', () => {
@@ -158,9 +159,11 @@ describe('ControllerAccessory', () => {
     expect((accessory as any).healService.getCharacteristic).toHaveBeenCalledWith(
       mockPlatform.Characteristic.ConfiguredName,
     );
-    expect((accessory as any).pruneService.getCharacteristic).toHaveBeenCalledWith(
-      mockPlatform.Characteristic.ConfiguredName,
-    );
+  });
+
+  it('should not expose a destructive node-removal switch', () => {
+    expect((accessory as any).pruneService).toBeUndefined();
+    expect((accessory as any).handleSetPrune).toBeUndefined();
   });
 
   it('should handle inclusion start request', async () => {
@@ -181,14 +184,6 @@ describe('ControllerAccessory', () => {
   it('should handle heal network start request', async () => {
     await (accessory as any).handleSetHeal(true);
     expect(mockController.startHealing).toHaveBeenCalled();
-  });
-
-  it('should handle prune dead nodes request', async () => {
-    const mockNode = { status: 3, nodeId: 5 }; // Dead node
-    mockController.nodes.set(5, mockNode);
-    
-    await (accessory as any).handleSetPrune(true);
-    expect(mockController.removeFailedNode).toHaveBeenCalledWith(5);
   });
 
   it('should start only one heal for duplicate ON writes', async () => {
@@ -258,10 +253,7 @@ describe('ControllerAccessory', () => {
     expect((accessory as any).isHealActive).toBe(false);
   });
 
-  it.each([
-    ['exclusion', 'handleSetExclusion'],
-    ['prune', 'handleSetPrune'],
-  ])('should cancel a starting heal when %s is turned on', async (_name, handler) => {
+  it('should cancel a starting heal when exclusion is turned on', async () => {
     let releaseStopInclusion: () => void = () => undefined;
     mockController.stopInclusion.mockImplementationOnce(
       () =>
@@ -272,7 +264,7 @@ describe('ControllerAccessory', () => {
     (accessory as any).isInclusionActive = true;
 
     const healOn = (accessory as any).handleSetHeal(true);
-    await (accessory as any)[handler](true);
+    await (accessory as any).handleSetExclusion(true);
     releaseStopInclusion();
     await healOn;
 
@@ -596,7 +588,77 @@ describe('ControllerAccessory', () => {
     const inclusionService = createService('Switch', 'Inclusion');
     const exclusionService = createService('Switch', 'Exclusion');
     const healService = createService('Switch', 'Heal');
-    const pruneService = createService('Switch', 'Prune');
+
+    existingAccessory.services = [
+      infoService,
+      managerService,
+      inclusionService,
+      exclusionService,
+      healService,
+    ];
+    existingAccessory.getService = jest
+      .fn()
+      .mockImplementation((serviceType) =>
+        serviceType === mockPlatform.Service.AccessoryInformation ? infoService : undefined,
+      );
+    existingAccessory.getServiceById = jest.fn().mockImplementation((serviceType, subtype) => {
+      if (serviceType !== mockPlatform.Service.Switch) {
+        return undefined;
+      }
+      return {
+        Inclusion: inclusionService,
+        Exclusion: exclusionService,
+        Heal: healService,
+      }[subtype as 'Inclusion' | 'Exclusion' | 'Heal'];
+    });
+    existingAccessory.addService = jest.fn();
+    mockPlatform.accessories = [existingAccessory];
+
+    accessory.stop();
+    accessory = new ControllerAccessory(mockPlatform, mockController);
+
+    expect(inclusionService.addOptionalCharacteristic).toHaveBeenCalledWith(
+      mockPlatform.Characteristic.ConfiguredName,
+    );
+    expect(mockPlatform.api.updatePlatformAccessories).toHaveBeenCalledWith([existingAccessory]);
+  });
+
+  it('should remove the Prune Dead Nodes switch from an accessory cached before the bump', () => {
+    // The switch removed every Dead node in one sweep. Existing controllers were paired with it,
+    // so the cache repair is the only thing that takes it away; without the version bump it never
+    // runs and the switch stays in HomeKit.
+    const existingAccessory = new mockPlatform.api.platformAccessory();
+    existingAccessory.UUID = 'homebridge-zwave-usb-controller-305419896';
+    // Pinned to the literal 2, the version shipped in v4.0.0, rather than to the constant: a
+    // revert of the bump has to fail this test, and "the constant minus one" would follow it down.
+    existingAccessory.context = { cacheRepairVersion: 2 };
+
+    const makeService = (uuid: string, subtype?: string) => ({
+      UUID: uuid,
+      subtype,
+      displayName: subtype || uuid,
+      characteristics: [],
+      getCharacteristic: jest.fn().mockReturnValue({
+        on: jest.fn().mockReturnThis(),
+        onSet: jest.fn().mockReturnThis(),
+        onGet: jest.fn().mockReturnThis(),
+        updateValue: jest.fn().mockReturnThis(),
+        setProps: jest.fn().mockReturnThis(),
+        props: {},
+      }),
+      testCharacteristic: jest.fn().mockReturnValue(true),
+      addOptionalCharacteristic: jest.fn(),
+      removeCharacteristic: jest.fn(),
+      updateCharacteristic: jest.fn(),
+      setCharacteristic: jest.fn().mockReturnThis(),
+    });
+
+    const infoService = makeService('AccessoryInformation');
+    const managerService = makeService(MANAGER_SERVICE_UUID, 'Status');
+    const inclusionService = makeService('Switch', 'Inclusion');
+    const exclusionService = makeService('Switch', 'Exclusion');
+    const healService = makeService('Switch', 'Heal');
+    const pruneService = makeService('Switch', 'Prune');
 
     existingAccessory.services = [
       infoService,
@@ -619,8 +681,7 @@ describe('ControllerAccessory', () => {
         Inclusion: inclusionService,
         Exclusion: exclusionService,
         Heal: healService,
-        Prune: pruneService,
-      }[subtype as 'Inclusion' | 'Exclusion' | 'Heal' | 'Prune'];
+      }[subtype as 'Inclusion' | 'Exclusion' | 'Heal'];
     });
     existingAccessory.addService = jest.fn();
     mockPlatform.accessories = [existingAccessory];
@@ -628,9 +689,12 @@ describe('ControllerAccessory', () => {
     accessory.stop();
     accessory = new ControllerAccessory(mockPlatform, mockController);
 
-    expect(inclusionService.addOptionalCharacteristic).toHaveBeenCalledWith(
-      mockPlatform.Characteristic.ConfiguredName,
-    );
-    expect(mockPlatform.api.updatePlatformAccessories).toHaveBeenCalledWith([existingAccessory]);
+    expect(existingAccessory.removeService).toHaveBeenCalledWith(pruneService);
+    // The switches the controller still owns are kept.
+    expect(existingAccessory.removeService).not.toHaveBeenCalledWith(inclusionService);
+    expect(existingAccessory.removeService).not.toHaveBeenCalledWith(exclusionService);
+    expect(existingAccessory.removeService).not.toHaveBeenCalledWith(healService);
+    expect(existingAccessory.context.cacheRepairVersion).toBe(CONTROLLER_CACHE_REPAIR_VERSION);
+    expect(CONTROLLER_CACHE_REPAIR_VERSION).toBeGreaterThan(2);
   });
 });

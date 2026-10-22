@@ -35,6 +35,49 @@ A high-performance, production-grade [Homebridge](https://homebridge.io) integra
 
 ---
 
+## Matter support
+
+On Homebridge 2.4 or later, enable Matter for the bridge or child bridge and pair it with your
+Matter controller. The plugin publishes its supported device services automatically. Homebridge 1
+continues to use HomeKit alone.
+
+| Z-Wave device service | Matter mapping |
+| :--- | :--- |
+| Binary switches and outlets | Controllable On/Off outlet |
+| Dimmers and RGB lights | Dimmable light or extended color light |
+| Locks | Door lock |
+| Motion, contact, and leak sensors | Occupancy, contact, and water leak detector |
+| Smoke and CO alarms | Smoke/CO alarm with the relevant alarm feature |
+| Temperature, humidity, and illuminance | Measurement sensor, with Matter units |
+| Air quality | Air quality category |
+| Thermostats and TRVs | Thermostat, advertising only the interviewed heating/cooling setpoints |
+| Window coverings | Window covering, including open, close, position, and stop |
+| Garage doors | Closure, with fully open and fully closed commands |
+| Scene buttons | Generic switch, with single, double, and long press events |
+| Sirens | On/Off outlet, or dimmable outlet with volume control |
+| Battery status | Power source on the owning device |
+
+A node with several services publishes the additional services as child endpoints. Commands use
+the same HomeKit handlers as the Home app, and state changes are mirrored to Matter. Battery,
+cache restoration, removal, and replacement-wrapper handling apply across these mappings.
+
+Controller apps decide which Matter types they display. Closure in particular may be unavailable
+in an app even when Homebridge publishes it. Garage-door stop is rejected because the plugin's
+Barrier Operator implementation has no portable stop command. Continuous dimmer/color movement
+and transition timing are not implemented; absolute levels and colors are supported.
+
+Raw CO2, VOC, PM2.5, and custom UV readings remain HomeKit-only. The derived air quality category
+is published over Matter. Air quality uses the host's core Good/Poor/Unknown values: Excellent/Good map to Good, and Fair/Inferior/Poor map to Poor. Homebridge 2.4 does not restore optional concentration-cluster composition
+from its Matter cache, so those readings are not advertised as working Matter measurements.
+
+Homebridge dispatches bridged Matter registration and removal without a downstream acknowledgement.
+The plugin prevents duplicate offers and reclaims cached endpoints at startup, but cannot detect
+all server-side refusals. A live endpoint's service structure is retained until the next restart
+if a device's capabilities change. Automated tests cover the plugin lifecycle and endpoint
+construction against Homebridge 2.4; physical-device testing of the expanded mappings remains open.
+
+---
+
 ## 📦 Prerequisites & Linux Setup
 
 Version 4 requires Node.js **22.12 or later in the Node 22 line**, Node **24**, or Node **26**. Node 18 and 20 are no longer supported because the installed dependencies require newer runtimes. Upgrade Node before installing v4.
@@ -141,7 +184,6 @@ This plugin adds a management accessory to your Home app to handle network opera
 - **Inclusion Mode**: A switch to start/stop pairing new devices (active for 3 minutes).
 - **Exclusion Mode**: A switch to remove/reset existing devices.
 - **Heal Network**: A switch to trigger a background mesh network optimization. Sleeping devices are skipped unless **Heal Network Includes Sleeping Devices** is turned on, so the operation finishes in a predictable time. Progress appears in System Status, and the switch turns itself off when the rebuild finishes, is stopped, or reports nothing for ten minutes.
-- **Prune Dead Nodes**: Automatically removes devices marked as "Dead" (failed) from the network. **Safe for battery devices**: This only removes nodes the controller has confirmed as failed (Status 3); it will never remove a device that is simply "Asleep" (Status 1).
 
 Controller switch labels are exposed using a compatibility path for Home app visibility. Some HomeKit apps may still render these actions differently.
 
@@ -163,12 +205,20 @@ The plugin includes a dedicated **Maintenance** tab within the Homebridge custom
 - **Battery Device Support**: Firmware updates are supported for battery-powered devices. You will be prompted to manually wake the device after starting the process to initiate the transfer.
 - **Real-time Progress**: Monitor the progress of the firmware transfer via a live progress bar.
 - **Clean Up Stale Accessories**: Remove stale cached Homebridge accessories explicitly from the maintenance UI instead of relying on automatic startup pruning.
+- **Remove a Failed Node**: Remove one node from the Z-Wave network, after the controller has been asked whether it can be removed and the answer has been shown. A battery device that sleeps between wake-ups is refused, as is a node the controller cannot assess. Removal is permanent and the device has to be included again physically.
+- **Rebuild Routes**: Start a network route rebuild from the maintenance UI and watch it run. Sleeping devices are skipped unless Heal Network Includes Sleeping Devices is turned on. If a rebuild started elsewhere is already running, the button waits for that one to finish instead of starting a second.
 
 ## ❓ Troubleshooting
 
 - **Device showing "No Response"?** Check the Homebridge logs. If the device is battery-powered, it may need to be "woken up" (usually by pressing a physical button on the device) to complete the interview.
 - **USB Stick busy?** Ensure no other software (like Home Assistant or a Z-Wave utility) is using the same serial port.
 - **Permission Denied?** Re-run the `usermod` command in the Prerequisites section and **reboot** the host.
+
+## Contributors
+
+Thanks to [Bruno Courbage (@bcourbage)](https://github.com/bcourbage) for the covering state machine,
+radio diagnostics, explicit failed-node removal, route-rebuild UI, covering test controls, and the
+initial Matter integration (#15–#20).
 
 ## 💖 Support & Contribution
 

@@ -8,6 +8,10 @@ import path from 'path';
 import http from 'http';
 import { EventEmitter } from 'events';
 import { CommandClasses } from '@zwave-js/core';
+import { STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS } from '../src/zwave/coveringController';
+
+/** Mirrors the platform's own grace period before the stall clock starts. */
+const COVERING_REPORT_GRACE_MS = 8000;
 
 // Mock ZWaveController to avoid starting the actual driver
 jest.mock('../src/zwave/ZWaveController', () => {
@@ -59,6 +63,9 @@ describe('ZWaveUsbPlatform', () => {
       static On = 'On';
       static ServiceLabelNamespace = 'ServiceLabelNamespace';
       static ServiceLabelIndex = 'ServiceLabelIndex';
+      static TargetPosition = 'TargetPosition';
+      static CurrentPosition = 'CurrentPosition';
+      static HoldPosition = 'HoldPosition';
       static StatusFault = {
         GENERAL_FAULT: 1,
         NO_FAULT: 0,
@@ -69,6 +76,7 @@ describe('ZWaveUsbPlatform', () => {
     class MockService {
       static AccessoryInformation = 'AccessoryInformation';
       static Switch = 'Switch';
+      static WindowCovering = { UUID: 'service-WindowCovering' };
     }
 
     hap = {
@@ -637,6 +645,8 @@ describe('ZWaveUsbPlatform', () => {
 
     (platform as any).zwaveController.homeId = 100;
     (platform as any).zwaveAccessories.set(2, existing);
+    const matterAdd = jest.fn();
+    (platform as any).matterAccessories.add = matterAdd;
 
     const graphSpy = jest.spyOn(AccessoryFactory, 'getGraphSignature').mockReturnValue('new-graph');
     const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(reconciled as any);
@@ -649,6 +659,76 @@ describe('ZWaveUsbPlatform', () => {
       expect(reconciled.initialize).toHaveBeenCalledWith({ pruneUnmanagedServices: true });
       expect(existing.updateNode).not.toHaveBeenCalled();
       expect(existing.refresh).not.toHaveBeenCalled();
+      /**
+       * The Matter layer has to be told, and told about the new object. It is the only thing
+       * that repoints the endpoint's handlers at the rebuilt wrapper; without this call the
+       * covering keeps answering Matter commands through the object that was just stopped.
+       */
+      expect(matterAdd).toHaveBeenCalledWith(reconciled);
+    } finally {
+      graphSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it('should not republish the Matter accessory when the graph signature is unchanged', () => {
+    // An ordinary re-interview ends here, not in the rebuild above: the signature comes back the
+    // same and the existing wrapper is updated in place. The Matter accessory is neither
+    // republished nor repointed, so the endpoint keeps the handlers it already has.
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const node = {
+      nodeId: 2,
+      name: 'Unchanged Node',
+      deviceConfig: { label: 'Unchanged Node', manufacturer: 'Maker' },
+      ready: true,
+      status: 4,
+      getDefinedValueIDs: jest.fn().mockReturnValue([]),
+      getAllEndpoints: jest
+        .fn()
+        .mockReturnValue([{ index: 0, supportsCC: jest.fn().mockReturnValue(false) }]),
+      getValueMetadata: jest.fn(),
+      getValue: jest.fn(),
+      supportsCC: jest.fn().mockReturnValue(false),
+    };
+
+    const existing = {
+      isInitialized: jest.fn().mockReturnValue(true),
+      getGraphSignature: jest.fn().mockReturnValue('same-graph'),
+      stop: jest.fn(),
+      updateNode: jest.fn(),
+      refresh: jest.fn(),
+    };
+
+    (platform as any).zwaveController.homeId = 100;
+    (platform as any).zwaveAccessories.set(2, existing);
+    const matterAdd = jest.fn();
+    (platform as any).matterAccessories.add = matterAdd;
+
+    const graphSpy = jest
+      .spyOn(AccessoryFactory, 'getGraphSignature')
+      .mockReturnValue('same-graph');
+    const createSpy = jest.spyOn(AccessoryFactory, 'create');
+
+    try {
+      (platform as any).handleNodeUpdated(node);
+
+      expect(existing.updateNode).toHaveBeenCalledWith(node);
+      expect(existing.refresh).toHaveBeenCalled();
+      expect(existing.stop).not.toHaveBeenCalled();
+      expect(createSpy).not.toHaveBeenCalled();
+      expect(matterAdd).not.toHaveBeenCalled();
     } finally {
       graphSpy.mockRestore();
       createSpy.mockRestore();
@@ -815,5 +895,997 @@ describe('ZWaveUsbPlatform', () => {
     } finally {
       createSpy.mockRestore();
     }
+  });
+
+  it('should report route diagnostics for a node', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    const diagnostics = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      status: 4,
+      neighbors: [4],
+      lastWorkingRoute: { repeaters: [], direct: true, ackRSSI: -90 },
+    };
+    controller.getNodeRouteDiagnostics = jest.fn().mockResolvedValue(diagnostics);
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/5/diagnostics';
+    req.method = 'GET';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+      });
+
+      expect(controller.getNodeRouteDiagnostics).toHaveBeenCalledWith(5);
+      expect(JSON.parse((res.end as jest.Mock).mock.calls[0][0])).toEqual({
+        ...diagnostics,
+        isWindowCovering: false,
+      });
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
+
+  it('should answer a diagnostics request for an unknown node with an error', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    const diagnostics = {
+      nodeId: 5,
+      name: "Nico's Shade",
+      status: 4,
+      neighbors: [4],
+      lastWorkingRoute: { repeaters: [], direct: true, ackRSSI: -90 },
+    };
+    controller.getNodeRouteDiagnostics = jest.fn().mockRejectedValue(new Error('Node 99 not found'));
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/99/diagnostics';
+    req.method = 'GET';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+      });
+
+      expect(res.writeHead).toHaveBeenCalledWith(500, expect.anything());
+      expect(JSON.parse((res.end as jest.Mock).mock.calls[0][0])).toEqual({
+        error: 'Node 99 not found',
+      });
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
+  const createCoveringHarness = (
+    platform: any,
+    device: { current: number; duration: unknown; hapCurrent?: number; hapTarget?: number },
+    subtype = '0',
+  ) => {
+    // One stable setter, so a test can assert what was actually written to the covering.
+    const targetSetter = { handleSetRequest: jest.fn().mockResolvedValue(undefined) };
+    const holdSetter = { handleSetRequest: jest.fn().mockResolvedValue(undefined) };
+    const service = {
+      UUID: platform.Service.WindowCovering.UUID,
+      subtype: subtype,
+      getCharacteristic: jest.fn().mockImplementation((type) => {
+        if (type === platform.Characteristic.TargetPosition) {
+          return {
+            ...targetSetter,
+            get value() {
+              return device.hapTarget;
+            },
+          };
+        }
+        if (type === platform.Characteristic.HoldPosition) {
+          return holdSetter;
+        }
+        return {
+          /**
+           * HomeKit's own cache, deliberately distinct from what the device reports. A test that
+           * let these be the same number could not tell a device read from a cached one, which
+           * is what hid the endpoint handling.
+           */
+          get value() {
+            return device.hapCurrent ?? device.current;
+          },
+        };
+      }),
+    };
+
+    platform.zwaveAccessories.set(5, {
+      stop: jest.fn(),
+      platformAccessory: { services: [service] },
+    });
+    platform.zwaveController.nodes.set(5, {
+      nodeId: 5,
+      getValue: jest.fn().mockImplementation((vid: any) => {
+        if (vid.commandClass !== CommandClasses['Multilevel Switch']) return undefined;
+        if (vid.endpoint !== Number(subtype)) return undefined;
+        if (vid.property === 'duration') return device.duration;
+        return device.current;
+      }),
+    });
+
+    return { service, targetSetter, holdSetter };
+  };
+
+  it('should wait for a traveling covering before reporting its position', async () => {
+    jest.useFakeTimers();
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // The covering reports an unknown remaining duration while it travels.
+    const device = { current: 81, duration: { value: 0, unit: 'unknown' } };
+    const { targetSetter } = createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).testCoveringPosition(5, 25);
+      await Promise.resolve();
+
+      // Still at 81 through the grace period: the covering has not begun to move yet, and that
+      // must not be read as having arrived.
+      await jest.advanceTimersByTimeAsync(8000);
+      device.current = 56;
+      await jest.advanceTimersByTimeAsync(4000);
+
+      device.current = 25;
+      device.duration = { value: 0, unit: 'seconds' };
+      // Only a full stall window of standing still ends the wait.
+      await jest.advanceTimersByTimeAsync(4000);
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toEqual({
+        nodeId: 5,
+        requested: 25,
+        before: 81,
+        after: 25,
+        reached: true,
+        startedAtTarget: false,
+        timedOut: false,
+      });
+      // The test tool has to actually drive the covering, not just read it back.
+      expect(targetSetter.handleSetRequest).toHaveBeenCalledWith(25);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should report a covering that accepted the command without moving', async () => {
+    jest.useFakeTimers();
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // The covering answers straight away that it has stopped, right where it already was.
+    const device = { current: 81, duration: { value: 0, unit: 'seconds' } };
+    const { targetSetter } = createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).testCoveringPosition(5, 25);
+      await Promise.resolve();
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toMatchObject({ after: 81, reached: false });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should read a covering published from a non-root endpoint', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // HomeKit's cache holds a stale 99: reading the wrong endpoint falls back to it, so the
+    // test can tell the difference between reading the device and reading the cache.
+    const device = { current: 81, duration: { value: 0, unit: 'seconds' }, hapCurrent: 99 };
+    // The covering lives on endpoint 2, so endpoint 0 reports nothing about it.
+    createCoveringHarness(platform as any, device, '2');
+
+    try {
+      const pending = (platform as any).testCoveringPosition(5, 25);
+      await Promise.resolve();
+
+      device.current = 25;
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toMatchObject({ after: 25, reached: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should send the stop and report it against the target', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // Traveling towards 100 and halted at 76. Movement has to be observed after the stop as
+    // well as a rest short of the target, or a stationary covering with a stale target would
+    // be credited with obeying a stop it never received.
+    const device = { current: 60, duration: { value: 0, unit: 'seconds' }, hapTarget: 100 };
+    const { holdSetter } = createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).stopCovering(5);
+      // It coasts a little further, then stands still.
+      await jest.advanceTimersByTimeAsync(4000);
+      device.current = 76;
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toMatchObject({
+        after: 76,
+        target: 100,
+        moved: true,
+        shortOfTarget: true,
+      });
+      // The stop has to actually be sent, not merely reported.
+      expect(holdSetter.handleSetRequest).toHaveBeenCalledWith(true);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not credit a stop that ended on the target', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // The covering ignored the stop and finished its travel.
+    const device = { current: 100, duration: { value: 0, unit: 'seconds' }, hapTarget: 100 };
+    createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).stopCovering(5);
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toMatchObject({ after: 100, shortOfTarget: false });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not call a covering stopped while it is still reporting movement', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const device = { current: 81, duration: { value: 0, unit: 'unknown' } };
+    createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).stopCovering(5);
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+
+      // Still still at 81 well past the grace period and the stall window. A covering that has
+      // not begun to move must not be read as one that has finished.
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS - 2000);
+      device.current = 70;
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS - 2000);
+      device.current = 60;
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS - 2000);
+      expect(settled).toBe(false);
+
+      // Now it stands still for a full stall window.
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS + 2000);
+      await expect(pending).resolves.toMatchObject({ after: 60 });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not judge a covering that is slow to start as already stopped', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const device = { current: 81, duration: { value: 0, unit: 'unknown' } };
+    createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).testCoveringPosition(5, 25);
+      let settled = false;
+      void pending.then(() => {
+        settled = true;
+      });
+
+      // Still at 81 for longer than the whole stall window before it begins to move. Without
+      // the grace period the stall clock would already have expired and reported 81%.
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS + 2000);
+      expect(settled).toBe(false);
+
+      device.current = 25;
+      await jest.advanceTimersByTimeAsync(COVERING_STALL_WINDOW_MS + 2000);
+
+      await expect(pending).resolves.toMatchObject({ after: 25, reached: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it.each([
+    ['a second move', (platform: any) => platform.driveCovering(5, 100)],
+    ['a stop', (platform: any) => platform.driveCoveringStop(5)],
+  ])('should refuse %s while a covering test is already running', async (_name, second) => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api) as any;
+    const device = { current: 81, duration: { value: 0, unit: 'unknown' } };
+    const { targetSetter, holdSetter } = createCoveringHarness(platform, device);
+
+    try {
+      const first = platform.driveCovering(5, 25);
+      await Promise.resolve();
+
+      // The guard lives in the platform, not the page, so another tab or a direct call to the
+      // local interface cannot drive the same motor while this one is in flight.
+      await expect(second(platform)).rejects.toThrow(/already running/);
+
+      // Nothing beyond the first command reached the covering.
+      expect(targetSetter.handleSetRequest).toHaveBeenCalledTimes(1);
+      expect(holdSetter.handleSetRequest).not.toHaveBeenCalled();
+
+      device.current = 25;
+      await jest.advanceTimersByTimeAsync(
+        COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS + 2000,
+      );
+      await first;
+
+      // Once it finishes the node is free again.
+      const afterwards = platform.driveCoveringStop(5);
+      await jest.advanceTimersByTimeAsync(
+        COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS + 2000,
+      );
+      await expect(afterwards).resolves.toBeDefined();
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not credit a stop to a covering that never moved', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    // Stationary at 76 with a stale target of 100: resting short of the target without ever
+    // moving is not evidence that a stop was obeyed.
+    const device = { current: 76, duration: { value: 0, unit: 'seconds' }, hapTarget: 100 };
+    createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).stopCovering(5);
+      await jest.advanceTimersByTimeAsync(COVERING_REPORT_GRACE_MS + COVERING_STALL_WINDOW_MS);
+
+      await expect(pending).resolves.toMatchObject({
+        after: 76,
+        moved: false,
+        shortOfTarget: false,
+      });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should not report a move as reached when the test timed out', async () => {
+    jest.useFakeTimers();
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const device = { current: 81, duration: { value: 0, unit: 'unknown' } };
+    createCoveringHarness(platform as any, device);
+
+    try {
+      const pending = (platform as any).testCoveringPosition(5, 25);
+      // Keeps reporting new positions right up to the deadline, landing on the target by
+      // coincidence at the moment time runs out.
+      for (let elapsed = 0; elapsed < 72000; elapsed += 2000) {
+        device.current = device.current === 25 ? 26 : 25;
+        await jest.advanceTimersByTimeAsync(2000);
+      }
+
+      await expect(pending).resolves.toMatchObject({ reached: false, timedOut: true });
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('should refuse a position test for a node that is not a covering', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    (platform as any).zwaveAccessories.set(7, {
+      stop: jest.fn(),
+      platformAccessory: { services: [{ UUID: 'something-else' }] },
+    });
+    (platform as any).zwaveController.nodes.set(7, { nodeId: 7, getValue: jest.fn() });
+
+    await expect((platform as any).testCoveringPosition(7, 25)).rejects.toThrow(
+      /not published as a window covering/,
+    );
+    await expect((platform as any).testCoveringPosition(99, 25)).rejects.toThrow(
+      /no HomeKit accessory/,
+    );
+    await expect((platform as any).testCoveringPosition(7, 150)).rejects.toThrow(
+      /between 0 and 100/,
+    );
+  });
+
+  describe('the live set a Matter cache sweep is keyed on', () => {
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      const platform = new ZWaveUsbPlatform(log, config, api) as any;
+      platform.zwaveController.nodes = new Map([[5, { nodeId: 5 }]]);
+      Object.defineProperty(platform.zwaveController, 'homeId', { value: 0xabc, writable: true });
+      return platform;
+    };
+
+    const cached = (uuid: string, nodeId: number, homeId: number) =>
+      ({ UUID: uuid, context: { nodeId, homeId }, services: [] }) as never;
+
+    it('excludes an accessory cached from a different Z-Wave network', () => {
+      // Node numbers are reused across networks, so the node id alone proves nothing.
+      const platform = newPlatform();
+      platform.accessories.push(cached('other-network', 5, 0x999));
+
+      expect(platform.liveAccessoryUuids().has('other-network')).toBe(false);
+    });
+
+    it('keeps a node that has not been built yet, whatever it turns out to be', () => {
+      // Asleep, dead or still interviewing. What it will publish as is not knowable, so
+      // unregistering it from Matter would be a guess against a shade with a flat battery.
+      const platform = newPlatform();
+      platform.accessories.push(cached('not-ready', 5, 0xabc));
+
+      expect(platform.liveAccessoryUuids().has('not-ready')).toBe(true);
+    });
+
+    it('drops a ready accessory with no supported Matter service', () => {
+      // A rebuilt node with no supported services must leave the Matter cache sweep.
+      const platform = newPlatform();
+      platform.accessories.push(cached('reclassified', 5, 0xabc));
+      platform.zwaveAccessories.set(5, {
+        stop: jest.fn(),
+        platformAccessory: { UUID: 'reclassified', services: [{ UUID: 'unsupported-service' }] },
+      });
+
+      expect(platform.liveAccessoryUuids().has('reclassified')).toBe(false);
+    });
+
+    it('keeps a ready accessory that is still a covering', () => {
+      const platform = newPlatform();
+      platform.accessories.push(cached('still-a-covering', 5, 0xabc));
+      platform.zwaveAccessories.set(5, {
+        stop: jest.fn(),
+        platformAccessory: {
+          UUID: 'still-a-covering',
+          services: [{ UUID: platform.Service.WindowCovering.UUID }],
+        },
+      });
+
+      expect(platform.liveAccessoryUuids().has('still-a-covering')).toBe(true);
+    });
+  });
+
+
+  describe('the Matter cache sweep and controller startup', () => {
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      const platform = new ZWaveUsbPlatform(log, config, api) as any;
+      // The controller accessory needs a fuller HAP mock than these tests care about, and none
+      // of them is about it.
+      platform.buildControllerAccessory = jest.fn(() => {
+        platform.controllerAccessory = { stop: jest.fn() };
+      });
+      return platform;
+    };
+
+    it('does not sweep when the controller could not be started', async () => {
+      // An empty node list after a failed start means the stick could not be read, not that
+      // every node was removed. Sweeping on it would unregister every restored covering.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterAccessories.reconcileCached = reconcile;
+      platform.zwaveController.start = jest.fn().mockRejectedValue(new Error('stick unplugged'));
+
+      try {
+        await platform.connectToZWaveController();
+
+        expect(reconcile).not.toHaveBeenCalled();
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('sweeps once on the retry that finally connects', async () => {
+      // didFinishLaunching has long since returned by then, so nothing else would run it.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterAccessories.reconcileCached = reconcile;
+      platform.zwaveController.start = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('stick unplugged'))
+        .mockResolvedValue(undefined);
+
+      try {
+        await platform.connectToZWaveController();
+        expect(reconcile).not.toHaveBeenCalled();
+
+        await jest.advanceTimersByTimeAsync(31000);
+
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not report a Matter sweep failure as a Z-Wave connection failure', async () => {
+      // Matter is optional. Treating its failure as the stick failing schedules another connect,
+      // and that stops a driver that is working perfectly well.
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      platform.matterAccessories.reconcileCached = jest
+        .fn()
+        .mockRejectedValue(new Error('matter is unwell'));
+      const start = jest.fn().mockResolvedValue(undefined);
+      platform.zwaveController.start = start;
+
+      try {
+        await platform.connectToZWaveController();
+
+        // The connection stands: no retry was scheduled and the controller accessory was built.
+        expect(platform.retryTimeout).toBeUndefined();
+        expect(platform.controllerAccessory).toBeDefined();
+
+        await jest.advanceTimersByTimeAsync(31000);
+        expect(start).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.matterSweepTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('retries only the sweep after it fails, without touching Z-Wave', async () => {
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('matter is unwell'))
+        .mockResolvedValue(undefined);
+      platform.matterAccessories.reconcileCached = reconcile;
+      const start = jest.fn().mockResolvedValue(undefined);
+      platform.zwaveController.start = start;
+
+      try {
+        await platform.connectToZWaveController();
+        expect(reconcile).toHaveBeenCalledTimes(1);
+
+        await jest.advanceTimersByTimeAsync(31000);
+
+        expect(reconcile).toHaveBeenCalledTimes(2);
+        // The driver was never restarted to get there.
+        expect(start).toHaveBeenCalledTimes(1);
+
+        // And once it succeeds it does not keep going.
+        await jest.advanceTimersByTimeAsync(31000);
+        expect(reconcile).toHaveBeenCalledTimes(2);
+      } finally {
+        clearTimeout(platform.matterSweepTimeout);
+        jest.useRealTimers();
+      }
+    });
+
+    it('sweeps only once across repeated connections', async () => {
+      jest.useFakeTimers();
+      const platform = newPlatform();
+      const reconcile = jest.fn().mockResolvedValue(undefined);
+      platform.matterAccessories.reconcileCached = reconcile;
+      platform.zwaveController.start = jest.fn().mockResolvedValue(undefined);
+
+      try {
+        await platform.connectToZWaveController();
+        await platform.connectToZWaveController();
+
+        expect(reconcile).toHaveBeenCalledTimes(1);
+      } finally {
+        clearTimeout(platform.retryTimeout);
+        jest.useRealTimers();
+      }
+    });
+  });
+
+  it('should refuse a failed-node removal whose confirmation does not match', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    controller.removeFailedNode = jest
+      .fn()
+      .mockRejectedValue(new Error('Refusing to remove Node 8: the confirmation did not match'));
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/8/remove-failed';
+    req.method = 'POST';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+        req.emit('data', JSON.stringify({ confirmNodeId: 5 }));
+        req.emit('end');
+      });
+
+      expect(controller.removeFailedNode).toHaveBeenCalledWith(8, 5);
+      expect(res.writeHead).toHaveBeenCalledWith(400, { 'Content-Type': 'application/json' });
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
+
+  describe('failed-node removal check route', () => {
+    const driveGet = async (platform: any, url: string) => {
+      const fakeServer = new EventEmitter() as EventEmitter & {
+        listen: jest.Mock;
+        close: jest.Mock;
+        address: jest.Mock;
+      };
+      fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+      fakeServer.close = jest.fn();
+      fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+      const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+      const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+      const res = { writeHead: jest.fn(), end: jest.fn() };
+      req.url = url;
+      req.method = 'GET';
+
+      try {
+        platform.startIpcServer();
+        const handler = createServerSpy.mock.calls.at(-1)?.[0];
+        await new Promise<void>((resolve) => {
+          res.end = jest.fn().mockImplementation(() => resolve());
+          handler(req, res);
+        });
+        return {
+          status: (res.writeHead as jest.Mock).mock.calls[0]?.[0],
+          body: JSON.parse((res.end as jest.Mock).mock.calls[0][0]),
+        };
+      } finally {
+        createServerSpy.mockRestore();
+      }
+    };
+
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      return new ZWaveUsbPlatform(log, config, api) as any;
+    };
+
+    it('returns the controller assessment for the node', async () => {
+      // The URL the UI server builds and the matcher the platform uses are independent strings.
+      // Without this, changing either one alone keeps the suite green and breaks the button.
+      const platform = newPlatform();
+      const assessment = {
+        nodeId: 8,
+        name: "Lia's Shade",
+        status: 3,
+        eligible: true,
+        reason: 'The controller reports Node 8 as failed.',
+      };
+      platform.zwaveController.assessFailedNodeRemoval = jest.fn().mockResolvedValue(assessment);
+
+      const { body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(platform.zwaveController.assessFailedNodeRemoval).toHaveBeenCalledWith(8);
+      expect(body).toEqual(assessment);
+    });
+
+    it('answers with an error when the assessment fails', async () => {
+      const platform = newPlatform();
+      platform.zwaveController.assessFailedNodeRemoval = jest
+        .fn()
+        .mockRejectedValue(new Error('Driver not started'));
+
+      const { status, body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(status).toBe(500);
+      expect(body.error).toBe('Driver not started');
+    });
+
+    it('answers rather than hanging when there is no controller', async () => {
+      // The dialog awaits this with no timeout, so a route that returns without writing leaves
+      // the Remove button disabled with nothing on screen to explain it.
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
+  });
+
+  describe('route rebuild IPC routes', () => {
+    const driveRoute = async (
+      platform: any,
+      url: string,
+      method: string,
+    ): Promise<{ status: number | undefined; body: any }> => {
+      const fakeServer = new EventEmitter() as EventEmitter & {
+        listen: jest.Mock;
+        close: jest.Mock;
+        address: jest.Mock;
+      };
+      fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+      fakeServer.close = jest.fn();
+      fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+      const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+      const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+      const res = { writeHead: jest.fn(), end: jest.fn() };
+      req.url = url;
+      req.method = method;
+
+      try {
+        platform.startIpcServer();
+        const handler = createServerSpy.mock.calls.at(-1)?.[0];
+        await new Promise<void>((resolve) => {
+          res.end = jest.fn().mockImplementation(() => resolve());
+          handler(req, res);
+        });
+        return {
+          status: (res.writeHead as jest.Mock).mock.calls[0]?.[0],
+          body: JSON.parse((res.end as jest.Mock).mock.calls[0][0]),
+        };
+      } finally {
+        createServerSpy.mockRestore();
+      }
+    };
+
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      return new ZWaveUsbPlatform(log, config, api) as any;
+    };
+
+    it.each([
+      ['started', 'started'],
+      ['busy', 'busy'],
+      ['refused', 'refused'],
+    ])('passes the controller result %s through unchanged', async (_name, result) => {
+      // The three outcomes are not interchangeable: busy means a rebuild this plugin did not
+      // start is running, so the UI still has something to wait for, and refused means nothing
+      // is running at all. Collapsing them to a boolean loses that.
+      const platform = newPlatform();
+      platform.zwaveController.startHealing = jest.fn().mockResolvedValue(result);
+      // isHealing tracks only rebuilds this plugin started, so it is false for busy. That is
+      // exactly why the status route also reports the driver's own view.
+      platform.zwaveController.isHealing = jest.fn().mockReturnValue(result === 'started');
+
+      const { body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(body).toEqual({ result, healing: result === 'started' });
+    });
+
+    it.each([
+      [true, false],
+      [false, true],
+      [false, false],
+    ])('reports healing=%p and rebuilding=%p', async (healing, rebuilding) => {
+      // Both are needed. A rebuild started before this plugin began tracking one is invisible to
+      // isHealing, so reporting only that would tell the UI it had finished immediately.
+      const platform = newPlatform();
+      platform.zwaveController.isHealing = jest.fn().mockReturnValue(healing);
+      platform.zwaveController.isRebuildingRoutes = jest.fn().mockReturnValue(rebuilding);
+
+      const { body } = await driveRoute(platform, '/network/heal/status', 'GET');
+
+      expect(body).toEqual({ healing, rebuilding });
+    });
+
+    it('answers the status route with an error when there is no controller', async () => {
+      // Answering healing:false here would be read as "the rebuild finished".
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveRoute(platform, '/network/heal/status', 'GET');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
+
+    it('answers with an error when the controller refuses to start a rebuild', async () => {
+      const platform = newPlatform();
+      platform.zwaveController.startHealing = jest
+        .fn()
+        .mockRejectedValue(new Error('Driver not started'));
+
+      const { status, body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(status).toBe(500);
+      expect(body.error).toBe('Driver not started');
+    });
+
+    it('answers rather than hanging when there is no controller', async () => {
+      // The management UI awaits this request with no timeout, so a route that returns without
+      // writing leaves its button disabled for good.
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
   });
 });

@@ -34,3 +34,18 @@ jobs:
 
       - name: Test
         run: npm test
+
+  matter-host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build
+      - name: Install Homebridge Matter host for integration checks
+        run: npm install --prefix "$RUNNER_TEMP/matter-host" --no-save --ignore-scripts homebridge@2.4.0
+      - name: Validate fresh and restored Matter endpoints
+        run: node scripts/verify-matter-host.mjs "$RUNNER_TEMP/matter-host/node_modules/homebridge"
