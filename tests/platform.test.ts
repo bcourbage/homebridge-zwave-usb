@@ -1633,4 +1633,142 @@ describe('ZWaveUsbPlatform', () => {
     });
   });
 
+  it('should refuse a failed-node removal whose confirmation does not match', async () => {
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    controller.removeFailedNode = jest
+      .fn()
+      .mockRejectedValue(new Error('Refusing to remove Node 8: the confirmation did not match'));
+
+    const fakeServer = new EventEmitter() as EventEmitter & {
+      listen: jest.Mock;
+      close: jest.Mock;
+      address: jest.Mock;
+    };
+    fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+    fakeServer.close = jest.fn();
+    fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+    const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+    const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+    const res = { writeHead: jest.fn(), end: jest.fn() };
+    req.url = '/nodes/8/remove-failed';
+    req.method = 'POST';
+
+    try {
+      (platform as any).startIpcServer();
+      const handler = createServerSpy.mock.calls.at(-1)?.[0];
+      await new Promise<void>((resolve) => {
+        res.end = jest.fn().mockImplementation(() => resolve());
+        handler(req, res);
+        req.emit('data', JSON.stringify({ confirmNodeId: 5 }));
+        req.emit('end');
+      });
+
+      expect(controller.removeFailedNode).toHaveBeenCalledWith(8, 5);
+      expect(res.writeHead).toHaveBeenCalledWith(400, { 'Content-Type': 'application/json' });
+    } finally {
+      createServerSpy.mockRestore();
+    }
+  });
+
+  describe('failed-node removal check route', () => {
+    const driveGet = async (platform: any, url: string) => {
+      const fakeServer = new EventEmitter() as EventEmitter & {
+        listen: jest.Mock;
+        close: jest.Mock;
+        address: jest.Mock;
+      };
+      fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+      fakeServer.close = jest.fn();
+      fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+      const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+      const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+      const res = { writeHead: jest.fn(), end: jest.fn() };
+      req.url = url;
+      req.method = 'GET';
+
+      try {
+        platform.startIpcServer();
+        const handler = createServerSpy.mock.calls.at(-1)?.[0];
+        await new Promise<void>((resolve) => {
+          res.end = jest.fn().mockImplementation(() => resolve());
+          handler(req, res);
+        });
+        return {
+          status: (res.writeHead as jest.Mock).mock.calls[0]?.[0],
+          body: JSON.parse((res.end as jest.Mock).mock.calls[0][0]),
+        };
+      } finally {
+        createServerSpy.mockRestore();
+      }
+    };
+
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      return new ZWaveUsbPlatform(log, config, api) as any;
+    };
+
+    it('returns the controller assessment for the node', async () => {
+      // The URL the UI server builds and the matcher the platform uses are independent strings.
+      // Without this, changing either one alone keeps the suite green and breaks the button.
+      const platform = newPlatform();
+      const assessment = {
+        nodeId: 8,
+        name: "Lia's Shade",
+        status: 3,
+        eligible: true,
+        reason: 'The controller reports Node 8 as failed.',
+      };
+      platform.zwaveController.assessFailedNodeRemoval = jest.fn().mockResolvedValue(assessment);
+
+      const { body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(platform.zwaveController.assessFailedNodeRemoval).toHaveBeenCalledWith(8);
+      expect(body).toEqual(assessment);
+    });
+
+    it('answers with an error when the assessment fails', async () => {
+      const platform = newPlatform();
+      platform.zwaveController.assessFailedNodeRemoval = jest
+        .fn()
+        .mockRejectedValue(new Error('Driver not started'));
+
+      const { status, body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(status).toBe(500);
+      expect(body.error).toBe('Driver not started');
+    });
+
+    it('answers rather than hanging when there is no controller', async () => {
+      // The dialog awaits this with no timeout, so a route that returns without writing leaves
+      // the Remove button disabled with nothing on screen to explain it.
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveGet(platform, '/nodes/8/removal-check');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
+  });
+
 });

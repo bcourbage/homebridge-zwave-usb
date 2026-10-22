@@ -243,8 +243,12 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         ) {
           const parts = normalizedUrl.split('/');
           const nodeId = parseInt(parts[2], 10);
+          if (!this.zwaveController) {
+            sendJson({ error: 'Controller not initialized' }, 500);
+            return;
+          }
           this.zwaveController
-            ?.refreshNodeInfo(nodeId)
+            .refreshNodeInfo(nodeId)
             .then((result) => {
               this.refreshStates.set(
                 nodeId,
@@ -307,6 +311,51 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           this.driveCoveringStop(nodeId)
             .then((result) => sendJson(result))
             .catch((err) => sendJson({ error: describeRequestFailure(err) }, 400));
+          return;
+        }
+
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/removal-check') &&
+          method === 'GET'
+        ) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          if (!this.zwaveController) {
+            // Answer rather than fall through. The UI awaits this request with no timeout, so a
+            // silent route would leave its Remove button disabled for good.
+            sendJson({ error: 'Controller not initialized' }, 500);
+            return;
+          }
+          this.zwaveController
+            .assessFailedNodeRemoval(nodeId)
+            .then((assessment) => sendJson(assessment))
+            .catch((err) => sendJson({ error: err.message }, 500));
+          return;
+        }
+
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/remove-failed') &&
+          method === 'POST'
+        ) {
+          let body = '';
+          req.on('data', (chunk) => (body += chunk));
+          req.on('end', async () => {
+            try {
+              const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+              const { confirmNodeId } = JSON.parse(body || '{}');
+
+              if (!this.zwaveController) {
+                throw new Error('Controller not initialized');
+              }
+
+              await this.zwaveController.removeFailedNode(nodeId, Number(confirmNodeId));
+              return sendJson({ success: true, nodeId });
+            } catch (err) {
+              this.log.error(`Failed-node removal rejected: ${err}`);
+              return sendJson({ error: err instanceof Error ? err.message : String(err) }, 400);
+            }
+          });
           return;
         }
 

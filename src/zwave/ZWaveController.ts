@@ -1,8 +1,9 @@
 import { Logger } from 'homebridge';
 import { Driver, ZWaveNode, InclusionStrategy, RebuildRoutesStatus } from 'zwave-js';
-import { CommandClasses, isRssiError, rssiToString } from '@zwave-js/core';
+import { CommandClasses, NodeStatus, isRssiError, rssiToString } from '@zwave-js/core';
 import { EventEmitter } from 'events';
 import {
+  FailedNodeRemovalAssessment,
   HealStartResult,
   IZWaveController,
   NodeRouteDiagnostics,
@@ -1003,24 +1004,109 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
   }
 
   /**
-   * REMOVE FAILED NODE FIX: Allows users to prune dead/broken devices
-   * that can no longer be physically excluded.
+   * Reports whether a node may be removed, and why. A node that is merely unreachable is not
+   * eligible: an unpowered but otherwise healthy device looks exactly the same from here.
    */
-  public async removeFailedNode(nodeId: number): Promise<void> {
+  public async assessFailedNodeRemoval(nodeId: number): Promise<FailedNodeRemovalAssessment> {
+    const node = this.nodes.get(nodeId);
+    const name = node
+      ? node.name || node.label || node.deviceConfig?.label || `Node ${nodeId}`
+      : `Node ${nodeId}`;
+    const status = node?.status ?? NodeStatus.Unknown;
+    const base = { nodeId, name, status };
+
+    if (!this.driver) {
+      return { ...base, eligible: false, reason: 'The Z-Wave driver is not running.' };
+    }
+
+    if (nodeId === 1) {
+      return {
+        ...base,
+        eligible: false,
+        reason: 'Node 1 is the controller and cannot be removed.',
+      };
+    }
+
+    if (!node) {
+      return { ...base, eligible: false, reason: `Node ${nodeId} is not part of this network.` };
+    }
+
+    /**
+     * Keyed on what the device IS, not on what it is doing right now. A battery device moves
+     * between Asleep, Awake and Unknown, and Unknown is exactly the state a node sits in while
+     * it waits for its first wake-up after a restart, which is when a user is most likely to
+     * reach for Remove.
+     */
+    if (!node.isListening && !node.isFrequentListening) {
+      return {
+        ...base,
+        eligible: false,
+        reason:
+          `Node ${nodeId} is a battery device that sleeps between wake-ups. This plugin does ` +
+          'not remove sleeping devices, because one that is merely out of battery looks the ' +
+          'same as one that is gone. Remove it by excluding it from the network instead.',
+      };
+    }
+
+    let isFailed: boolean;
+    try {
+      isFailed = await this.driver.controller.isFailedNode(nodeId);
+    } catch (err) {
+      return {
+        ...base,
+        eligible: false,
+        reason: `The controller could not check Node ${nodeId}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      };
+    }
+
+    if (!isFailed) {
+      return {
+        ...base,
+        eligible: false,
+        reason: `The controller does not consider Node ${nodeId} failed.`,
+      };
+    }
+
+    return {
+      ...base,
+      eligible: true,
+      reason:
+        `The controller reports Node ${nodeId} as failed. Confirm the device is gone for good ` +
+        'before removing it, because an unpowered device also reports as failed.',
+    };
+  }
+
+  /**
+   * Removes a single node the caller has explicitly identified. `confirmNodeId` must repeat the
+   * node ID so a mis-routed request cannot delete the wrong device, and eligibility is checked
+   * again immediately before the removal.
+   */
+  public async removeFailedNode(nodeId: number, confirmNodeId: number): Promise<void> {
     if (!this.driver) {
       throw new Error('Driver not started');
     }
-    this.log.info(`Attempting to remove failed node ${nodeId}...`);
-    try {
-      // 1. Z-Wave JS requires checking if the node is actually failed first
-      const isFailed = await this.driver.controller.isFailedNode(nodeId);
-      if (!isFailed) {
-        throw new Error(`Node ${nodeId} is not marked as failed. Cannot remove.`);
-      }
 
-      // 2. Instruct controller to remove it
+    if (confirmNodeId !== nodeId) {
+      throw new Error(
+        `Refusing to remove Node ${nodeId}: the confirmation did not match the node ID.`,
+      );
+    }
+
+    const assessment = await this.assessFailedNodeRemoval(nodeId);
+    this.log.info(
+      `Failed-node removal check for Node ${nodeId} (${assessment.name}): ` +
+        `${assessment.eligible ? 'eligible' : 'not eligible'} - ${assessment.reason}`,
+    );
+
+    if (!assessment.eligible) {
+      throw new Error(assessment.reason);
+    }
+
+    try {
       await this.driver.controller.removeFailedNode(nodeId);
-      this.log.info(`Node ${nodeId} removed successfully.`);
+      this.log.info(`Node ${nodeId} (${assessment.name}) removed successfully.`);
       this.emit('status updated', `Node ${nodeId} Removed`);
     } catch (err) {
       this.log.error(`Failed to remove failed node ${nodeId}:`, err);

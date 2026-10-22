@@ -141,7 +141,6 @@ This plugin adds a management accessory to your Home app to handle network opera
 - **Inclusion Mode**: A switch to start/stop pairing new devices (active for 3 minutes).
 - **Exclusion Mode**: A switch to remove/reset existing devices.
 - **Heal Network**: A switch to trigger a background mesh network optimization. Sleeping devices are skipped unless **Heal Network Includes Sleeping Devices** is turned on, so the operation finishes in a predictable time. Progress appears in System Status, and the switch turns itself off when the rebuild finishes, is stopped, or reports nothing for ten minutes.
-- **Prune Dead Nodes**: Automatically removes devices marked as "Dead" (failed) from the network. **Safe for battery devices**: This only removes nodes the controller has confirmed as failed (Status 3); it will never remove a device that is simply "Asleep" (Status 1).
 
 Controller switch labels are exposed using a compatibility path for Home app visibility. Some HomeKit apps may still render these actions differently.
 
@@ -163,6 +162,7 @@ The plugin includes a dedicated **Maintenance** tab within the Homebridge custom
 - **Battery Device Support**: Firmware updates are supported for battery-powered devices. You will be prompted to manually wake the device after starting the process to initiate the transfer.
 - **Real-time Progress**: Monitor the progress of the firmware transfer via a live progress bar.
 - **Clean Up Stale Accessories**: Remove stale cached Homebridge accessories explicitly from the maintenance UI instead of relying on automatic startup pruning.
+- **Remove a Failed Node**: Remove one node from the Z-Wave network, after the controller has been asked whether it can be removed and the answer has been shown. A battery device that sleeps between wake-ups is refused, as is a node the controller cannot assess. Removal is permanent and the device has to be included again physically.
 
 ## ❓ Troubleshooting
 

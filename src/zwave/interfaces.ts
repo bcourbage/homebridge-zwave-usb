@@ -68,6 +68,15 @@ export interface NodeRouteDiagnostics {
   backgroundRSSI?: Record<string, number | string>;
 }
 
+/** Why a node may or may not be removed from the network. */
+export interface FailedNodeRemovalAssessment {
+  nodeId: number;
+  name: string;
+  status: number;
+  eligible: boolean;
+  reason: string;
+}
+
 export interface IZWaveController extends EventEmitter {
   homeId: number | undefined;
   nodes: Map<number, ZWaveNode>;
@@ -81,7 +90,8 @@ export interface IZWaveController extends EventEmitter {
   stopHealing(): Promise<boolean>;
   /** Whether a route rebuild this plugin started is still in progress. */
   isHealing(): boolean;
-  removeFailedNode(nodeId: number): Promise<void>;
+  assessFailedNodeRemoval(nodeId: number): Promise<FailedNodeRemovalAssessment>;
+  removeFailedNode(nodeId: number, confirmNodeId: number): Promise<void>;
   getNodeRouteDiagnostics(nodeId: number): Promise<NodeRouteDiagnostics>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
