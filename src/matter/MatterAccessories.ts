@@ -1,12 +1,9 @@
 import { Characteristic, PlatformAccessory, Service } from 'homebridge';
 import { ZWaveUsbPlatform } from '../platform/ZWaveUsbPlatform';
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
-import {
-  homeKitBatteryToMatterPercent,
-  homeKitPositionToMatterLift,
-  matterLiftToHomeKitPosition,
-} from './coveringPosition';
+import { homeKitBatteryToMatterPercent } from './coveringPosition';
 import { matterLabel, matterSerialNumber } from './matterText';
+import { serviceMappings, ServiceMapping } from './serviceMappings';
 
 /** The status errors a cluster handler throws to report a failure to the controller. */
 interface MatterStatusErrors {
@@ -28,6 +25,13 @@ interface PendingPublication {
  */
 interface MatterApi {
   deviceTypes: Record<string, unknown>;
+  switch?: {
+    emitGesture(
+      uuid: string,
+      gesture: 'singlePress' | 'doublePress' | 'longPress',
+      options?: { partId?: string },
+    ): Promise<void>;
+  };
   status: MatterStatusErrors;
   registerPlatformAccessories(
     pluginIdentifier: string,
@@ -38,6 +42,7 @@ interface MatterApi {
     uuid: string,
     cluster: string,
     attributes: Record<string, unknown>,
+    partId?: string,
   ): Promise<unknown>;
   unregisterPlatformAccessories(
     pluginIdentifier: string,
@@ -57,14 +62,15 @@ interface MatterAccessoryDescriptor {
   context: Record<string, unknown>;
   clusters: Record<string, Record<string, unknown>>;
   handlers: Record<string, Record<string, (request?: never) => Promise<void> | void>>;
+  parts?: Array<{
+    id: string;
+    displayName: string;
+    deviceType: unknown;
+    clusters: Record<string, Record<string, unknown>>;
+    handlers: Record<string, Record<string, (request?: never) => Promise<void> | void>>;
+  }>;
 }
 
-/** Matter's WindowCovering command payload for an absolute lift position. */
-interface GoToLiftPercentageRequest {
-  liftPercent100thsValue: number;
-}
-
-const WINDOW_COVERING_CLUSTER = 'windowCovering';
 const POWER_SOURCE_CLUSTER = 'powerSource';
 
 /** PowerSource.BatChargeLevel */
@@ -79,14 +85,14 @@ const BAT_CHARGE_WARNING = 1;
 const PUBLISH_DEBOUNCE_MS = 3000;
 
 /**
- * Publishes covering accessories over Matter so controllers that cannot speak HomeKit, such as
+ * Publishes supported Z-Wave services over Matter so controllers that cannot speak HomeKit, such as
  * Alexa, can operate them.
  *
- * Commands are routed through the covering's HomeKit characteristics, so a Matter request goes
+ * Commands are routed through the accessory's HomeKit characteristics, so a Matter request goes
  * through the same command coalescing, encoding and position reconciliation as a HomeKit one.
  * Nothing here talks to Z-Wave directly.
  */
-export class MatterCoverings {
+export class MatterAccessories {
   private readonly published = new Set<string>();
   /** Descriptors of what was registered, so an accessory can be unregistered again. */
   private readonly descriptors = new Map<string, MatterAccessoryDescriptor>();
@@ -119,6 +125,7 @@ export class MatterCoverings {
   private readonly tracked = new Map<string, ZWaveAccessory>();
   private readonly pending = new Map<string, ZWaveAccessory>();
   private publishTimer?: NodeJS.Timeout;
+  private stopped = false;
 
   constructor(private readonly platform: ZWaveUsbPlatform) {}
 
@@ -127,6 +134,9 @@ export class MatterCoverings {
   }
 
   public stop(): void {
+    this.stopped = true;
+    for (const uuid of this.inFlight)
+      this.generations.set(uuid, (this.generations.get(uuid) ?? 0) + 1);
     if (this.publishTimer) {
       clearTimeout(this.publishTimer);
       this.publishTimer = undefined;
@@ -197,7 +207,7 @@ export class MatterCoverings {
 
   /**
    * Removes every Matter accessory Homebridge restored that this run did not match to a live
-   * covering. Called once the network has been discovered, which is the first moment the absence
+   * device. Called once the network has been discovered, which is the first moment the absence
    * of a node means the node is gone rather than not interviewed yet.
    */
   public async reconcileCached(liveUuids: ReadonlySet<string>): Promise<void> {
@@ -219,15 +229,15 @@ export class MatterCoverings {
 
   /**
    * Queues an accessory for publication. Safe to call repeatedly: an accessory is only ever
-   * published once, and a node that is not a covering is ignored.
+   * published once, and services without a supported mapping are ignored.
    */
   public add(accessory: ZWaveAccessory): void {
-    if (!this.matter) {
+    if (!this.matter || this.stopped) {
       return;
     }
 
     const uuid = accessory.platformAccessory.UUID;
-    if (!this.findCoveringService(accessory.platformAccessory)) {
+    if (!this.supports(accessory)) {
       return;
     }
 
@@ -260,18 +270,45 @@ export class MatterCoverings {
     this.publishTimer.unref();
   }
 
-  private findCoveringService(platformAccessory: PlatformAccessory): Service | undefined {
-    const coveringType = this.platform.Service.WindowCovering as unknown as { UUID?: string };
-    if (!coveringType?.UUID) {
-      return undefined;
-    }
+  public supports(accessory: ZWaveAccessory): boolean {
+    return (
+      serviceMappings(this.platform, accessory, {
+        read: async () => undefined,
+        write: async () => undefined,
+      }).length > 0
+    );
+  }
 
-    return platformAccessory.services.find((service) => service.UUID === coveringType.UUID);
+  private mappings(accessory: ZWaveAccessory): ServiceMapping[] {
+    return serviceMappings(this.platform, accessory, {
+      read: async (key, type) => {
+        const current = this.live(accessory.platformAccessory.UUID, this.matter!);
+        const service = this.mappings(current).find((m) => m.key === key)?.service;
+        if (!service) throw new this.matter!.status.NotFound('Service is no longer available');
+        return service.getCharacteristic(type).handleGetRequest();
+      },
+      write: async (key, type, value) => {
+        const current = this.live(accessory.platformAccessory.UUID, this.matter!);
+        const service = this.mappings(current).find((m) => m.key === key)?.service;
+        if (!service) throw new this.matter!.status.NotFound('Service is no longer available');
+        await this.writeCharacteristic(
+          service,
+          type,
+          value,
+          current,
+          type === this.platform.Characteristic.HoldPosition
+            ? 'stop request'
+            : type === this.platform.Characteristic.TargetPosition
+              ? `${String(value)}% position request`
+              : type.UUID,
+        );
+      },
+    }).filter((mapping) => !!this.matter?.deviceTypes[mapping.deviceType]);
   }
 
   private async publishPending(): Promise<void> {
     const matter = this.matter;
-    if (!matter || this.pending.size === 0) {
+    if (!matter || this.stopped || this.pending.size === 0) {
       return;
     }
 
@@ -303,7 +340,15 @@ export class MatterCoverings {
     const restored: PendingPublication[] = [];
 
     for (const [uuid, accessory] of queued) {
-      const descriptor = await this.describe(accessory, matter);
+      let descriptor: MatterAccessoryDescriptor | undefined;
+      try {
+        descriptor = await this.describe(accessory, matter);
+      } catch (err) {
+        this.platform.log.warn(
+          `Could not describe ${accessory.platformAccessory.displayName} for Matter: ${String(err)}`,
+        );
+        continue;
+      }
       if (!descriptor) {
         continue;
       }
@@ -396,7 +441,7 @@ export class MatterCoverings {
        * dispatched, must not disturb the HomeKit accessories that are already working.
        */
       this.platform.log.warn(
-        `Could not publish ${descriptors.length} covering(s) over Matter: ${
+        `Could not publish ${descriptors.length} accessory(ies) over Matter: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -420,7 +465,7 @@ export class MatterCoverings {
       // Claimed, so no longer a restored endpoint awaiting reclamation.
       this.cached.delete(entry.uuid);
       this.tracked.set(entry.uuid, entry.accessory);
-      this.trackPosition(entry.accessory);
+      this.trackState(entry.accessory);
       this.trackBattery(entry.accessory);
       committed.push(entry);
     }
@@ -432,7 +477,7 @@ export class MatterCoverings {
        * The wording follows.
        */
       this.platform.log.info(
-        `Handed ${committed.length} covering(s) to Matter: ` +
+        `Handed ${committed.length} accessory(ies) to Matter: ` +
           committed.map((entry) => entry.accessory.platformAccessory.displayName).join(', '),
       );
     }
@@ -450,7 +495,7 @@ export class MatterCoverings {
        * the controller that nothing knows about.
        */
       this.platform.log.warn(
-        `Could not undo a registration for ${undo.length} removed covering(s): ${
+        `Could not undo a registration for ${undo.length} removed accessory(ies): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -458,72 +503,95 @@ export class MatterCoverings {
     }
   }
 
+  private async mappingState(
+    mapping: ServiceMapping,
+  ): Promise<Record<string, Record<string, unknown>>> {
+    const clusters = Object.fromEntries(
+      Object.entries(mapping.clusters).map(([name, state]) => [name, { ...state }]),
+    );
+    for (const binding of mapping.bindings) {
+      if (binding.event) continue;
+      let value: unknown;
+      try {
+        const characteristic = mapping.service.getCharacteristic(binding.characteristic);
+        value = await characteristic.handleGetRequest();
+      } catch {
+        value = undefined;
+      }
+      Object.assign((clusters[binding.cluster] ??= {}), binding.attributes(value));
+    }
+    if (
+      clusters.windowCovering &&
+      clusters.windowCovering.targetPositionLiftPercent100ths == null
+    ) {
+      clusters.windowCovering.targetPositionLiftPercent100ths =
+        clusters.windowCovering.currentPositionLiftPercent100ths;
+    }
+    return clusters;
+  }
+
   private async describe(
     accessory: ZWaveAccessory,
     matter: MatterApi,
   ): Promise<MatterAccessoryDescriptor | undefined> {
-    const platformAccessory = accessory.platformAccessory;
-    const uuid = platformAccessory.UUID;
-    const service = this.findCoveringService(platformAccessory);
-    const deviceType = matter.deviceTypes?.WindowCovering;
-
-    if (!service || !deviceType) {
-      return undefined;
-    }
-
-    const information = this.readAccessoryInformation(platformAccessory);
-    /**
-     * A covering that has not reported yet has no position, and the attribute is nullable for
-     * exactly that. Publishing a number would be worse than vague: HomeKit 0 is fully closed and
-     * inverts to Matter 10000, so every controller on the network would be told the covering is
-     * shut. This is the same encoding the battery level above uses for an unknown level.
-     */
-    const known = await this.readPosition(service);
-    const knownTarget = await this.readTargetPosition(service);
-    const lift = known === undefined ? null : homeKitPositionToMatterLift(known);
-    const targetLift = knownTarget === undefined ? lift : homeKitPositionToMatterLift(knownTarget);
-    const battery = this.describeBattery(platformAccessory);
-
-    return {
-      UUID: platformAccessory.UUID,
-      displayName: matterLabel(platformAccessory.displayName),
-      deviceType,
+    const mappings = this.mappings(accessory);
+    const root = mappings[0];
+    if (!root) return undefined;
+    const information = this.readAccessoryInformation(accessory.platformAccessory);
+    const battery = this.describeBattery(accessory.platformAccessory);
+    const descriptor: MatterAccessoryDescriptor = {
+      UUID: accessory.platformAccessory.UUID,
+      displayName: matterLabel(accessory.platformAccessory.displayName),
+      deviceType: matter.deviceTypes[root.deviceType],
       serialNumber: matterSerialNumber(information.serialNumber),
       manufacturer: matterLabel(information.manufacturer),
       model: matterLabel(information.model),
       firmwareRevision: information.firmwareRevision,
-      context: { nodeId: accessory.node.nodeId },
+      context: { nodeId: accessory.node.nodeId, serviceKey: root.key },
       clusters: {
-        [WINDOW_COVERING_CLUSTER]: {
-          type: 0, // Rollershade
-          endProductType: 0,
-          configStatus: { operational: true, online: true, liftPositionAware: true },
-          currentPositionLiftPercent100ths: lift,
-          targetPositionLiftPercent100ths: targetLift,
-        },
-        ...(battery ? { [POWER_SOURCE_CLUSTER]: battery } : {}),
+        ...(await this.mappingState(root)),
+        ...(battery ? { powerSource: battery } : {}),
       },
-      handlers: {
-        /**
-         * Each handler is async so that resolving the accessory reports a failure the same way
-         * the command itself does. Thrown from a plain arrow it would escape synchronously,
-         * past a caller that only watches the returned promise.
-         */
-        [WINDOW_COVERING_CLUSTER]: {
-          goToLiftPercentage: async (request?: never) => {
-            const { liftPercent100thsValue } = (request ??
-              {}) as unknown as GoToLiftPercentageRequest;
-            return this.requestPosition(
-              this.live(uuid, matter),
-              matterLiftToHomeKitPosition(liftPercent100thsValue),
-            );
-          },
-          upOrOpen: async () => this.requestPosition(this.live(uuid, matter), 100),
-          downOrClose: async () => this.requestPosition(this.live(uuid, matter), 0),
-          stopMotion: async () => this.requestStop(this.live(uuid, matter)),
-        },
-      },
+      handlers: this.handlers(root, matter),
     };
+    if (mappings.length > 1) {
+      descriptor.parts = await Promise.all(
+        mappings.slice(1).map(async (mapping) => ({
+          id: mapping.key,
+          displayName: matterLabel(
+            mapping.service.displayName || accessory.platformAccessory.displayName,
+          ),
+          deviceType: matter.deviceTypes[mapping.deviceType],
+          clusters: await this.mappingState(mapping),
+          handlers: this.handlers(mapping, matter),
+        })),
+      );
+    }
+    return descriptor;
+  }
+
+  private handlers(
+    mapping: ServiceMapping,
+    matter: MatterApi,
+  ): MatterAccessoryDescriptor['handlers'] {
+    return Object.fromEntries(
+      Object.entries(mapping.commands).map(([cluster, commands]) => [
+        cluster,
+        Object.fromEntries(
+          Object.entries(commands).map(([command, handler]) => [
+            command,
+            async (request?: never) => {
+              try {
+                await handler(request);
+              } catch (err) {
+                if (err instanceof matter.status.NotFound) throw err;
+                throw new matter.status.Failure(err instanceof Error ? err.message : String(err));
+              }
+            },
+          ]),
+        ),
+      ]),
+    );
   }
 
   private findBatteryService(platformAccessory: PlatformAccessory): Service | undefined {
@@ -536,7 +604,7 @@ export class MatterCoverings {
   }
 
   /**
-   * Describes the covering's battery for Matter.
+   * Describes the accessory's battery for Matter.
    *
    * The static facts are always declared, even when no reading has arrived yet. Homebridge
    * decides whether to compose the Battery feature from the attributes present at registration,
@@ -577,28 +645,6 @@ export class MatterCoverings {
       : BAT_CHARGE_OK;
   }
 
-  /**
-   * Stops the covering through HomeKit's HoldPosition characteristic. It is the plugin's real
-   * HomeKit-facing stop, not a route of its own, though Apple's Home app does not expose a
-   * control that writes it.
-   */
-  private async requestStop(accessory: ZWaveAccessory): Promise<void> {
-    const service = this.findCoveringService(accessory.platformAccessory);
-    if (!service) {
-      return;
-    }
-
-    this.platform.log.debug(`Matter requested stop for ${accessory.platformAccessory.displayName}`);
-
-    await this.writeCharacteristic(
-      service,
-      this.platform.Characteristic.HoldPosition,
-      true,
-      accessory,
-      'stop request',
-    );
-  }
-
   private readAccessoryInformation(platformAccessory: PlatformAccessory): {
     serialNumber: string;
     manufacturer: string;
@@ -614,57 +660,9 @@ export class MatterCoverings {
     return {
       serialNumber: read(this.platform.Characteristic.SerialNumber, platformAccessory.UUID),
       manufacturer: read(this.platform.Characteristic.Manufacturer, 'Z-Wave'),
-      model: read(this.platform.Characteristic.Model, 'Window Covering'),
+      model: read(this.platform.Characteristic.Model, 'Z-Wave Device'),
       firmwareRevision: read(this.platform.Characteristic.FirmwareRevision, '1.0.0'),
     };
-  }
-
-  /**
-   * Asks the characteristic rather than reading its cached value. Until a covering has answered
-   * once, the plugin publishes no position and the read fails, while the cached value is still
-   * HomeKit's default of 0, which would be indistinguishable from a closed covering.
-   */
-  private async readCharacteristicPosition(
-    service: Service,
-    characteristic: typeof Characteristic.CurrentPosition | typeof Characteristic.TargetPosition,
-  ): Promise<number | undefined> {
-    try {
-      const value = await service.getCharacteristic(characteristic)?.handleGetRequest();
-      return typeof value === 'number' ? value : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async readPosition(service: Service): Promise<number | undefined> {
-    return this.readCharacteristicPosition(service, this.platform.Characteristic.CurrentPosition);
-  }
-
-  private async readTargetPosition(service: Service): Promise<number | undefined> {
-    return this.readCharacteristicPosition(service, this.platform.Characteristic.TargetPosition);
-  }
-
-  /**
-   * Drives the covering through the HomeKit characteristic rather than through Z-Wave, so a
-   * Matter command takes exactly the same path as one from the Home app.
-   */
-  private async requestPosition(accessory: ZWaveAccessory, position: number): Promise<void> {
-    const service = this.findCoveringService(accessory.platformAccessory);
-    if (!service) {
-      return;
-    }
-
-    this.platform.log.debug(
-      `Matter requested ${position}% for ${accessory.platformAccessory.displayName}`,
-    );
-
-    await this.writeCharacteristic(
-      service,
-      this.platform.Characteristic.TargetPosition,
-      position,
-      accessory,
-      `${position}% position request`,
-    );
   }
 
   /**
@@ -727,7 +725,7 @@ export class MatterCoverings {
   private live(uuid: string, matter: MatterApi): ZWaveAccessory {
     const accessory = this.tracked.get(uuid);
     if (!accessory) {
-      throw new matter.status.NotFound(`No covering is registered for ${uuid}.`);
+      throw new matter.status.NotFound(`No accessory is registered for ${uuid}.`);
     }
 
     return accessory;
@@ -744,11 +742,11 @@ export class MatterCoverings {
   private refreshTracking(uuid: string, accessory: ZWaveAccessory): void {
     this.untrack(uuid);
     this.tracked.set(uuid, accessory);
-    this.trackPosition(accessory);
+    this.trackState(accessory);
     this.trackBattery(accessory);
     void this.pushCurrentState(accessory).catch((err) => {
       this.platform.log.debug(
-        `Could not mirror the rebuilt covering to Matter: ${
+        `Could not mirror the rebuilt accessory to Matter: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
@@ -761,73 +759,67 @@ export class MatterCoverings {
    * what was last reported until the new object happens to report a change of its own.
    */
   private async pushCurrentState(accessory: ZWaveAccessory): Promise<void> {
-    const service = this.findCoveringService(accessory.platformAccessory);
-    if (!service) {
-      return;
+    const descriptor = this.descriptors.get(accessory.platformAccessory.UUID);
+    if (!descriptor) return;
+    const mappings = this.mappings(accessory);
+    for (const mapping of mappings) {
+      const partId = this.partId(descriptor, mapping);
+      if (partId === null) continue;
+      for (const [cluster, attributes] of Object.entries(await this.mappingState(mapping))) {
+        this.pushState(accessory, cluster, attributes, partId);
+      }
     }
-
-    const known = await this.readPosition(service);
-    const knownTarget = await this.readTargetPosition(service);
-    const lift = known === undefined ? null : homeKitPositionToMatterLift(known);
-
-    this.pushState(accessory, WINDOW_COVERING_CLUSTER, {
-      currentPositionLiftPercent100ths: lift,
-      targetPositionLiftPercent100ths:
-        knownTarget === undefined ? lift : homeKitPositionToMatterLift(knownTarget),
-    });
-
-    const battery = this.findBatteryService(accessory.platformAccessory);
-    if (!battery) {
-      return;
-    }
-
-    const level = this.readBatteryLevel(battery);
-    this.pushState(accessory, POWER_SOURCE_CLUSTER, {
-      batChargeLevel: this.readBatteryChargeLevel(battery),
-      batPercentRemaining: level === undefined ? null : homeKitBatteryToMatterPercent(level),
-    });
+    const battery = this.describeBattery(accessory.platformAccessory);
+    if (battery && descriptor.clusters.powerSource)
+      this.pushState(accessory, POWER_SOURCE_CLUSTER, battery);
   }
 
-  private trackPosition(accessory: ZWaveAccessory): void {
-    const service = this.findCoveringService(accessory.platformAccessory);
-    if (!service) {
-      return;
+  /** Only mirror services present in the endpoint registered this session. */
+  private partId(
+    descriptor: MatterAccessoryDescriptor,
+    mapping: ServiceMapping,
+  ): string | undefined | null {
+    if (descriptor.parts?.some((part) => part.id === mapping.key)) return mapping.key;
+    const rootKey = (descriptor.context as { serviceKey?: string }).serviceKey;
+    return rootKey === mapping.key ? undefined : null;
+  }
+
+  private trackState(accessory: ZWaveAccessory): void {
+    const descriptor = this.descriptors.get(accessory.platformAccessory.UUID);
+    if (!descriptor) return;
+    for (const mapping of this.mappings(accessory)) {
+      const partId = this.partId(descriptor, mapping);
+      if (partId === null) continue;
+      for (const binding of mapping.bindings) {
+        this.onCharacteristicChange(
+          accessory.platformAccessory.UUID,
+          mapping.service,
+          binding.characteristic,
+          (value) => {
+            if (binding.event) {
+              const gesture =
+                value === 0
+                  ? 'singlePress'
+                  : value === 1
+                    ? 'doublePress'
+                    : value === 2
+                      ? 'longPress'
+                      : undefined;
+              if (gesture)
+                void this.matter?.switch
+                  ?.emitGesture(accessory.platformAccessory.UUID, gesture, { partId })
+                  .catch((err) =>
+                    this.platform.log.warn(`Could not send Matter button event: ${String(err)}`),
+                  );
+            } else {
+              // HAP error updates must not become sensor readings.
+              if (value instanceof Error || value === undefined || value === null) return;
+              this.pushState(accessory, binding.cluster, binding.attributes(value), partId);
+            }
+          },
+        );
+      }
     }
-
-    /**
-     * Current and target are reported separately. Pushing the traveling position into both
-     * would erase the target the controller asked for, and a controller that infers completion
-     * from target === current would call the move finished on the first intermediate report.
-     */
-    this.onCharacteristicChange(
-      accessory.platformAccessory.UUID,
-      service,
-      this.platform.Characteristic.CurrentPosition,
-      (newValue) => {
-        if (typeof newValue !== 'number') {
-          return;
-        }
-
-        this.pushState(accessory, WINDOW_COVERING_CLUSTER, {
-          currentPositionLiftPercent100ths: homeKitPositionToMatterLift(newValue),
-        });
-      },
-    );
-
-    this.onCharacteristicChange(
-      accessory.platformAccessory.UUID,
-      service,
-      this.platform.Characteristic.TargetPosition,
-      (newValue) => {
-        if (typeof newValue !== 'number') {
-          return;
-        }
-
-        this.pushState(accessory, WINDOW_COVERING_CLUSTER, {
-          targetPositionLiftPercent100ths: homeKitPositionToMatterLift(newValue),
-        });
-      },
-    );
   }
 
   /** Mirrors battery readings the same way, so a Matter controller can show the charge level. */
@@ -901,9 +893,15 @@ export class MatterCoverings {
     accessory: ZWaveAccessory,
     cluster: string,
     attributes: Record<string, unknown>,
+    partId?: string,
   ): void {
     void this.matter
-      ?.updateAccessoryState(accessory.platformAccessory.UUID, cluster, attributes)
+      ?.updateAccessoryState(
+        accessory.platformAccessory.UUID,
+        cluster,
+        attributes,
+        ...(partId ? [partId] : []),
+      )
       .catch((err) => {
         this.platform.log.debug(
           `Could not mirror ${cluster} to Matter: ${

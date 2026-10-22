@@ -23,7 +23,7 @@ import {
   STABILITY_TOLERANCE as COVERING_STABILITY_TOLERANCE,
   STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS,
 } from '../zwave/coveringController';
-import { MatterCoverings } from '../matter/MatterCoverings';
+import { MatterAccessories } from '../matter/MatterAccessories';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -79,7 +79,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * RACE CONDITION FIX: Track which nodes are currently being created
    * to prevent duplicate accessories if multiple events fire rapidly.
    */
-  private readonly matterCoverings = new MatterCoverings(this);
+  private readonly matterAccessories = new MatterAccessories(this);
   private discoveryInFlight = new Set<number>();
   private firmwareProgress = new Map<number, { sent: number; total: number; status?: number }>();
   private refreshStates = new Map<number, 'waiting-wakeup' | 'refreshing'>();
@@ -155,7 +155,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         if (this.retryTimeout) {
           clearTimeout(this.retryTimeout);
         }
-        this.matterCoverings.stop();
+        this.matterAccessories.stop();
         for (const acc of this.zwaveAccessories.values()) {
           acc.stop();
         }
@@ -270,8 +270,12 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           method === 'GET'
         ) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          if (!this.zwaveController) {
+            sendJson({ error: 'Controller not initialized' }, 500);
+            return;
+          }
           this.zwaveController
-            ?.getNodeRouteDiagnostics(nodeId)
+            .getNodeRouteDiagnostics(nodeId)
             .then((diagnostics) =>
               sendJson({
                 ...diagnostics,
@@ -542,7 +546,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * been excluded be removed from Matter instead of lingering in the controller.
    */
   configureMatterAccessory(accessory: { UUID: string; displayName: string }) {
-    this.matterCoverings.configureCachedAccessory(accessory);
+    this.matterAccessories.configureCachedAccessory(accessory);
   }
 
   configureAccessory(accessory: PlatformAccessory) {
@@ -640,7 +644,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId);
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
           hydratedAccessory.initialize({ removeSupersededServices: true });
-          this.matterCoverings.add(hydratedAccessory);
+          this.matterAccessories.add(hydratedAccessory);
           return;
         }
 
@@ -657,7 +661,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const reconciledAccessory = AccessoryFactory.create(this, node, homeId);
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
-          this.matterCoverings.add(reconciledAccessory);
+          this.matterAccessories.add(reconciledAccessory);
           return;
         }
 
@@ -695,7 +699,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
          * classification differed, so the graph is reconciled as part of the first build.
          */
         accessory.initialize({ removeSupersededServices: true });
-        this.matterCoverings.add(accessory);
+        this.matterAccessories.add(accessory);
       } else {
         accessory.refresh();
       }
@@ -868,9 +872,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
      * movement has to have been observed after the request too.
      */
     const restedShort =
-      after !== null &&
-      target !== null &&
-      Math.abs(after - target) > COVERING_POSITION_TOLERANCE;
+      after !== null && target !== null && Math.abs(after - target) > COVERING_POSITION_TOLERANCE;
     const shortOfTarget = restedShort && travel.moved && travel.outcome === 'settled';
     this.log.info(
       `Stop test: Node ${nodeId} ended at ${after}% with target ${target}% ` +
@@ -1000,14 +1002,18 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     };
   }
 
-  private shouldCreateAccessoryForUnreadyNode(cachedAccessory: PlatformAccessory | undefined): boolean {
+  private shouldCreateAccessoryForUnreadyNode(
+    cachedAccessory: PlatformAccessory | undefined,
+  ): boolean {
     // Intentionally only materialize unready nodes if HomeKit already knows about them.
     // Brand-new unready nodes are deferred until feature metadata is complete, which keeps
     // the service graph stable and avoids publishing half-built accessories.
     return Boolean(cachedAccessory);
   }
 
-  private getHomeKitPublicationState(node: IZWaveNode): 'controller' | 'published' | 'cached-pending' | 'pending-interview' {
+  private getHomeKitPublicationState(
+    node: IZWaveNode,
+  ): 'controller' | 'published' | 'cached-pending' | 'pending-interview' {
     if (Number(node.nodeId) === 1) {
       return 'controller';
     }
@@ -1053,7 +1059,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     try {
-      await this.matterCoverings.reconcileCached(this.liveAccessoryUuids());
+      await this.matterAccessories.reconcileCached(this.liveAccessoryUuids());
       this.matterCacheSwept = true;
     } catch (err) {
       this.log.warn(
@@ -1080,16 +1086,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   private liveAccessoryUuids(): Set<string> {
     const live = new Set<string>();
     const homeId = this.zwaveController?.homeId;
-    const coveringType = (this.Service.WindowCovering as unknown as { UUID?: string })?.UUID;
 
     const built = new Map<string, ZWaveAccessory>();
     for (const accessory of this.zwaveAccessories.values()) {
       built.set(accessory.platformAccessory.UUID, accessory);
     }
-
-    const isCovering = (platformAccessory: PlatformAccessory): boolean =>
-      coveringType !== undefined &&
-      platformAccessory.services.some((service) => service.UUID === coveringType);
 
     /**
      * Taken from the accessories themselves rather than rebuilt from the node id. A UUID here
@@ -1116,9 +1117,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       if (ready) {
         /**
          * This run has built the accessory, so its service graph is known. If it is no longer
-         * published as a covering, the Matter registration for it is stale and must go.
+         * published with a supported Matter service, its cached registration is stale.
          */
-        if (isCovering(ready.platformAccessory)) {
+        if (this.matterAccessories.supports(ready)) {
           live.add(accessory.UUID);
         }
         continue;
@@ -1132,7 +1133,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     for (const accessory of built.values()) {
-      if (isCovering(accessory.platformAccessory)) {
+      if (this.matterAccessories.supports(accessory)) {
         live.add(accessory.platformAccessory.UUID);
       }
     }
@@ -1158,8 +1159,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     this.api.unregisterPlatformAccessories('homebridge-zwave-usb', 'ZWaveUSB', staleAccessories);
 
     const staleUuids = new Set(staleAccessories.map((accessory) => accessory.UUID));
-    staleUuids.forEach((uuid) => void this.matterCoverings.remove(uuid));
-    void this.matterCoverings.reconcileCached(this.liveAccessoryUuids());
+    staleUuids.forEach((uuid) => void this.matterAccessories.remove(uuid));
+    void this.matterAccessories.reconcileCached(this.liveAccessoryUuids());
     const staleNodeIds = new Set(
       staleAccessories
         .map((accessory) => {
@@ -1204,7 +1205,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       );
 
       const removedUuids = new Set(accessoriesToRemove.map((accessory) => accessory.UUID));
-      removedUuids.forEach((uuid) => void this.matterCoverings.remove(uuid));
+      removedUuids.forEach((uuid) => void this.matterAccessories.remove(uuid));
       const remainingAccessories = this.accessories.filter(
         (accessory) => !removedUuids.has(accessory.UUID),
       );

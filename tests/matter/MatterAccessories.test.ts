@@ -1,4 +1,4 @@
-import { MatterCoverings } from '../../src/matter/MatterCoverings';
+import { MatterAccessories } from '../../src/matter/MatterAccessories';
 import { ZWaveUsbPlatform } from '../../src/platform/ZWaveUsbPlatform';
 import { ZWaveAccessory } from '../../src/accessories/ZWaveAccessory';
 
@@ -6,7 +6,7 @@ const WINDOW_COVERING_UUID = '0000008C-0000-1000-8000-0026BB765291';
 const INFORMATION_UUID = '0000003E-0000-1000-8000-0026BB765291';
 const BATTERY_UUID = '00000096-0000-1000-8000-0026BB765291';
 
-describe('MatterCoverings', () => {
+describe('MatterAccessories', () => {
   let platform: any;
   let matter: any;
   let handleSetRequest: jest.Mock;
@@ -196,13 +196,13 @@ describe('MatterCoverings', () => {
     jest.useRealTimers();
   });
 
-  const publish = async (coverings: MatterCoverings, accessory: ZWaveAccessory) => {
+  const publish = async (coverings: MatterAccessories, accessory: ZWaveAccessory) => {
     coverings.add(accessory);
     await jest.advanceTimersByTimeAsync(4000);
   };
 
   it('publishes a covering as a Matter WindowCovering device', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await publish(coverings, createCoveringAccessory());
 
@@ -222,7 +222,7 @@ describe('MatterCoverings', () => {
   });
 
   it('reports the current position with Matter polarity', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await publish(coverings, createCoveringAccessory());
 
@@ -236,7 +236,7 @@ describe('MatterCoverings', () => {
     // Until the covering answers, the plugin publishes no position. Matter carries "not known"
     // in configStatus.liftPositionAware; announcing 0 instead would tell every controller on the
     // network that the covering is closed.
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     const accessory = createCoveringAccessory();
     currentPosition = undefined;
 
@@ -250,7 +250,7 @@ describe('MatterCoverings', () => {
   });
 
   it('corrects an unknown position once the covering reports one', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     const accessory = createCoveringAccessory();
     currentPosition = undefined;
 
@@ -266,7 +266,7 @@ describe('MatterCoverings', () => {
   });
 
   it('batches several coverings into one registration', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     coverings.add(createCoveringAccessory('nico', "Nico's Shade"));
     coverings.add(createCoveringAccessory('lia', "Lia's Shade"));
@@ -277,7 +277,7 @@ describe('MatterCoverings', () => {
   });
 
   it('shortens an over-long serial number to what Matter accepts', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await publish(coverings, createCoveringAccessory());
 
@@ -288,7 +288,7 @@ describe('MatterCoverings', () => {
   });
 
   it('keeps the Matter target distinct from the position while the covering travels', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     await publish(coverings, createCoveringAccessory());
 
     matter.updateAccessoryState.mockClear();
@@ -305,7 +305,7 @@ describe('MatterCoverings', () => {
   });
 
   it('removes an accessory from Matter when its node leaves the network', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     const accessory = createCoveringAccessory();
     await publish(coverings, accessory);
 
@@ -323,7 +323,7 @@ describe('MatterCoverings', () => {
   });
 
   it('never publishes the same accessory twice', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     const accessory = createCoveringAccessory();
 
     await publish(coverings, accessory);
@@ -333,7 +333,7 @@ describe('MatterCoverings', () => {
   });
 
   it('ignores accessories that are not coverings', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     const light = {
       node: { nodeId: 7 },
       platformAccessory: {
@@ -351,7 +351,7 @@ describe('MatterCoverings', () => {
 
   it('does nothing when the bridge has no Matter support', async () => {
     platform.api = {};
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await publish(coverings, createCoveringAccessory());
 
@@ -360,11 +360,11 @@ describe('MatterCoverings', () => {
 
   it('keeps HomeKit working when Matter registration fails', async () => {
     matter.registerPlatformAccessories.mockRejectedValue(new Error('matter is not ready'));
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await expect(publish(coverings, createCoveringAccessory())).resolves.toBeUndefined();
     expect(platform.log.warn).toHaveBeenCalledWith(
-      expect.stringContaining('Could not publish 1 covering(s) over Matter'),
+      expect.stringContaining('Could not publish 1 accessory(ies) over Matter'),
     );
   });
 
@@ -373,7 +373,7 @@ describe('MatterCoverings', () => {
       matter.registerPlatformAccessories.mock.calls[0][2][0].handlers.windowCovering;
 
     it('routes an absolute Matter position through the HomeKit characteristic', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       // Matter 75.00% closed is HomeKit 25% open.
@@ -383,7 +383,7 @@ describe('MatterCoverings', () => {
     });
 
     it('opens fully on UpOrOpen and closes fully on DownOrClose', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       await handlers().upOrOpen();
@@ -394,7 +394,7 @@ describe('MatterCoverings', () => {
     });
 
     it('routes stopMotion through HomeKit HoldPosition', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       await handlers().stopMotion();
@@ -406,7 +406,7 @@ describe('MatterCoverings', () => {
 
     it('reports a failed stop to the Matter controller as a failure', async () => {
       holdSetRequest.mockRejectedValue(new Error('device did not respond'));
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       await expect(handlers().stopMotion()).rejects.toBeInstanceOf(matter.status.Failure);
@@ -417,7 +417,7 @@ describe('MatterCoverings', () => {
 
     it('reports a failed write to the Matter controller as a failure', async () => {
       handleSetRequest.mockRejectedValue(new Error('device did not respond'));
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       /**
@@ -436,7 +436,7 @@ describe('MatterCoverings', () => {
       matter.registerPlatformAccessories.mock.calls[0][2][0].clusters.powerSource;
 
     it('publishes the battery as a Matter power source in half-percent units', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       // Matter reports battery charge in half-percent units, so 84% is 168.
@@ -451,7 +451,7 @@ describe('MatterCoverings', () => {
       // Homebridge composes the Battery feature from the attributes present at registration, so
       // a shade whose battery pack is out must still register as battery powered.
       batteryLevel = null;
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       expect(powerSource()).toMatchObject({ batPresent: true, batReplaceability: 2 });
@@ -461,14 +461,14 @@ describe('MatterCoverings', () => {
 
     it('reports a low battery as a charge warning', async () => {
       lowBattery = 1;
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       expect(powerSource().batChargeLevel).toBe(1);
     });
 
     it('omits the power source for an accessory with no battery service', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
       (accessory.platformAccessory as any).services = (
         accessory.platformAccessory as any
@@ -480,7 +480,7 @@ describe('MatterCoverings', () => {
     });
 
     it('mirrors later battery readings back to Matter', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       expect(batteryListeners).toHaveLength(1);
@@ -493,7 +493,7 @@ describe('MatterCoverings', () => {
   });
 
   it('mirrors later position changes back to Matter', async () => {
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
     await publish(coverings, createCoveringAccessory());
 
     expect(changeListeners).toHaveLength(1);
@@ -509,7 +509,7 @@ describe('MatterCoverings', () => {
   it('mirrors a target change to Matter', async () => {
     // Without this the whole target block could be deleted and every test would still pass,
     // because nothing was subscribed to the target characteristic.
-    const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+    const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
     await publish(coverings, createCoveringAccessory());
     targetPosition = 30;
@@ -528,7 +528,7 @@ describe('MatterCoverings', () => {
       // Registration is what stamps the plugin and platform onto the descriptor. The update
       // entry point carries no identity, so a restored accessory published through it is
       // persisted with no owner and removed as orphaned on the next start.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
 
       coverings.configureCachedAccessory({
@@ -543,7 +543,7 @@ describe('MatterCoverings', () => {
     });
 
     it('still tracks a restored accessory so its state reaches Matter', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
 
       coverings.configureCachedAccessory({
@@ -571,7 +571,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
       coverings.add(accessory);
       await jest.advanceTimersByTimeAsync(4000);
@@ -599,7 +599,7 @@ describe('MatterCoverings', () => {
     });
 
     it('keeps the record when unregistration fails, so nothing is forgotten', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
       await publish(coverings, accessory);
 
@@ -618,7 +618,7 @@ describe('MatterCoverings', () => {
     it('keeps a restored covering that is on the network but not published yet', async () => {
       // Publication is debounced, and a shade whose battery is out may not be queued at all.
       // Sweeping on "not published" would unregister a covering that is simply not awake.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       coverings.configureCachedAccessory({ UUID: 'asleep-uuid', displayName: 'Asleep Shade' });
 
       await coverings.reconcileCached(new Set(['asleep-uuid']));
@@ -627,7 +627,7 @@ describe('MatterCoverings', () => {
     });
 
     it('removes a restored accessory that no longer matches a covering', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
 
       coverings.configureCachedAccessory({ UUID: 'gone-uuid', displayName: 'Removed Shade' });
       await coverings.reconcileCached(new Set(['a-node-that-still-exists']));
@@ -637,7 +637,7 @@ describe('MatterCoverings', () => {
     });
 
     it('leaves a restored accessory alone when it was matched to a live covering', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
 
       coverings.configureCachedAccessory({
@@ -770,7 +770,7 @@ describe('MatterCoverings', () => {
 
     /** One Homebridge start: the cache is offered back, then the live covering is published. */
     const start = async (restored: string[], accessory: ZWaveAccessory) => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       restored.forEach((uuid) =>
         coverings.configureCachedAccessory({ UUID: uuid, displayName: "Nico's Shade" }),
       );
@@ -902,7 +902,7 @@ describe('MatterCoverings', () => {
       // describe() would otherwise bump it first and the publication would see itself as
       // current. Stale work is then dropped before the call rather than undone afterwards,
       // because the undo is dispatched as an event of its own and can be handled first.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
       const uuid = accessory.platformAccessory.UUID;
 
@@ -941,7 +941,7 @@ describe('MatterCoverings', () => {
       // A rebuilt object for an identifier already live is the same Matter accessory, and
       // Homebridge refuses a second registration of one. Nothing has to be published: the
       // handlers resolve the accessory by identifier, so repointing the record is the update.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
       expect(matter.registerPlatformAccessories).toHaveBeenCalledTimes(1);
 
@@ -955,7 +955,7 @@ describe('MatterCoverings', () => {
       // All four handlers were registered with the endpoint before the rebuild existed, so each
       // one has to resolve the accessory when it runs rather than keep the object it was built
       // with. One of them doing so is not evidence about the others.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const staleSet = jest.fn().mockResolvedValue(undefined);
       const staleHold = jest.fn().mockResolvedValue(undefined);
       const set = jest.fn().mockResolvedValue(undefined);
@@ -985,7 +985,7 @@ describe('MatterCoverings', () => {
       // The listeners that were mirroring state belonged to the wrapper just replaced, so
       // without a push here the endpoint keeps the last position it was told about until the
       // new wrapper happens to report a change of its own.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
 
       const rebuilt = createCoveringAccessory();
@@ -1003,7 +1003,7 @@ describe('MatterCoverings', () => {
       // The endpoint can outlive the covering, and a controller that commands one that is gone
       // has to be told so. Resolving to nothing and calling through would fail as a type error
       // inside the handler, which reaches the controller as an opaque failure.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       await publish(coverings, createCoveringAccessory());
       const handlers =
         matter.registerPlatformAccessories.mock.calls[0][2][0].handlers.windowCovering;
@@ -1014,7 +1014,7 @@ describe('MatterCoverings', () => {
     });
 
     it('stops mirroring the accessory it replaced', async () => {
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const first = createCoveringAccessory();
       await publish(coverings, first);
 
@@ -1041,7 +1041,7 @@ describe('MatterCoverings', () => {
     it('keeps a group handed over when a later group in the same run is rejected', async () => {
       // The two groups are handed over separately, so a rejection of one must not discard the
       // other: the first group was already handed over and would be offered again later.
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const restored = createCoveringAccessory('restored-uuid', 'Restored Shade');
       coverings.configureCachedAccessory({ UUID: 'restored-uuid', displayName: 'Restored Shade' });
       const brandNew = createCoveringAccessory('new-uuid', 'New Shade');
@@ -1082,7 +1082,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
 
       coverings.add(accessory);
@@ -1108,7 +1108,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const first = createCoveringAccessory();
       const rebuilt = createCoveringAccessory();
 
@@ -1138,7 +1138,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const first = createCoveringAccessory();
       const rebuilt = createCoveringAccessory();
       const uuid = first.platformAccessory.UUID;
@@ -1177,7 +1177,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const accessory = createCoveringAccessory();
       const uuid = accessory.platformAccessory.UUID;
 
@@ -1204,7 +1204,7 @@ describe('MatterCoverings', () => {
           }),
       );
 
-      const coverings = new MatterCoverings(platform as ZWaveUsbPlatform);
+      const coverings = new MatterAccessories(platform as ZWaveUsbPlatform);
       const first = createCoveringAccessory();
       const uuid = first.platformAccessory.UUID;
 

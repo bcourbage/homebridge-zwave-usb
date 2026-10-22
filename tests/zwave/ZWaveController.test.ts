@@ -860,6 +860,19 @@ describe('ZWaveController (Direct Mode)', () => {
       mockDriver.controller.removeFailedNode = jest.fn().mockResolvedValue(undefined);
     });
 
+    it('protects a controller whose own node ID is not 1', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      addNode(7, 3, 'Controller');
+      Object.defineProperty(mockDriver.controller, 'ownNodeId', { value: 7, configurable: true });
+      mockDriver.controller.isFailedNode.mockResolvedValue(true);
+      try {
+        await expect(controller.assessFailedNodeRemoval(7)).resolves.toMatchObject({ eligible: false });
+        await expect(controller.removeFailedNode(7, 7)).rejects.toThrow(/controller/);
+        expect(mockDriver.controller.removeFailedNode).not.toHaveBeenCalled();
+      } finally { delete mockDriver.controller.ownNodeId; }
+    });
+
     it('refuses to remove a temporarily dead but valid node', async () => {
       controller = new ZWaveController(log, '/dev/ttyACM0');
       await controller.start();

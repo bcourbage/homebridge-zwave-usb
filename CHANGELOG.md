@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.0] - 2026-10-22
+
+### Breaking changes
+- Remove the controller's bulk Prune Dead Nodes switch (#17). Scenes and automations using that switch stop working. Use the Maintenance tab's per-node removal flow or Z-Wave exclusion instead.
+
+### Added
+- Matter publication across the supported device categories, extending #20 beyond window coverings. Shared lifecycle handling covers battery reporting, cached endpoint ownership, node removal, wrapper replacement, and multiple services/endpoints per node.
+- Radio and route diagnostics for all non-controller nodes (#16).
+- Route rebuilding with live status in the Maintenance tab (#18).
+- Window-covering movement and stop controls with observed-result reporting (#19).
+
+### Fixed
+- Include the selected parameter key in native Window Covering CC writes and stop commands, and ignore reports for other parameters. Multilevel Switch CC coverings keep their unkeyed write path.
+- Follow window-covering commands through a tested state machine, distinguish optimistic driver echoes from reported positions, reconcile startup state, and support Hold Position (#15).
+- Require explicit per-node confirmation and a fresh controller assessment before failed-node removal. Refuse sleeping devices and protect the controller at its reported node ID (#17).
+- Translate Matter units, contact polarity, lock states, thermostat modes, and covering polarity through the existing HomeKit handlers. Advertise thermostat heating/cooling only when the interviewed setpoints support it.
+- Preserve every supported service on multi-endpoint devices, including nodes with more than one covering, instead of mirroring only the first covering.
+
+### Upgrade and validation notes
+- Node and Homebridge compatibility requirements are unchanged. Matter publication requires a Matter-enabled Homebridge 2.4+ bridge; Homebridge 1 continues to use HomeKit.
+- Sirens use a controllable outlet with optional dimming for volume. Garage doors use Closure; controller support varies, and garage-door stop is explicitly unsupported.
+- Raw CO2, VOC, PM2.5, and UV readings remain HomeKit-only; Matter receives the derived air quality category. Air quality uses the host's core Good/Poor/Unknown values: Excellent/Good map to Good, and Fair/Inferior/Poor map to Poor. Optional concentration clusters do not survive Homebridge 2.4's cache restoration as required.
+- Absolute dimmer/color commands are supported. Continuous movement and transition timing remain unsupported.
+- Validation includes lint, build, the complete Jest suite, and fresh/restored endpoint construction against Homebridge 2.4's Matter runtime. The expanded mappings have not been tested on physical devices during this release review.
+
+Thanks to Bruno Courbage (@bcourbage) for all six PRs (#15–#20), their regression tests, and the hardware evidence supplied with them. The release extends his Matter work across the plugin's device categories.
+
 ## [4.0.0] - 2026-10-18
 
 ### Breaking changes

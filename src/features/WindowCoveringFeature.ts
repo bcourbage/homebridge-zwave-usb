@@ -106,6 +106,22 @@ export class WindowCoveringFeature extends BaseFeature {
       return;
     }
 
+    if (args && args.commandClass === CommandClasses['Window Covering']) {
+      const selected = findCoveringPositionValueId(this.node, this.endpoint.index);
+      if (
+        selected?.commandClass === CommandClasses['Window Covering'] &&
+        args.propertyKey !== selected.propertyKey
+      )
+        return;
+    } else if (
+      args &&
+      args.commandClass === CommandClasses['Multilevel Switch'] &&
+      this.positionCommandClass === CommandClasses['Window Covering']
+    ) {
+      // Do not let the less-specific switch cache overwrite the selected covering parameter.
+      return;
+    }
+
     if (
       args &&
       (args.property === 'currentValue' || args.property === 'targetValue') &&
@@ -423,6 +439,16 @@ export class WindowCoveringFeature extends BaseFeature {
         endpoint,
         property: 'targetValue',
       };
+      if (valueId.commandClass === CommandClasses['Window Covering']) {
+        const position = this.resolvePositionValueId();
+        if (
+          position?.commandClass !== CommandClasses['Window Covering'] ||
+          typeof position.propertyKey !== 'number'
+        ) {
+          return { kind: 'refused', message: 'no keyed Window Covering position is defined' };
+        }
+        valueId.propertyKey = position.propertyKey;
+      }
       zwaveValue = intent.target === 100 ? 99 : intent.target;
       label = 'TargetPosition';
     }

@@ -646,7 +646,7 @@ describe('ZWaveUsbPlatform', () => {
     (platform as any).zwaveController.homeId = 100;
     (platform as any).zwaveAccessories.set(2, existing);
     const matterAdd = jest.fn();
-    (platform as any).matterCoverings.add = matterAdd;
+    (platform as any).matterAccessories.add = matterAdd;
 
     const graphSpy = jest.spyOn(AccessoryFactory, 'getGraphSignature').mockReturnValue('new-graph');
     const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(reconciled as any);
@@ -714,7 +714,7 @@ describe('ZWaveUsbPlatform', () => {
     (platform as any).zwaveController.homeId = 100;
     (platform as any).zwaveAccessories.set(2, existing);
     const matterAdd = jest.fn();
-    (platform as any).matterCoverings.add = matterAdd;
+    (platform as any).matterAccessories.add = matterAdd;
 
     const graphSpy = jest
       .spyOn(AccessoryFactory, 'getGraphSignature')
@@ -1470,13 +1470,13 @@ describe('ZWaveUsbPlatform', () => {
       expect(platform.liveAccessoryUuids().has('not-ready')).toBe(true);
     });
 
-    it('drops a ready accessory that is no longer published as a covering', () => {
-      // Reclassified as a light, say. Its Matter covering registration is now stale.
+    it('drops a ready accessory with no supported Matter service', () => {
+      // A rebuilt node with no supported services must leave the Matter cache sweep.
       const platform = newPlatform();
       platform.accessories.push(cached('reclassified', 5, 0xabc));
       platform.zwaveAccessories.set(5, {
         stop: jest.fn(),
-        platformAccessory: { UUID: 'reclassified', services: [{ UUID: 'service-Lightbulb' }] },
+        platformAccessory: { UUID: 'reclassified', services: [{ UUID: 'unsupported-service' }] },
       });
 
       expect(platform.liveAccessoryUuids().has('reclassified')).toBe(false);
@@ -1521,7 +1521,7 @@ describe('ZWaveUsbPlatform', () => {
       jest.useFakeTimers();
       const platform = newPlatform();
       const reconcile = jest.fn().mockResolvedValue(undefined);
-      platform.matterCoverings.reconcileCached = reconcile;
+      platform.matterAccessories.reconcileCached = reconcile;
       platform.zwaveController.start = jest.fn().mockRejectedValue(new Error('stick unplugged'));
 
       try {
@@ -1539,7 +1539,7 @@ describe('ZWaveUsbPlatform', () => {
       jest.useFakeTimers();
       const platform = newPlatform();
       const reconcile = jest.fn().mockResolvedValue(undefined);
-      platform.matterCoverings.reconcileCached = reconcile;
+      platform.matterAccessories.reconcileCached = reconcile;
       platform.zwaveController.start = jest
         .fn()
         .mockRejectedValueOnce(new Error('stick unplugged'))
@@ -1563,7 +1563,7 @@ describe('ZWaveUsbPlatform', () => {
       // and that stops a driver that is working perfectly well.
       jest.useFakeTimers();
       const platform = newPlatform();
-      platform.matterCoverings.reconcileCached = jest
+      platform.matterAccessories.reconcileCached = jest
         .fn()
         .mockRejectedValue(new Error('matter is unwell'));
       const start = jest.fn().mockResolvedValue(undefined);
@@ -1591,7 +1591,7 @@ describe('ZWaveUsbPlatform', () => {
         .fn()
         .mockRejectedValueOnce(new Error('matter is unwell'))
         .mockResolvedValue(undefined);
-      platform.matterCoverings.reconcileCached = reconcile;
+      platform.matterAccessories.reconcileCached = reconcile;
       const start = jest.fn().mockResolvedValue(undefined);
       platform.zwaveController.start = start;
 
@@ -1618,7 +1618,7 @@ describe('ZWaveUsbPlatform', () => {
       jest.useFakeTimers();
       const platform = newPlatform();
       const reconcile = jest.fn().mockResolvedValue(undefined);
-      platform.matterCoverings.reconcileCached = reconcile;
+      platform.matterAccessories.reconcileCached = reconcile;
       platform.zwaveController.start = jest.fn().mockResolvedValue(undefined);
 
       try {

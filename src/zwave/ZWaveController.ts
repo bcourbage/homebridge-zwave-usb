@@ -386,7 +386,10 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
         return;
       }
 
-      if ((node as ZWaveNode & { deviceSerialNumber?: string }).deviceSerialNumber === deviceSerialNumber) {
+      if (
+        (node as ZWaveNode & { deviceSerialNumber?: string }).deviceSerialNumber ===
+        deviceSerialNumber
+      ) {
         return;
       }
 
@@ -1023,11 +1026,11 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
       return { ...base, eligible: false, reason: 'The Z-Wave driver is not running.' };
     }
 
-    if (nodeId === 1) {
+    if (nodeId === (this.driver.controller.ownNodeId ?? 1)) {
       return {
         ...base,
         eligible: false,
-        reason: 'Node 1 is the controller and cannot be removed.',
+        reason: `Node ${nodeId} is the controller and cannot be removed.`,
       };
     }
 

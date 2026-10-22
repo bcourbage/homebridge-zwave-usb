@@ -125,13 +125,18 @@ export function findCoveringStopValueId(
     return undefined;
   }
 
+  const selected = findCoveringPositionValueId(node, endpointIndex);
   const candidates = node.getDefinedValueIDs().filter((valueId) => {
     if ((valueId.endpoint ?? 0) !== endpointIndex || typeof valueId.property !== 'string') {
       return false;
     }
 
     if (valueId.commandClass === CommandClasses['Window Covering']) {
-      return WINDOW_COVERING_ACTIONS.includes(valueId.property);
+      return (
+        WINDOW_COVERING_ACTIONS.includes(valueId.property) &&
+        (selected?.commandClass !== CommandClasses['Window Covering'] ||
+          valueId.propertyKey === selected.propertyKey)
+      );
     }
 
     return (
@@ -140,9 +145,12 @@ export function findCoveringStopValueId(
     );
   });
 
-  // Window Covering CC is the more specific description of a covering, so prefer it.
-  return (
-    candidates.find((valueId) => valueId.commandClass === CommandClasses['Window Covering']) ??
-    candidates[0]
+  // Do not stop a different axis through a generic switch when the selected native
+  // parameter has no stop action of its own.
+  const native = candidates.find(
+    (valueId) => valueId.commandClass === CommandClasses['Window Covering'],
   );
+  return selected?.commandClass === CommandClasses['Window Covering']
+    ? native
+    : (native ?? candidates[0]);
 }

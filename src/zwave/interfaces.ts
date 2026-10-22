@@ -98,7 +98,6 @@ export interface IZWaveController extends EventEmitter {
    * this plugin began tracking one is invisible to `isHealing` but is still running.
    */
   isRebuildingRoutes(): boolean;
-  removeFailedNode(nodeId: number): Promise<void>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
   setS2Pin(pin: string): void;

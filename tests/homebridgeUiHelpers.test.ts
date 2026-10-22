@@ -529,3 +529,19 @@ describe('route rebuild helpers', () => {
     expect(healIsRunning(state as never)).toBe(running);
   });
 });
+
+// The management page is not part of the TypeScript build. Parse its actual script so
+// integrating independent UI changes cannot ship a page that fails before wiring controls.
+describe('management page integration', () => {
+  it('has valid inline JavaScript and one instance of each modal', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const html = fs.readFileSync(path.join(__dirname, '../homebridge-ui/public/index.html'), 'utf8');
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
+    expect(scripts.length).toBeGreaterThan(0);
+    for (const match of scripts) expect(() => new Function(match[1])).not.toThrow();
+    for (const id of ['diagnosticsModal', 'removeNodeModal', 'renameModal', 'confirmModal']) {
+      expect(html.match(new RegExp(`id="${id}"`, 'g'))).toHaveLength(1);
+    }
+  });
+});

@@ -63,3 +63,21 @@ All internal Z-Wave JS logs are redirected to the Homebridge logger.
 
 - **Versioning**: Follow SemVer.
 - **Changelog**: Maintain `CHANGELOG.md` with detailed notes for every release.
+
+## Matter publication
+
+`MatterAccessories` owns registration, cached ownership, removal, and listener cleanup for all
+supported Z-Wave services. `serviceMappings.ts` translates HAP services into Matter clusters and
+routes commands through existing characteristic handlers. One stable accessory UUID identifies
+the node; additional services use stable service-UUID/subtype part identifiers. Coverings retain
+the root endpoint used by the initial Matter implementation.
+
+A rebuilt wrapper rebinds listeners and command resolution without re-registering a live UUID.
+Shutdown invalidates work still constructing descriptors. Capability changes that alter the
+endpoint structure take effect after restart. The cache sweep follows the controller's node list,
+not interview completion or the publication queue, and Matter errors do not restart Z-Wave.
+
+`node scripts/verify-matter-host.mjs /path/to/node_modules/homebridge` checks fresh and restored
+endpoint construction against an installed Homebridge 2.4 runtime after `npm run build`. It uses
+a temporary, uncommissioned Matter server without starting network advertisement. This supplements
+the unit tests; it does not establish physical-device or controller-app compatibility.

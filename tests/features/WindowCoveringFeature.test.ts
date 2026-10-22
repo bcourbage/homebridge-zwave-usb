@@ -339,7 +339,7 @@ describe('WindowCoveringFeature', () => {
       endpoint.supportsCC.mockImplementation((cc: number) => cc === WINDOW_COVERING);
       await start();
 
-      await move(40);
+      await expect(move(40)).rejects.toBeInstanceOf(platform.api.hap.HapStatusError);
       await advance(40000);
 
       expect(node.pollValue).not.toHaveBeenCalled();
@@ -503,14 +503,78 @@ describe('WindowCoveringFeature', () => {
 
     it('prefers Window Covering CC when the endpoint implements it', async () => {
       endpoint.supportsCC.mockImplementation((cc: number) => cc === WINDOW_COVERING);
+      node.getDefinedValueIDs = jest
+        .fn()
+        .mockReturnValue([
+          { commandClass: WINDOW_COVERING, endpoint: 0, property: 'currentValue', propertyKey: 13 },
+        ]);
       await start();
 
       await move(25);
 
       expect(node.setValue).toHaveBeenCalledWith(
-        expect.objectContaining({ commandClass: WINDOW_COVERING }),
+        expect.objectContaining({
+          commandClass: WINDOW_COVERING,
+          property: 'targetValue',
+          propertyKey: 13,
+        }),
         25,
       );
+    });
+
+    it('rejects native covering writes when no parameter key can be resolved', async () => {
+      endpoint.supportsCC.mockImplementation((cc: number) => cc === WINDOW_COVERING);
+      node.getDefinedValueIDs = jest.fn().mockReturnValue([]);
+      await start();
+      await expect(move(25)).rejects.toBeInstanceOf(platform.api.hap.HapStatusError);
+      expect(node.setValue).not.toHaveBeenCalled();
+    });
+
+    it('uses the selected parameter for stop, even when another action appears first', async () => {
+      endpoint.supportsCC.mockImplementation((cc: number) => cc === WINDOW_COVERING);
+      node.getDefinedValueIDs = jest.fn().mockReturnValue([
+        { commandClass: WINDOW_COVERING, endpoint: 0, property: 'currentValue', propertyKey: 13 },
+        { commandClass: WINDOW_COVERING, endpoint: 0, property: 'levelChangeUp', propertyKey: 7 },
+        {
+          commandClass: WINDOW_COVERING,
+          endpoint: 0,
+          property: 'levelChangeDown',
+          propertyKey: 13,
+        },
+      ]);
+      await start();
+      await hold();
+      expect(node.setValue).toHaveBeenCalledWith(
+        expect.objectContaining({ property: 'levelChangeDown', propertyKey: 13 }),
+        false,
+      );
+    });
+
+    it('ignores reports for another native covering parameter', async () => {
+      endpoint.supportsCC.mockImplementation((cc: number) => cc === WINDOW_COVERING);
+      node.getDefinedValueIDs = jest.fn().mockReturnValue([
+        { commandClass: WINDOW_COVERING, endpoint: 0, property: 'currentValue', propertyKey: 13 },
+        { commandClass: WINDOW_COVERING, endpoint: 0, property: 'currentValue', propertyKey: 7 },
+      ]);
+      await start();
+      feature.update({
+        commandClass: WINDOW_COVERING,
+        property: 'currentValue',
+        propertyKey: 13,
+        endpoint: 0,
+        newValue: 40,
+        source: 'node',
+      } as any);
+      expect(current()).toBe(40);
+      feature.update({
+        commandClass: WINDOW_COVERING,
+        property: 'currentValue',
+        propertyKey: 7,
+        endpoint: 0,
+        newValue: 90,
+        source: 'node',
+      } as any);
+      expect(current()).toBe(40);
     });
 
     it('logs the request and what was transmitted', async () => {
