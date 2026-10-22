@@ -1771,4 +1771,121 @@ describe('ZWaveUsbPlatform', () => {
     });
   });
 
+  describe('route rebuild IPC routes', () => {
+    const driveRoute = async (
+      platform: any,
+      url: string,
+      method: string,
+    ): Promise<{ status: number | undefined; body: any }> => {
+      const fakeServer = new EventEmitter() as EventEmitter & {
+        listen: jest.Mock;
+        close: jest.Mock;
+        address: jest.Mock;
+      };
+      fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+      fakeServer.close = jest.fn();
+      fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+      const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+      const req = new EventEmitter() as EventEmitter & { url?: string; method?: string };
+      const res = { writeHead: jest.fn(), end: jest.fn() };
+      req.url = url;
+      req.method = method;
+
+      try {
+        platform.startIpcServer();
+        const handler = createServerSpy.mock.calls.at(-1)?.[0];
+        await new Promise<void>((resolve) => {
+          res.end = jest.fn().mockImplementation(() => resolve());
+          handler(req, res);
+        });
+        return {
+          status: (res.writeHead as jest.Mock).mock.calls[0]?.[0],
+          body: JSON.parse((res.end as jest.Mock).mock.calls[0][0]),
+        };
+      } finally {
+        createServerSpy.mockRestore();
+      }
+    };
+
+    const newPlatform = () => {
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+      return new ZWaveUsbPlatform(log, config, api) as any;
+    };
+
+    it.each([
+      ['started', 'started'],
+      ['busy', 'busy'],
+      ['refused', 'refused'],
+    ])('passes the controller result %s through unchanged', async (_name, result) => {
+      // The three outcomes are not interchangeable: busy means a rebuild this plugin did not
+      // start is running, so the UI still has something to wait for, and refused means nothing
+      // is running at all. Collapsing them to a boolean loses that.
+      const platform = newPlatform();
+      platform.zwaveController.startHealing = jest.fn().mockResolvedValue(result);
+      // isHealing tracks only rebuilds this plugin started, so it is false for busy. That is
+      // exactly why the status route also reports the driver's own view.
+      platform.zwaveController.isHealing = jest.fn().mockReturnValue(result === 'started');
+
+      const { body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(body).toEqual({ result, healing: result === 'started' });
+    });
+
+    it.each([
+      [true, false],
+      [false, true],
+      [false, false],
+    ])('reports healing=%p and rebuilding=%p', async (healing, rebuilding) => {
+      // Both are needed. A rebuild started before this plugin began tracking one is invisible to
+      // isHealing, so reporting only that would tell the UI it had finished immediately.
+      const platform = newPlatform();
+      platform.zwaveController.isHealing = jest.fn().mockReturnValue(healing);
+      platform.zwaveController.isRebuildingRoutes = jest.fn().mockReturnValue(rebuilding);
+
+      const { body } = await driveRoute(platform, '/network/heal/status', 'GET');
+
+      expect(body).toEqual({ healing, rebuilding });
+    });
+
+    it('answers the status route with an error when there is no controller', async () => {
+      // Answering healing:false here would be read as "the rebuild finished".
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveRoute(platform, '/network/heal/status', 'GET');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
+
+    it('answers with an error when the controller refuses to start a rebuild', async () => {
+      const platform = newPlatform();
+      platform.zwaveController.startHealing = jest
+        .fn()
+        .mockRejectedValue(new Error('Driver not started'));
+
+      const { status, body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(status).toBe(500);
+      expect(body.error).toBe('Driver not started');
+    });
+
+    it('answers rather than hanging when there is no controller', async () => {
+      // The management UI awaits this request with no timeout, so a route that returns without
+      // writing leaves its button disabled for good.
+      const platform = newPlatform();
+      platform.zwaveController = undefined;
+
+      const { status, body } = await driveRoute(platform, '/network/heal', 'POST');
+
+      expect(status).toBe(500);
+      expect(body.error).toContain('Controller');
+    });
+  });
 });

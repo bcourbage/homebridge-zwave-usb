@@ -207,6 +207,36 @@
     return `${where}, which is its target of ${positionText(result.target)}. The covering may have finished traveling on its own, so the stop proved nothing.`;
   }
 
+  /**
+   * What the Rebuild Routes button should say and do for each outcome the controller reports.
+   *
+   * `busy` means the driver is rebuilding from a request this plugin no longer tracks. There is
+   * something to wait for, but `isHealing` cannot see it, so the wait has to watch the driver's
+   * own view instead.
+   */
+  function describeHealStart(result) {
+    if (result === 'started') {
+      return {
+        status: 'Rebuilding routes. Watch the Homebridge log for progress.',
+        watch: true,
+      };
+    }
+
+    if (result === 'busy') {
+      return {
+        status: 'A route rebuild started elsewhere is already running. Waiting for it to finish.',
+        watch: true,
+      };
+    }
+
+    return { status: 'The controller did not start a route rebuild.', watch: false };
+  }
+
+  /** Whether a rebuild is still running, by either the plugin's reckoning or the driver's. */
+  function healIsRunning(state) {
+    return Boolean(state && (state.healing || state.rebuilding));
+  }
+
   function buildPluginConfig(currentConfig, formValues) {
     const securityKeys = normalizeSecurityKeys(formValues.securityKeys || {});
     const invalidSecurityKeyFields = getInvalidSecurityKeyFields(securityKeys);
@@ -244,6 +274,8 @@
     normalizeSecurityKey,
     normalizeSecurityKeys,
     getInvalidSecurityKeyFields,
+    describeHealStart,
+    healIsRunning,
     escapeHtml,
     formatRssi,
     describeRoute,

@@ -359,6 +359,32 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
+        if (normalizedUrl === '/network/heal' && method === 'POST') {
+          if (!this.zwaveController) {
+            sendJson({ error: 'Controller not initialized' }, 500);
+            return;
+          }
+          this.zwaveController
+            .startHealing()
+            .then((result) => sendJson({ result, healing: this.zwaveController?.isHealing() }))
+            .catch((err) => sendJson({ error: err.message }, 500));
+          return;
+        }
+
+        if (normalizedUrl === '/network/heal/status' && method === 'GET') {
+          if (!this.zwaveController) {
+            // A wrong answer is worse than an error here: `healing: false` is what the UI reads
+            // as "the rebuild finished".
+            sendJson({ error: 'Controller not initialized' }, 500);
+            return;
+          }
+          sendJson({
+            healing: this.zwaveController.isHealing(),
+            rebuilding: this.zwaveController.isRebuildingRoutes(),
+          });
+          return;
+        }
+
         if (normalizedUrl === '/accessories/prune-stale' && method === 'POST') {
           try {
             const removed = this.pruneStaleAccessories();

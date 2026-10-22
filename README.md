@@ -163,6 +163,7 @@ The plugin includes a dedicated **Maintenance** tab within the Homebridge custom
 - **Real-time Progress**: Monitor the progress of the firmware transfer via a live progress bar.
 - **Clean Up Stale Accessories**: Remove stale cached Homebridge accessories explicitly from the maintenance UI instead of relying on automatic startup pruning.
 - **Remove a Failed Node**: Remove one node from the Z-Wave network, after the controller has been asked whether it can be removed and the answer has been shown. A battery device that sleeps between wake-ups is refused, as is a node the controller cannot assess. Removal is permanent and the device has to be included again physically.
+- **Rebuild Routes**: Start a network route rebuild from the maintenance UI and watch it run. Sleeping devices are skipped unless Heal Network Includes Sleeping Devices is turned on. If a rebuild started elsewhere is already running, the button waits for that one to finish instead of starting a second.
 
 ## ❓ Troubleshooting
 

@@ -93,6 +93,12 @@ export interface IZWaveController extends EventEmitter {
   assessFailedNodeRemoval(nodeId: number): Promise<FailedNodeRemovalAssessment>;
   removeFailedNode(nodeId: number, confirmNodeId: number): Promise<void>;
   getNodeRouteDiagnostics(nodeId: number): Promise<NodeRouteDiagnostics>;
+  /**
+   * Whether the driver is rebuilding routes, whoever asked for it. A rebuild started before
+   * this plugin began tracking one is invisible to `isHealing` but is still running.
+   */
+  isRebuildingRoutes(): boolean;
+  removeFailedNode(nodeId: number): Promise<void>;
   setNodeName(nodeId: number, name: string): Promise<void>;
   refreshNodeInfo(nodeId: number): Promise<{ nodeId: number; requiresWakeUp: boolean }>;
   setS2Pin(pin: string): void;

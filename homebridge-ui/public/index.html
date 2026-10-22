@@ -202,10 +202,16 @@
             <div class="text-muted small">
               Nodes that have not completed interview yet are intentionally held back from HomeKit until their service metadata is stable. Use Refresh Info to force a fresh interview when metadata looks incomplete.
             </div>
-            <button class="btn btn-sm btn-outline-danger" id="cleanupStaleAccessories">
-              Clean Up Stale Accessories
-            </button>
+            <div class="btn-group btn-group-sm">
+              <button class="btn btn-outline-secondary" id="healNetwork">
+                Rebuild Routes
+              </button>
+              <button class="btn btn-outline-danger" id="cleanupStaleAccessories">
+                Clean Up Stale Accessories
+              </button>
+            </div>
           </div>
+          <div class="small text-muted mb-2" id="healStatus" aria-live="polite"></div>
           <div class="table-responsive">
             <table class="table table-sm" id="nodeTable">
               <thead>
@@ -682,6 +688,47 @@
 	          window.homebridge.toast.error(err.message);
 	        }
 	        loadNodes();
+	      document.getElementById('healNetwork').addEventListener('click', async (e) => {
+	        const button = e.currentTarget;
+	        const status = document.getElementById('healStatus');
+	        button.disabled = true;
+
+	        const watchUntilItEnds = () => {
+	          let settled = false;
+	          const finish = (text) => {
+	            if (settled) return;
+	            settled = true;
+	            clearInterval(poll);
+	            status.textContent = text;
+	            button.disabled = false;
+	          };
+	          const poll = setInterval(async () => {
+	            try {
+	              const state = await window.homebridge.request('heal-network-status');
+	              if (!uiHelpers.healIsRunning(state)) {
+	                finish('Route rebuild finished. The Homebridge log has the summary.');
+	              }
+	            } catch (err) {
+	              finish(err.message);
+	            }
+	          }, 3000);
+	        };
+
+	        try {
+	          const outcome = uiHelpers.describeHealStart(
+	            (await window.homebridge.request('heal-network')).result,
+	          );
+	          status.textContent = outcome.status;
+	          if (outcome.watch) {
+	            watchUntilItEnds();
+	            return;
+	          }
+	          button.disabled = false;
+	        } catch (err) {
+	          status.textContent = err.message;
+	          button.disabled = false;
+	        }
+	      });
 	      });
 
 	      document.getElementById('cleanupStaleAccessories').addEventListener('click', async () => {
