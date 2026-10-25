@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.1] - 2026-10-25
+
+### Fixed
+- Clarify window-covering stop results: the earlier percentage is the position when Stop was sent, not where the preceding move began. Lead with the final position and attach the target comparison to it across successful, inconclusive, and timed-out results (#22).
+- Use the same timing description in the stop-test log message.
+- Publish raw CO2, VOC, and PM2.5 over Matter using the host's public measurement servers. Combine CO2 and air-quality HAP services at the same Z-Wave endpoint while preserving separate endpoints and source listeners.
+- Reclaim composed measurement clusters after Homebridge 2.4's name-only cache restore, including measurements on child endpoints. Keep accessory UUIDs and child endpoint IDs stable.
+- Read unknown battery levels through their getters instead of publishing the cached HAP default of zero. Match battery services to their endpoints and publish battery-only devices as bridged power sources.
+- Keep missing raw sensor samples null instead of mirroring default zero values, and avoid publishing a UV-only sensor as a false illuminance reading.
+
+### Limits and validation
+- UV index remains HomeKit-only because the current Matter runtime has no standard UV cluster. Air quality retains compatible core summary grades; finer enum grades fail the host's pre-plugin cache restore. Raw readings now supply the quantitative data.
+- Homebridge 2.4's incomplete helper-name list may log unknown-cluster warnings for CO2/VOC updates; the real composed clusters accept and report those values.
+- Validation covers fresh/restored endpoint construction and three starts through the real host registration/cache code, live state updates, endpoint identities, and independent endpoint batteries. Expanded physical-device/controller testing remains open.
+
+Thanks to Bruno Courbage (@bcourbage) for the hardware report, stop-wording fix, and regression test in #22.
+
 ## [5.0.0] - 2026-10-22
 
 ### Breaking changes

@@ -49,3 +49,5 @@ jobs:
         run: npm install --prefix "$RUNNER_TEMP/matter-host" --no-save --ignore-scripts homebridge@2.4.0
       - name: Validate fresh and restored Matter endpoints
         run: node scripts/verify-matter-host.mjs "$RUNNER_TEMP/matter-host/node_modules/homebridge"
+      - name: Validate sensor cache reclamation and live state updates
+        run: node scripts/verify-matter-lifecycle.mjs "$RUNNER_TEMP/matter-host/node_modules/homebridge"
