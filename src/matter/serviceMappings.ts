@@ -8,9 +8,13 @@ type CharacteristicType = typeof Characteristic.On;
 type Attributes = Record<string, unknown>;
 export interface StateBinding {
   characteristic: CharacteristicType;
+  /** A co-located HAP service contributing another measurement to this endpoint. */
+  service?: Service;
   cluster: string;
   attributes: (value: unknown) => Attributes;
   event?: true;
+  /** Raw measurement exists in the driver cache; HAP getters may otherwise return a default zero. */
+  available?: () => boolean;
 }
 export interface ServiceMapping {
   /** Stable across service ordering changes and process restarts. */
@@ -18,6 +22,8 @@ export interface ServiceMapping {
   service: Service;
   deviceType: string;
   clusters: Record<string, Attributes>;
+  /** Optional servers exposed through the host's public AirQualitySensor requirements. */
+  composition?: Record<string, string[]>;
   bindings: StateBinding[];
   commands: Record<string, Record<string, (request?: never) => Promise<void>>>;
 }
@@ -70,6 +76,22 @@ export function serviceMappings(
       name: string,
       convert: (v: unknown) => unknown = (v) => v,
     ) => bind(characteristic, cluster, (v) => ({ [name]: convert(v) }));
+    const measurement = (characteristic: CharacteristicType, cluster: string, property: string) => {
+      field(characteristic, cluster, 'measuredValue', (v) => numeric(v));
+      m.bindings[m.bindings.length - 1].available = () => {
+        if (typeof accessory.node.getValue !== 'function') return true;
+        try {
+          const value = accessory.node.getValue({
+            commandClass: CommandClasses['Multilevel Sensor'],
+            endpoint: Number(service.subtype ?? 0),
+            property,
+          });
+          return typeof value === 'number' && Number.isFinite(value) && value >= 0;
+        } catch {
+          return false;
+        }
+      };
+    };
     const write = (type: CharacteristicType, value: unknown) => io.write(key, type, value);
     const onOff = () => {
       field(C.On, 'onOff', 'onOff', Boolean);
@@ -223,7 +245,38 @@ export function serviceMappings(
         [smoke ? 'smokeState' : 'coState']: v === 1 ? 1 : 0,
         expressedState: v === 1 ? (smoke ? 1 : 2) : 0,
       }));
+    } else if (is('CarbonDioxideSensor')) {
+      m.deviceType = 'AirQualitySensor';
+      field(C.CarbonDioxideDetected, 'airQuality', 'airQuality', (v) =>
+        v === 0 ? 1 : v === 1 ? 4 : 0,
+      );
+      if (has(C.CarbonDioxideLevel)) {
+        m.composition = { CarbonDioxideConcentrationMeasurementServer: ['NumericMeasurement'] };
+        m.clusters.carbonDioxideConcentrationMeasurement = {
+          measurementMedium: 0,
+          measurementUnit: 0,
+          minMeasuredValue: 0,
+          maxMeasuredValue: null,
+        };
+        measurement(
+          C.CarbonDioxideLevel,
+          'carbonDioxideConcentrationMeasurement',
+          'Carbon dioxide (CO2) level',
+        );
+      }
     } else if (is('TemperatureSensor') || is('HumiditySensor') || is('LightSensor')) {
+      const defined = accessory.node.getDefinedValueIDs?.() ?? [];
+      const sensors = defined.filter(
+        (v) =>
+          v.commandClass === CommandClasses['Multilevel Sensor'] &&
+          (v.endpoint ?? 0) === Number(service.subtype ?? 0),
+      );
+      if (
+        is('LightSensor') &&
+        sensors.some((v) => v.property === 'Ultraviolet') &&
+        !sensors.some((v) => v.property === 'Illuminance')
+      )
+        continue;
       const temp = is('TemperatureSensor'),
         humidity = is('HumiditySensor');
       m.deviceType = temp ? 'TemperatureSensor' : humidity ? 'HumiditySensor' : 'LightSensor';
@@ -255,11 +308,36 @@ export function serviceMappings(
       );
     } else if (is('AirQualitySensor')) {
       m.deviceType = 'AirQualitySensor';
-      // Only Good/Poor/Unknown survive restoration of the host's base type.
-      // HAP Excellent/Good are Good; Fair/Inferior/Poor use the coarser Poor category.
+      m.composition = {};
+      // The host restores base AirQuality types before the plugin can reclaim them.
+      // Optional enum grades fail that restore; retain the core categories and raw readings.
       field(C.AirQuality, 'airQuality', 'airQuality', (v) =>
         v === 1 || v === 2 ? 1 : v === 3 || v === 4 || v === 5 ? 4 : 0,
       );
+      for (const [characteristic, cluster, requirement] of [
+        [
+          C.VOCDensity,
+          'totalVolatileOrganicCompoundsConcentrationMeasurement',
+          'TotalVolatileOrganicCompoundsConcentrationMeasurementServer',
+        ],
+        [C.PM2_5Density, 'pm25ConcentrationMeasurement', 'Pm25ConcentrationMeasurementServer'],
+      ] as const) {
+        if (!has(characteristic)) continue;
+        m.composition[requirement] = ['NumericMeasurement'];
+        m.clusters[cluster] = {
+          measurementMedium: 0,
+          measurementUnit: 4,
+          minMeasuredValue: 0,
+          maxMeasuredValue: null,
+        };
+        measurement(
+          characteristic,
+          cluster,
+          characteristic === C.VOCDensity
+            ? 'Volatile Organic Compound level'
+            : 'Particulate Matter 2.5',
+        );
+      }
     } else if (is('StatelessProgrammableSwitch')) {
       m.deviceType = 'GenericSwitch';
       m.clusters.switch = { numberOfPositions: 2, currentPosition: 0, multiPressMax: 2 };
@@ -386,6 +464,36 @@ export function serviceMappings(
       };
     }
     if (m.deviceType) result.push(m);
+  }
+  if (result.length === 0) {
+    const battery = accessory.platformAccessory.services.find(
+      (service) => service.UUID === S.Battery?.UUID,
+    );
+    if (battery)
+      result.push({
+        key: `${battery.UUID}-${battery.subtype ?? 'root'}`,
+        service: battery,
+        deviceType: 'BridgedNode',
+        clusters: {},
+        bindings: [],
+        commands: {},
+      });
+  }
+  // CO2 and air-quality HAP services at the same Z-Wave endpoint describe one sensor.
+  // Keep the existing air-quality endpoint identity and bind each measurement to its source.
+  for (const co2 of [...result].filter((m) => m.service.UUID === S.CarbonDioxideSensor?.UUID)) {
+    const air = result.find(
+      (m) =>
+        m !== co2 &&
+        m.service.UUID === S.AirQualitySensor?.UUID &&
+        m.service.subtype === co2.service.subtype,
+    );
+    if (!air) continue;
+    const measurements = co2.bindings.filter((binding) => binding.cluster !== 'airQuality');
+    air.bindings.push(...measurements.map((binding) => ({ ...binding, service: co2.service })));
+    Object.assign((air.composition ??= {}), co2.composition);
+    Object.assign(air.clusters, co2.clusters);
+    result.splice(result.indexOf(co2), 1);
   }
   // Preserve the covering root shape while keeping every other service in stable parts.
   return result.sort(

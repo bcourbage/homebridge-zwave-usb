@@ -24,9 +24,34 @@ const typeNames = [
   'Thermostat',
 ];
 
+function fakeDevice(name: string, behaviors: Record<string, unknown> = {}): any {
+  return {
+    name,
+    behaviors,
+    requirements: Object.fromEntries(
+      [
+        'AirQualityServer',
+        'CarbonDioxideConcentrationMeasurementServer',
+        'TotalVolatileOrganicCompoundsConcentrationMeasurementServer',
+        'Pm25ConcentrationMeasurementServer',
+      ].map((id) => [id, { with: (...features: string[]) => ({ id, features }) }]),
+    ),
+    with: (...servers: any[]) =>
+      fakeDevice(name, {
+        ...behaviors,
+        ...Object.fromEntries(servers.map((server) => [server.id, server])),
+      }),
+  };
+}
+
 function harness(services: any[], setpoints = [1, 2], uuid = 'node-8') {
   const matter = {
-    deviceTypes: Object.fromEntries(typeNames.map((name) => [name, { name }])),
+    deviceTypes: {
+      ...Object.fromEntries(typeNames.map((name) => [name, fakeDevice(name)])),
+      BridgedNode: fakeDevice('BridgedNode', {
+        bridgedDeviceBasicInformation: { id: 'bridgedDeviceBasicInformation' },
+      }),
+    },
     registerPlatformAccessories: jest.fn().mockResolvedValue(undefined),
     unregisterPlatformAccessories: jest.fn().mockResolvedValue(undefined),
     updateAccessoryState: jest.fn().mockResolvedValue(undefined),
@@ -227,7 +252,7 @@ describe('Matter publication across device types', () => {
     async (_name, make, type, cluster, attributes) => {
       const h = harness([make()]);
       const descriptor = await h.publish();
-      expect(descriptor.deviceType).toEqual({ name: type });
+      expect(descriptor.deviceType.name).toBe(type);
       expect(descriptor.clusters[cluster]).toMatchObject(attributes);
       h.bridge.stop();
     },
@@ -398,6 +423,257 @@ describe('Matter publication across device types', () => {
     await expect(d.handlers.thermostat.systemModeChange({ systemMode: 9 })).rejects.toBeInstanceOf(
       h.matter.status.Failure,
     );
+    h.bridge.stop();
+  });
+
+  it('publishes raw CO2, VOC and PM2.5 on one air sensor endpoint with their real units', async () => {
+    const air = service(S.AirQualitySensor, [
+      [C.AirQuality, 3],
+      [C.VOCDensity, 180],
+      [C.PM2_5Density, 14],
+    ]);
+    const co2 = service(S.CarbonDioxideSensor, [
+      [C.CarbonDioxideDetected, 0],
+      [C.CarbonDioxideLevel, 750],
+    ]);
+    const h = harness([air, co2]);
+    const d = await h.publish();
+    expect(d.parts).toBeUndefined();
+    expect(d.clusters.carbonDioxideConcentrationMeasurement).toMatchObject({
+      measuredValue: 750,
+      measurementUnit: 0,
+      measurementMedium: 0,
+    });
+    expect(d.clusters.totalVolatileOrganicCompoundsConcentrationMeasurement).toMatchObject({
+      measuredValue: 180,
+      measurementUnit: 4,
+    });
+    expect(d.clusters.pm25ConcentrationMeasurement).toMatchObject({
+      measuredValue: 14,
+      measurementUnit: 4,
+    });
+    co2.updateCharacteristic(C.CarbonDioxideLevel, 900);
+    expect(h.matter.updateAccessoryState).toHaveBeenCalledWith(
+      'node-8',
+      'carbonDioxideConcentrationMeasurement',
+      { measuredValue: 900 },
+    );
+    air.updateCharacteristic(C.PM2_5Density, 20);
+    expect(h.matter.updateAccessoryState).toHaveBeenCalledWith(
+      'node-8',
+      'pm25ConcentrationMeasurement',
+      { measuredValue: 20 },
+    );
+    h.bridge.stop();
+  });
+
+  it('keeps raw measurements on their selected endpoint through wrapper replacement', async () => {
+    const cover = service(
+      S.WindowCovering,
+      [
+        [C.CurrentPosition, 50],
+        [C.TargetPosition, 50],
+      ],
+      '1',
+    );
+    const air = service(
+      S.AirQualitySensor,
+      [
+        [C.AirQuality, 2],
+        [C.VOCDensity, 10],
+      ],
+      '2',
+    );
+    const co2 = service(
+      S.CarbonDioxideSensor,
+      [
+        [C.CarbonDioxideDetected, 0],
+        [C.CarbonDioxideLevel, 700],
+      ],
+      '2',
+    );
+    const h = harness([cover, air, co2]);
+    const d = await h.publish();
+    const part = d.parts.find((p: any) => p.clusters.carbonDioxideConcentrationMeasurement);
+    const nextCo2 = service(
+      S.CarbonDioxideSensor,
+      [
+        [C.CarbonDioxideDetected, 0],
+        [C.CarbonDioxideLevel, 800],
+      ],
+      '2',
+    );
+    h.bridge.add({
+      ...h.accessory,
+      platformAccessory: { ...h.accessory.platformAccessory, services: [cover, air, nextCo2] },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    h.matter.updateAccessoryState.mockClear();
+    co2.updateCharacteristic(C.CarbonDioxideLevel, 1000);
+    expect(h.matter.updateAccessoryState).not.toHaveBeenCalled();
+    nextCo2.updateCharacteristic(C.CarbonDioxideLevel, 900);
+    expect(h.matter.updateAccessoryState).toHaveBeenCalledWith(
+      'node-8',
+      'carbonDioxideConcentrationMeasurement',
+      { measuredValue: 900 },
+      part.id,
+    );
+    expect(h.matter.registerPlatformAccessories).toHaveBeenCalledTimes(1);
+    h.bridge.stop();
+  });
+
+  it('does not merge measurements belonging to different Z-Wave endpoints', async () => {
+    const air = service(
+      S.AirQualitySensor,
+      [
+        [C.AirQuality, 2],
+        [C.PM2_5Density, 11],
+      ],
+      '1',
+    );
+    const co2 = service(
+      S.CarbonDioxideSensor,
+      [
+        [C.CarbonDioxideDetected, 0],
+        [C.CarbonDioxideLevel, 850],
+      ],
+      '2',
+    );
+    const h = harness([air, co2]);
+    const d = await h.publish();
+    expect(d.parts).toHaveLength(1);
+    const endpoints = [d, ...d.parts];
+    expect(
+      endpoints.filter((p: any) => p.clusters.carbonDioxideConcentrationMeasurement),
+    ).toHaveLength(1);
+    expect(endpoints.filter((p: any) => p.clusters.pm25ConcentrationMeasurement)).toHaveLength(1);
+    expect(
+      endpoints.some(
+        (p: any) =>
+          p.clusters.carbonDioxideConcentrationMeasurement &&
+          p.clusters.pm25ConcentrationMeasurement,
+      ),
+    ).toBe(false);
+    h.bridge.stop();
+  });
+
+  it('publishes an unavailable raw measurement as null rather than its HAP default', async () => {
+    const co2 = service(S.CarbonDioxideSensor, [
+      [C.CarbonDioxideDetected, 0],
+      [C.CarbonDioxideLevel, 0],
+    ]);
+    co2.getCharacteristic(C.CarbonDioxideLevel).onGet(() => {
+      throw new Error('No reading');
+    });
+    const h = harness([co2]);
+    const d = await h.publish();
+    expect(d.clusters.carbonDioxideConcentrationMeasurement.measuredValue).toBeNull();
+    h.bridge.stop();
+  });
+
+  it.each([undefined, NaN, -1])(
+    'does not turn an unavailable/invalid raw sample %s into a HAP default zero',
+    async (sample) => {
+      const air = service(S.AirQualitySensor, [
+        [C.AirQuality, 0],
+        [C.VOCDensity, 0],
+        [C.PM2_5Density, 0],
+      ]);
+      const co2 = service(S.CarbonDioxideSensor, [
+        [C.CarbonDioxideDetected, 0],
+        [C.CarbonDioxideLevel, 0],
+      ]);
+      const h = harness([air, co2]);
+      h.accessory.node.getValue = jest.fn().mockReturnValue(sample);
+      const d = await h.publish();
+      for (const cluster of [
+        'carbonDioxideConcentrationMeasurement',
+        'totalVolatileOrganicCompoundsConcentrationMeasurement',
+        'pm25ConcentrationMeasurement',
+      ]) {
+        expect(d.clusters[cluster].measuredValue).toBeNull();
+      }
+      h.accessory.node.getValue.mockReturnValue(400);
+      co2.updateCharacteristic(C.CarbonDioxideLevel, 400);
+      expect(h.matter.updateAccessoryState).toHaveBeenCalledWith(
+        'node-8',
+        'carbonDioxideConcentrationMeasurement',
+        { measuredValue: 400 },
+      );
+      h.bridge.stop();
+    },
+  );
+
+  it('keeps an unknown battery level null despite the characteristic cached default of zero', async () => {
+    const contact = service(S.ContactSensor, [[C.ContactSensorState, 0]]);
+    const battery = service(S.Battery, []);
+    battery.getCharacteristic(C.BatteryLevel).onGet(() => {
+      throw new Error('Battery has not reported');
+    });
+    expect(battery.getCharacteristic(C.BatteryLevel).value).toBe(0);
+    const h = harness([contact, battery]);
+    const d = await h.publish();
+    expect(d.clusters.powerSource.batPercentRemaining).toBeNull();
+    h.bridge.stop();
+  });
+
+  it('uses the battery belonging to each endpoint and mirrors changes to that part only', async () => {
+    const first = service(S.Switch, [[C.On, true]], '0');
+    const second = service(S.Switch, [[C.On, false]], '2');
+    const rootBattery = service(
+      S.Battery,
+      [
+        [C.BatteryLevel, 80],
+        [C.StatusLowBattery, 0],
+      ],
+      '0',
+    );
+    const partBattery = service(
+      S.Battery,
+      [
+        [C.BatteryLevel, 15],
+        [C.StatusLowBattery, 1],
+      ],
+      '2',
+    );
+    const h = harness([first, second, rootBattery, partBattery]);
+    const d = await h.publish();
+    expect(d.clusters.powerSource.batPercentRemaining).toBe(160);
+    expect(d.parts[0].clusters.powerSource).toMatchObject({
+      batPercentRemaining: 30,
+      batChargeLevel: 1,
+    });
+    h.matter.updateAccessoryState.mockClear();
+    partBattery.updateCharacteristic(C.BatteryLevel, 10);
+    expect(h.matter.updateAccessoryState).toHaveBeenCalledTimes(1);
+    expect(h.matter.updateAccessoryState).toHaveBeenCalledWith(
+      'node-8',
+      'powerSource',
+      { batPercentRemaining: 20 },
+      d.parts[0].id,
+    );
+    h.bridge.stop();
+  });
+
+  it('publishes a battery-only device as a bridged power source', async () => {
+    const battery = service(S.Battery, [
+      [C.BatteryLevel, 40],
+      [C.StatusLowBattery, 0],
+    ]);
+    const h = harness([battery]);
+    const d = await h.publish();
+    expect(d.deviceType.name).toBe('BridgedNode');
+    expect(d.clusters.powerSource.batPercentRemaining).toBe(80);
+    h.bridge.stop();
+  });
+
+  it('does not advertise UV as an invented illuminance measurement', async () => {
+    const light = service(S.LightSensor, []);
+    const h = harness([light]);
+    h.accessory.node.getDefinedValueIDs = () => [
+      { commandClass: CommandClasses['Multilevel Sensor'], endpoint: 0, property: 'Ultraviolet' },
+    ];
+    expect(await h.publish()).toBeUndefined();
     h.bridge.stop();
   });
 

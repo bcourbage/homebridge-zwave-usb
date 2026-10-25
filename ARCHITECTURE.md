@@ -81,3 +81,16 @@ not interview completion or the publication queue, and Matter errors do not rest
 endpoint construction against an installed Homebridge 2.4 runtime after `npm run build`. It uses
 a temporary, uncommissioned Matter server without starting network advertisement. This supplements
 the unit tests; it does not establish physical-device or controller-app compatibility.
+
+### Optional Matter measurement servers
+
+`deviceComposition.ts` composes host-provided CO2, TVOC, and PM2.5 measurement servers. CO2 and
+AQ HAP services sharing an endpoint contribute bindings to one Matter service; each binding keeps
+its source service and checks the driver cache before treating a getter default as a reading.
+
+Homebridge 2.4 compares root server names during cache reclamation but omits optional child
+servers. Explicitly composing the root's required bridged-info server makes the host reconstruct
+the requested graph instead of attaching to incomplete cached children. The plugin keeps the
+same accessory UUID and child IDs. `verify-matter-lifecycle.mjs` checks this path across three
+starts with the host's actual serializer and registration code, including independent batteries.
+No host registry, private runtime object, or on-disk cache is modified by the plugin.

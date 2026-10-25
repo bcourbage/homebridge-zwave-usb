@@ -49,13 +49,13 @@ continues to use HomeKit alone.
 | Motion, contact, and leak sensors | Occupancy, contact, and water leak detector |
 | Smoke and CO alarms | Smoke/CO alarm with the relevant alarm feature |
 | Temperature, humidity, and illuminance | Measurement sensor, with Matter units |
-| Air quality | Air quality category |
+| Air quality and CO2 sensors | Air quality category plus CO2, VOC and PM2.5 measurements |
 | Thermostats and TRVs | Thermostat, advertising only the interviewed heating/cooling setpoints |
 | Window coverings | Window covering, including open, close, position, and stop |
 | Garage doors | Closure, with fully open and fully closed commands |
 | Scene buttons | Generic switch, with single, double, and long press events |
 | Sirens | On/Off outlet, or dimmable outlet with volume control |
-| Battery status | Power source on the owning device |
+| Battery status | Power source on the matching endpoint, including battery-only devices |
 
 A node with several services publishes the additional services as child endpoints. Commands use
 the same HomeKit handlers as the Home app, and state changes are mirrored to Matter. Battery,
@@ -66,9 +66,22 @@ in an app even when Homebridge publishes it. Garage-door stop is rejected becaus
 Barrier Operator implementation has no portable stop command. Continuous dimmer/color movement
 and transition timing are not implemented; absolute levels and colors are supported.
 
-Raw CO2, VOC, PM2.5, and custom UV readings remain HomeKit-only. The derived air quality category
-is published over Matter. Air quality uses the host's core Good/Poor/Unknown values: Excellent/Good map to Good, and Fair/Inferior/Poor map to Poor. Homebridge 2.4 does not restore optional concentration-cluster composition
-from its Matter cache, so those readings are not advertised as working Matter measurements.
+CO2 is published in ppm; VOC and PM2.5 use the HomeKit-normalized micrograms per cubic meter.
+CO2 and air-quality services at the same Z-Wave endpoint are combined so one sensor is not
+duplicated. Missing raw samples and unknown battery levels are reported as null rather than
+HomeKit's default zero. Separate endpoint batteries retain their own levels and warnings.
+
+The plugin composes measurement servers through Homebridge's public device requirements and
+reclaims the full graph after name-only cache restoration. Automated tests cover three starts,
+raw state updates, and stable endpoint numbers for standalone and child sensors. Homebridge 2.4
+may log an unknown-cluster warning for CO2 or VOC state updates because its helper name list is
+incomplete; the composed Matter clusters still receive the readings.
+
+Custom UV readings remain HomeKit-only: the current Matter runtime has no standard UV-index
+cluster. A UV-only HAP LightSensor is not advertised as a fabricated illuminance measurement.
+Air quality still uses the host's core Good/Poor/Unknown categories: Excellent/Good map to Good,
+and Fair/Inferior/Poor map to Poor. Optional finer enum grades fail Homebridge 2.4's pre-plugin
+cache restoration; the raw readings preserve the quantitative data.
 
 Homebridge dispatches bridged Matter registration and removal without a downstream acknowledgement.
 The plugin prevents duplicate offers and reclaims cached endpoints at startup, but cannot detect

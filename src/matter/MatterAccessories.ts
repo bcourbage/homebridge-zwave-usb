@@ -4,6 +4,7 @@ import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
 import { homeKitBatteryToMatterPercent } from './coveringPosition';
 import { matterLabel, matterSerialNumber } from './matterText';
 import { serviceMappings, ServiceMapping } from './serviceMappings';
+import { composeBridgedRoot, composeDeviceType } from './deviceComposition';
 
 /** The status errors a cluster handler throws to report a failure to the controller. */
 interface MatterStatusErrors {
@@ -513,7 +514,11 @@ export class MatterAccessories {
       if (binding.event) continue;
       let value: unknown;
       try {
-        const characteristic = mapping.service.getCharacteristic(binding.characteristic);
+        if (binding.available && !binding.available())
+          throw new Error('No measurement has been reported');
+        const characteristic = (binding.service ?? mapping.service).getCharacteristic(
+          binding.characteristic,
+        );
         value = await characteristic.handleGetRequest();
       } catch {
         value = undefined;
@@ -538,11 +543,15 @@ export class MatterAccessories {
     const root = mappings[0];
     if (!root) return undefined;
     const information = this.readAccessoryInformation(accessory.platformAccessory);
-    const battery = this.describeBattery(accessory.platformAccessory);
+    const battery = await this.describeBattery(accessory.platformAccessory, root.service);
     const descriptor: MatterAccessoryDescriptor = {
       UUID: accessory.platformAccessory.UUID,
       displayName: matterLabel(accessory.platformAccessory.displayName),
-      deviceType: matter.deviceTypes[root.deviceType],
+      deviceType: composeBridgedRoot(
+        composeDeviceType(root, matter.deviceTypes),
+        mappings,
+        matter.deviceTypes,
+      ),
       serialNumber: matterSerialNumber(information.serialNumber),
       manufacturer: matterLabel(information.manufacturer),
       model: matterLabel(information.model),
@@ -561,8 +570,11 @@ export class MatterAccessories {
           displayName: matterLabel(
             mapping.service.displayName || accessory.platformAccessory.displayName,
           ),
-          deviceType: matter.deviceTypes[mapping.deviceType],
-          clusters: await this.mappingState(mapping),
+          deviceType: composeDeviceType(mapping, matter.deviceTypes),
+          clusters: {
+            ...(await this.mappingState(mapping)),
+            ...(await this.batteryCluster(accessory.platformAccessory, mapping.service)),
+          },
           handlers: this.handlers(mapping, matter),
         })),
       );
@@ -594,13 +606,24 @@ export class MatterAccessories {
     );
   }
 
-  private findBatteryService(platformAccessory: PlatformAccessory): Service | undefined {
+  private findBatteryService(
+    platformAccessory: PlatformAccessory,
+    target?: Service,
+  ): Service | undefined {
     const batteryType = this.platform.Service.Battery as unknown as { UUID?: string };
     if (!batteryType?.UUID) {
       return undefined;
     }
 
-    return platformAccessory.services.find((service) => service.UUID === batteryType.UUID);
+    const batteries = platformAccessory.services.filter(
+      (service) => service.UUID === batteryType.UUID,
+    );
+    if (!target) return batteries[0];
+    const endpoint = (service: Service) => Number(/^(\d+)/.exec(service.subtype ?? '0')?.[1] ?? 0);
+    return (
+      batteries.find((service) => endpoint(service) === endpoint(target)) ??
+      batteries.find((service) => endpoint(service) === 0)
+    );
   }
 
   /**
@@ -611,15 +634,16 @@ export class MatterAccessories {
    * so a power source declared without them would reject the device's first real reading for the
    * rest of the process. A missing level is reported as unknown rather than invented.
    */
-  private describeBattery(
+  private async describeBattery(
     platformAccessory: PlatformAccessory,
-  ): Record<string, unknown> | undefined {
-    const service = this.findBatteryService(platformAccessory);
+    target?: Service,
+  ): Promise<Record<string, unknown> | undefined> {
+    const service = this.findBatteryService(platformAccessory, target);
     if (!service) {
       return undefined;
     }
 
-    const level = this.readBatteryLevel(service);
+    const level = await this.readBatteryLevel(service);
 
     return {
       status: 1, // Active
@@ -632,9 +656,26 @@ export class MatterAccessories {
     };
   }
 
-  private readBatteryLevel(service: Service): number | undefined {
-    const value = service.getCharacteristic(this.platform.Characteristic.BatteryLevel)?.value;
-    return typeof value === 'number' ? value : undefined;
+  private async batteryCluster(
+    platformAccessory: PlatformAccessory,
+    target: Service,
+  ): Promise<Record<string, Record<string, unknown>>> {
+    const battery = await this.describeBattery(platformAccessory, target);
+    return battery ? { powerSource: battery } : {};
+  }
+
+  private async readBatteryLevel(service: Service): Promise<number | undefined> {
+    try {
+      const characteristic = service.getCharacteristic(this.platform.Characteristic.BatteryLevel);
+      // The cached HAP default is 0 even when BatteryFeature has never received a level.
+      const value =
+        typeof characteristic.handleGetRequest === 'function'
+          ? await characteristic.handleGetRequest()
+          : characteristic.value;
+      return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+    } catch {
+      return undefined;
+    }
   }
 
   private readBatteryChargeLevel(service: Service): number {
@@ -761,17 +802,21 @@ export class MatterAccessories {
   private async pushCurrentState(accessory: ZWaveAccessory): Promise<void> {
     const descriptor = this.descriptors.get(accessory.platformAccessory.UUID);
     if (!descriptor) return;
-    const mappings = this.mappings(accessory);
-    for (const mapping of mappings) {
+    for (const mapping of this.mappings(accessory)) {
       const partId = this.partId(descriptor, mapping);
       if (partId === null) continue;
-      for (const [cluster, attributes] of Object.entries(await this.mappingState(mapping))) {
+      const clusters = partId
+        ? descriptor.parts?.find((part) => part.id === partId)?.clusters
+        : descriptor.clusters;
+      const state = await this.mappingState(mapping);
+      if (clusters?.powerSource)
+        Object.assign(
+          state,
+          await this.batteryCluster(accessory.platformAccessory, mapping.service),
+        );
+      for (const [cluster, attributes] of Object.entries(state))
         this.pushState(accessory, cluster, attributes, partId);
-      }
     }
-    const battery = this.describeBattery(accessory.platformAccessory);
-    if (battery && descriptor.clusters.powerSource)
-      this.pushState(accessory, POWER_SOURCE_CLUSTER, battery);
   }
 
   /** Only mirror services present in the endpoint registered this session. */
@@ -793,7 +838,7 @@ export class MatterAccessories {
       for (const binding of mapping.bindings) {
         this.onCharacteristicChange(
           accessory.platformAccessory.UUID,
-          mapping.service,
+          binding.service ?? mapping.service,
           binding.characteristic,
           (value) => {
             if (binding.event) {
@@ -814,7 +859,12 @@ export class MatterAccessories {
             } else {
               // HAP error updates must not become sensor readings.
               if (value instanceof Error || value === undefined || value === null) return;
-              this.pushState(accessory, binding.cluster, binding.attributes(value), partId);
+              this.pushState(
+                accessory,
+                binding.cluster,
+                binding.attributes(binding.available && !binding.available() ? undefined : value),
+                partId,
+              );
             }
           },
         );
@@ -824,36 +874,49 @@ export class MatterAccessories {
 
   /** Mirrors battery readings the same way, so a Matter controller can show the charge level. */
   private trackBattery(accessory: ZWaveAccessory): void {
-    const service = this.findBatteryService(accessory.platformAccessory);
-    if (!service) {
-      return;
+    const descriptor = this.descriptors.get(accessory.platformAccessory.UUID);
+    if (!descriptor) return;
+    for (const mapping of this.mappings(accessory)) {
+      const partId = this.partId(descriptor, mapping);
+      if (partId === null) continue;
+      const clusters = partId
+        ? descriptor.parts?.find((part) => part.id === partId)?.clusters
+        : descriptor.clusters;
+      if (!clusters?.powerSource) continue;
+      const service = this.findBatteryService(accessory.platformAccessory, mapping.service);
+      if (!service) continue;
+      this.onCharacteristicChange(
+        accessory.platformAccessory.UUID,
+        service,
+        this.platform.Characteristic.BatteryLevel,
+        (value) => {
+          if (typeof value !== 'number' || !Number.isFinite(value)) return;
+          this.pushState(
+            accessory,
+            POWER_SOURCE_CLUSTER,
+            {
+              batPercentRemaining: homeKitBatteryToMatterPercent(value),
+            },
+            partId,
+          );
+        },
+      );
+      this.onCharacteristicChange(
+        accessory.platformAccessory.UUID,
+        service,
+        this.platform.Characteristic.StatusLowBattery,
+        () => {
+          this.pushState(
+            accessory,
+            POWER_SOURCE_CLUSTER,
+            {
+              batChargeLevel: this.readBatteryChargeLevel(service),
+            },
+            partId,
+          );
+        },
+      );
     }
-
-    this.onCharacteristicChange(
-      accessory.platformAccessory.UUID,
-      service,
-      this.platform.Characteristic.BatteryLevel,
-      (newValue) => {
-        if (typeof newValue !== 'number') {
-          return;
-        }
-
-        this.pushState(accessory, POWER_SOURCE_CLUSTER, {
-          batPercentRemaining: homeKitBatteryToMatterPercent(newValue),
-        });
-      },
-    );
-
-    this.onCharacteristicChange(
-      accessory.platformAccessory.UUID,
-      service,
-      this.platform.Characteristic.StatusLowBattery,
-      () => {
-        this.pushState(accessory, POWER_SOURCE_CLUSTER, {
-          batChargeLevel: this.readBatteryChargeLevel(service),
-        });
-      },
-    );
   }
 
   private onCharacteristicChange(
