@@ -69,6 +69,29 @@
     
     .btn-group .btn { margin-right: 2px; }
 
+    /*
+     * Contrast repair for the Maintenance surface, and only for it.
+     *
+     * The plugin already declares what a table cell should be. config-ui-x ships a bare
+     * `td { color: #999 !important }`, which a more specific rule cannot beat without an
+     * !important of its own, so every body cell renders at #999 and measures 2.85:1 on the
+     * light card. The headings and the muted paragraphs have the opposite problem: the
+     * plugin's light values are never replaced under the dark themes, leaving them at 1.09:1
+     * and 3.02:1 on the #2b2b2b card.
+     *
+     * The card is the same colour under all thirteen themes of each mode, #fff and #2b2b2b,
+     * so one value per mode covers every theme. !important appears only where it answers an
+     * existing !important. Nothing outside #maintenance is touched, and the card background
+     * is left alone.
+     *
+     * Measured: cells 2.85 to 15.43 light and 4.97 to 10.87 dark; headings 15.43 light kept
+     * and 1.09 to 11.94 dark; muted 4.69 light kept and 3.02 to 6.82 dark.
+     */
+    #nodeTable > tbody > tr > td { color: var(--hb-text-color, #212529) !important; }
+    body.dark-mode #nodeTable > tbody > tr > td { color: #dee2e6 !important; }
+    body.dark-mode #nodeTable > thead > tr > th { color: #e9ecef; }
+    body.dark-mode #maintenance .text-muted { color: #adb5bd !important; }
+
     /* Custom Modal styles to replace native prompt/confirm */
     .custom-modal-backdrop {
       display: none;

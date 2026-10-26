@@ -664,4 +664,47 @@ describe('management page integration', () => {
     siblings.forEach((id) => expect(registrationDepth(id)).toBe(expected));
     expect(registrationDepth('healNetwork')).toBe(expected);
   });
+
+  const readPage = () => {
+    const fs = require('fs');
+    const path = require('path');
+    return fs.readFileSync(path.join(__dirname, '../homebridge-ui/public/index.html'), 'utf8');
+  };
+
+  it('repairs the table contrast with selectors scoped to the Maintenance surface', () => {
+    /**
+     * config-ui-x ships a bare `td { color: #999 !important }` that the plugin's own rule
+     * cannot beat, leaving every body cell at 2.85:1 on the light card, and its light values
+     * for headings and muted text are never replaced under the dark themes, leaving 1.09:1 and
+     * 3.02:1 on the dark one.
+     */
+    const html = readPage();
+
+    expect(html).toMatch(
+      /#nodeTable > tbody > tr > td \{ color: var\(--hb-text-color, #212529\) !important; \}/,
+    );
+    expect(html).toMatch(
+      /body\.dark-mode #nodeTable > tbody > tr > td \{ color: #dee2e6 !important; \}/,
+    );
+    expect(html).toMatch(/body\.dark-mode #nodeTable > thead > tr > th \{ color: #e9ecef; \}/);
+    expect(html).toMatch(/body\.dark-mode #maintenance \.text-muted \{ color: #adb5bd !important; \}/);
+  });
+
+  it('leaves every surface outside Maintenance alone', () => {
+    /**
+     * The Configuration tab and the dialogs were not measured, so no rule here may reach them.
+     * A dark-mode `.text-muted` rule without `#maintenance` would restyle both.
+     */
+    const html = readPage();
+    const style = html.slice(html.indexOf('<style>'), html.indexOf('</style>'));
+    const darkRules = [...style.matchAll(/^\s*(body\.dark-mode[^{]*)\{/gm)].map(([, sel]) =>
+      sel.trim(),
+    );
+
+    expect(darkRules.length).toBeGreaterThan(0);
+    darkRules.forEach((selector) => {
+      const scoped = selector.includes('#maintenance') || selector.includes('#nodeTable');
+      expect(`${selector} -> scoped`).toBe(`${selector} -> ${scoped ? 'scoped' : 'GLOBAL'}`);
+    });
+  });
 });
