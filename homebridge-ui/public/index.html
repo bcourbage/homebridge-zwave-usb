@@ -689,6 +689,8 @@
 	          window.homebridge.toast.error(err.message);
 	        }
 	        loadNodes();
+	      });
+
 	      document.getElementById('healNetwork').addEventListener('click', async (e) => {
 	        const button = e.currentTarget;
 	        const status = document.getElementById('healStatus');
@@ -729,7 +731,6 @@
 	          status.textContent = err.message;
 	          button.disabled = false;
 	        }
-	      });
 	      });
 
 	      document.getElementById('cleanupStaleAccessories').addEventListener('click', async () => {

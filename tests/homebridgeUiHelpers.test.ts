@@ -561,4 +561,107 @@ describe('management page integration', () => {
       expect(html.match(new RegExp(`id="${id}"`, 'g'))).toHaveLength(1);
     }
   });
+
+  /**
+   * Nesting depth of an offset inside JavaScript source, counting brackets but not those in
+   * strings, template literals or comments. A listener registered at depth 0 runs when the page
+   * loads; one nested inside another handler runs only after that handler has fired.
+   */
+  const depthAt = (source: string, offset: number): number => {
+    let depth = 0;
+    let quote: string | null = null;
+    // Depth at which each open `${` sat, so its `}` is matched rather than counted as a close.
+    const templates: number[] = [];
+    let comment: 'line' | 'block' | null = null;
+
+    for (let i = 0; i < offset; i += 1) {
+      const c = source[i];
+      const next = source[i + 1];
+
+      if (comment === 'line') {
+        if (c === '\n') comment = null;
+        continue;
+      }
+      if (comment === 'block') {
+        if (c === '*' && next === '/') {
+          comment = null;
+          i += 1;
+        }
+        continue;
+      }
+      if (quote) {
+        if (c === '\\') i += 1;
+        else if (c === quote) quote = null;
+        else if (quote === '`' && c === '$' && next === '{') {
+          templates.push(depth);
+          quote = null;
+          i += 1;
+        }
+        continue;
+      }
+      if (c === '/' && next === '/') {
+        comment = 'line';
+        i += 1;
+        continue;
+      }
+      if (c === '/' && next === '*') {
+        comment = 'block';
+        i += 1;
+        continue;
+      }
+      if (c === "'" || c === '"' || c === '`') {
+        quote = c;
+        continue;
+      }
+      if (c === '(' || c === '[') depth += 1;
+      else if (c === ')' || c === ']') depth -= 1;
+      else if (c === '{') depth += 1;
+      else if (c === '}') {
+        if (templates.length > 0 && templates[templates.length - 1] === depth) {
+          templates.pop();
+          quote = '`';
+        } else depth -= 1;
+      }
+    }
+    return depth;
+  };
+
+  it('measures nesting depth without being fooled by strings or comments', () => {
+    // The scanner is the instrument for the assertion below, so it is checked first.
+    expect(depthAt('a(); MARK', 'a(); '.length)).toBe(0);
+    expect(depthAt('f(() => { MARK', 'f(() => { '.length)).toBe(2);
+    expect(depthAt('const s = "{{{"; MARK', 'const s = "{{{"; '.length)).toBe(0);
+    expect(depthAt('const s = `x${ y }z`; MARK', 'const s = `x${ y }z`; '.length)).toBe(0);
+    // Interpolation inside an open block: the `}` of `${}` must not close the block.
+    expect(depthAt('f(() => { `a${ b }c`; MARK', 'f(() => { `a${ b }c`; '.length)).toBe(2);
+    expect(depthAt('// {{{\nMARK', '// {{{\n'.length)).toBe(0);
+    expect(depthAt('/* {{{ */ MARK', '/* {{{ */ '.length)).toBe(0);
+  });
+
+  it('registers the Rebuild Routes listener at page load, not inside another handler', () => {
+    /**
+     * It was nested inside the Remove confirmation handler, so Rebuild Routes did nothing until
+     * a node had been removed, and every removal added another listener, making one click start
+     * several rebuilds.
+     */
+    const fs = require('fs');
+    const path = require('path');
+    const html = fs.readFileSync(path.join(__dirname, '../homebridge-ui/public/index.html'), 'utf8');
+    const script = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)[1] as string;
+
+    const registrationDepth = (id: string) => {
+      const at = script.indexOf(`getElementById('${id}').addEventListener`);
+      expect(at).toBeGreaterThan(-1);
+      return depthAt(script, at);
+    };
+
+    /**
+     * Compared with its siblings rather than against a fixed number, so the assertion keeps
+     * meaning if the page gains or loses an enclosing wrapper.
+     */
+    const siblings = ['cancelRemoveNode', 'confirmRemoveNode', 'cleanupStaleAccessories'];
+    const expected = registrationDepth(siblings[0]);
+    siblings.forEach((id) => expect(registrationDepth(id)).toBe(expected));
+    expect(registrationDepth('healNetwork')).toBe(expected);
+  });
 });
