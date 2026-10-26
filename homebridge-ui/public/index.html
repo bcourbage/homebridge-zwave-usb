@@ -134,6 +134,22 @@
     .maintenance-actions { gap: 0.5rem; }
     .modal-actions { margin-top: 1rem; display: flex; justify-content: flex-end; gap: 0.5rem; }
 
+    /*
+     * The battery sits with the name because it describes the device rather than the row's
+     * state. Red means either that the device reported a low-battery warning or that the
+     * reported level is 20% or less.
+     *
+     * It is held a step back from the name it follows, so the name still leads the row and the
+     * icon reads as something about the device rather than as part of its title. That means it
+     * states its own color instead of taking the cell's, so both are measured: 4.69:1 and
+     * 7.36:1 on the light card, 6.82:1 and 5.60:1 on the dark one.
+     */
+    .battery-indicator { margin-left: 6px; color: #6c757d; }
+    .battery-fill { fill: currentColor; stroke: none; }
+    .battery-low { color: #a71d2a; }
+    body.dark-mode .battery-indicator { color: #adb5bd; }
+    body.dark-mode .battery-low { color: #ea868f; }
+
     .node-notices td { border-top: 0; padding-top: 0; }
     .node-notice { display: flex; align-items: center; gap: 6px; font-size: 80%; }
     /*
@@ -506,6 +522,21 @@
           .join('')}</div>`;
       };
 
+      const batteryHtml = (battery) => {
+        if (!battery) return '';
+        const label = uiHelpers.escapeHtml(battery.text);
+        // The shell's inner run is 9.4 wide in the icon's own coordinates.
+        const filled = ((9.4 * battery.fifths) / 5).toFixed(2);
+
+        // tabindex so the exact figure in the tooltip can be reached from the keyboard, since
+        // `.tip` only reveals it on hover or focus and a span takes no focus of its own.
+        return `<span class="tip battery-indicator${
+          battery.low ? ' battery-low' : ''
+        }" tabindex="0" data-tip="${label}" role="img" aria-label="${label}"><svg class="ico" viewBox="0 0 16 16" aria-hidden="true" focusable="false">${
+          uiHelpers.NODE_ICONS.battery
+        }<rect class="battery-fill" x="2.3" y="5.3" width="${filled}" height="5.4" rx="0.6"/></svg></span>`;
+      };
+
       const noticeLineHtml = (notice) => {
         const link = notice.link
           ? ` <a href="${uiHelpers.escapeHtml(notice.link.href)}">${uiHelpers.escapeHtml(
@@ -536,7 +567,7 @@
           const tr = document.createElement('tr');
           tr.innerHTML = `
 	              <td>${node.nodeId}</td>
-	              <td id="node-name-${node.nodeId}">${uiHelpers.escapeHtml(nodeName)}</td>
+	              <td id="node-name-${node.nodeId}">${uiHelpers.escapeHtml(nodeName)}${batteryHtml(uiHelpers.describeBattery(node))}</td>
 	              <td>
 	                <span class="badge badge-${status === 'Alive' || status === 'Awake' ? 'success' : 'secondary'}">${status}</span>
 	              </td>

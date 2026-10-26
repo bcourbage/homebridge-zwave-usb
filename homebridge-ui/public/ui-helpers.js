@@ -248,6 +248,7 @@
     refresh: '<path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1"/><path d="M13.5 2v3h-3"/>',
     diagnostics: '<path d="M3 13V10M6.3 13V7.5M9.7 13V5M13 13V2.5"/>',
     update: '<path d="M8 2v8M5 7l3 3 3-3"/><path d="M2.5 11v2.5h11V11"/>',
+    battery: '<rect x="1" y="4" width="12" height="8" rx="1.6"/><path d="M14.3 6.6v2.8"/>',
     remove: '<path d="M2.5 4h11M6 4V2.5h4V4"/><path d="M4 4l.7 9.5h6.6L12 4"/>',
     info: '<circle cx="8" cy="8" r="6"/><path d="M8 7.5v3.5M8 5v.1"/>',
     pending: '<circle cx="8" cy="8" r="6"/><path d="M8 4.5V8l2.5 1.5"/>',
@@ -396,6 +397,43 @@
       delete copy.firmwareProgress;
       return copy;
     });
+  }
+
+  /**
+   * The battery indicator for one node, or nothing for a device that has no battery to report.
+   *
+   * The icon is filled in fifths so the row reads at a glance, and the figure itself goes in the
+   * label, where someone who wants the number can find it. A device can warn that its battery is
+   * low without reporting a usable percentage, because Battery CC sends that warning in place of
+   * one, so the warning counts on its own as well as when the level has fallen to a fifth.
+   */
+  function describeBattery(node) {
+    const battery = node && node.battery;
+    if (!battery) {
+      return null;
+    }
+
+    const reported = Number(battery.level);
+    const level = Number.isFinite(reported)
+      ? Math.min(100, Math.max(0, Math.round(reported)))
+      : undefined;
+    const low = battery.low === true || (level !== undefined && level <= 20);
+
+    return {
+      level,
+      low,
+      // The shell is drawn whatever the charge, so an empty one still reads as a battery and a
+      // device without one has no icon at all. Nothing is invented for a battery at zero, or
+      // for a warning that arrived without a percentage.
+      fifths: level === undefined ? 0 : Math.ceil(level / 20),
+      // The warning is said in words as well as shown in red, so it reaches a screen reader and
+      // anyone who cannot tell the red icon from the grey one.
+      text: low
+        ? level === undefined
+          ? 'Battery low'
+          : `Battery low, ${level}%`
+        : `Battery ${level}%`,
+    };
   }
 
   const NODE_BUTTONS = [
@@ -576,5 +614,6 @@
     describeNodeActions,
     describeNodeNotices,
     withoutFirmwareProgress,
+    describeBattery,
   };
 });

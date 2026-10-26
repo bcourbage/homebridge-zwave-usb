@@ -14,6 +14,7 @@ const { describeHealStart, healIsRunning,
   describeNodeActions,
   describeNodeNotices,
   withoutFirmwareProgress,
+  describeBattery,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -905,6 +906,94 @@ describe('node notices', () => {
   });
 });
 
+describe('battery indicator', () => {
+  it('shows nothing for a device that has no battery to report', () => {
+    // An empty shell would read as a flat battery rather than as a mains-powered device.
+    expect(describeBattery({})).toBeNull();
+    expect(describeBattery({ battery: undefined })).toBeNull();
+    expect(describeBattery(undefined)).toBeNull();
+  });
+
+  it('fills the icon in fifths and names the exact figure', () => {
+    const cases: [number, number][] = [
+      [100, 5],
+      [81, 5],
+      [80, 4],
+      [61, 4],
+      [60, 3],
+      [47, 3],
+      [41, 3],
+      [40, 2],
+      [21, 2],
+      [20, 1],
+      [1, 1],
+    ];
+
+    cases.forEach(([level, fifths]) => {
+      const battery = describeBattery({ battery: { level, low: false } });
+      expect(battery.fifths).toBe(fifths);
+      // A level at or under a fifth is low, and says so.
+      expect(battery.text).toBe(level <= 20 ? `Battery low, ${level}%` : `Battery ${level}%`);
+    });
+  });
+
+  it('draws an empty shell for a battery that reports zero', () => {
+    /**
+     * The shell is drawn whatever the charge, so an empty one still reads as a battery while a
+     * device without one has no icon at all. Showing a fifth would invent charge the device
+     * never claimed.
+     */
+    const battery = describeBattery({ battery: { level: 0, low: false } });
+
+    expect(battery.fifths).toBe(0);
+    expect(battery.text).toBe('Battery low, 0%');
+
+    // A warning that arrived without a percentage invents nothing either.
+    expect(describeBattery({ battery: { low: true } }).fifths).toBe(0);
+    // One percent is still a sliver, because the device did report charge.
+    expect(describeBattery({ battery: { level: 1, low: false } }).fifths).toBe(1);
+  });
+
+  it('calls a battery low at a fifth or less', () => {
+    expect(describeBattery({ battery: { level: 21, low: false } }).low).toBe(false);
+    expect(describeBattery({ battery: { level: 20, low: false } }).low).toBe(true);
+    expect(describeBattery({ battery: { level: 5, low: false } }).low).toBe(true);
+  });
+
+  it('says the battery is low in words, not in color alone', () => {
+    /**
+     * The class turns the icon red, which a screen reader never sees and which someone who
+     * cannot tell the two icons apart never sees either. The label carries the warning too.
+     */
+    expect(describeBattery({ battery: { level: 60, low: true } }).text).toBe('Battery low, 60%');
+    expect(describeBattery({ battery: { level: 14, low: false } }).text).toBe('Battery low, 14%');
+    expect(describeBattery({ battery: { low: true } }).text).toBe('Battery low');
+    expect(describeBattery({ battery: { level: 80, low: false } }).text).toBe('Battery 80%');
+  });
+
+  it("honors the device's own warning whatever level it reports", () => {
+    /**
+     * Battery CC sends the low-battery warning in place of a percentage, and a device may also
+     * raise it while still reporting a comfortable level. Reading only the number would show a
+     * device that says it is failing as three fifths full and not low.
+     */
+    const warnedHigh = describeBattery({ battery: { level: 60, low: true } });
+    expect(warnedHigh.low).toBe(true);
+    expect(warnedHigh.fifths).toBe(3);
+    expect(warnedHigh.text).toBe('Battery low, 60%');
+
+    const warnedOnly = describeBattery({ battery: { low: true } });
+    expect(warnedOnly.low).toBe(true);
+    expect(warnedOnly.level).toBeUndefined();
+    expect(warnedOnly.text).toBe('Battery low');
+  });
+
+  it('brings an impossible reading back into range', () => {
+    expect(describeBattery({ battery: { level: 140, low: false } }).level).toBe(100);
+    expect(describeBattery({ battery: { level: -5, low: false } }).level).toBe(0);
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -1062,7 +1151,8 @@ describe('management page integration', () => {
       const scoped =
         selector.includes('#maintenance') ||
         selector.includes('#nodeTable') ||
-        selector.includes('.node-notice');
+        selector.includes('.node-notice') ||
+        selector.includes('.battery');
       expect(`${selector} -> scoped`).toBe(`${selector} -> ${scoped ? 'scoped' : 'GLOBAL'}`);
     });
   });
@@ -1210,6 +1300,20 @@ describe('management page integration', () => {
 
     expect(success).toContain("applyFirmwareEvent(nodeId, { type: 'update-finished' })");
     expect(success).toContain('uiHelpers.withoutFirmwareProgress(lastNodes, nodeId)');
+  });
+
+  it('puts the battery beside the name without disturbing the rename field', () => {
+    /**
+     * The rename dialog prefills from the name cell's text, so the indicator has to contribute
+     * none: it is an SVG inside a span, written against the name with no space between them.
+     */
+    const html = readPage();
+
+    expect(html).toContain('uiHelpers.describeBattery(node)');
+    // A span takes no focus of its own, so the figure in the tooltip would be mouse-only.
+    expect(html).toMatch(/tabindex="0"[^>]*data-tip="\$\{label\}"/);
+    expect(html).toContain('${uiHelpers.escapeHtml(nodeName)}${batteryHtml(');
+    expect(html).toMatch(/role="img" aria-label="\$\{label\}"/);
   });
 
   it('escapes every node-supplied value it writes into the row', () => {
