@@ -8,6 +8,12 @@ const { describeHealStart, healIsRunning,
   buildPluginConfig,
   describeCoveringTestResult,
   describeCoveringStopResult,
+  NODE_ICONS,
+  firmwareStateOf,
+  nextFirmwareRecord,
+  describeNodeActions,
+  describeNodeNotices,
+  withoutFirmwareProgress,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -549,6 +555,356 @@ describe('route rebuild helpers', () => {
 
 // The management page is not part of the TypeScript build. Parse its actual script so
 // integrating independent UI changes cannot ship a page that fails before wiring controls.
+const node = (over: Record<string, unknown> = {}) => ({
+  nodeId: 5,
+  name: "Nico's Shade",
+  status: 4,
+  isListening: true,
+  ...over,
+});
+
+/** One step of the transition table: the record a phase leaves behind, advanced by one event. */
+const step = (phase: string | null, event: Record<string, unknown>, version?: string) =>
+  nextFirmwareRecord(phase === null ? null : { phase, version }, event);
+
+const stateFor = (phase: string | null, version?: string) =>
+  firmwareStateOf(node(), phase === null ? undefined : { phase, version });
+
+describe('firmware state derivation', () => {
+  it('reads the state the plugin reports in preference to the one the page remembers', () => {
+    // A refresh arriving mid-update must not put the row back to whatever was last clicked.
+    const updating = { firmwareProgress: { percent: 37.5 } };
+    const done = { firmwareProgress: { percent: 100, outcome: 'success' } };
+    const broke = { firmwareProgress: { percent: 100, outcome: 'failure' } };
+    const remembered = { phase: 'available', version: '11.4' };
+
+    expect(firmwareStateOf(node(updating), remembered)).toEqual({ name: 'updating', percent: 37.5 });
+    expect(firmwareStateOf(node(done), remembered)).toEqual({ name: 'completed', percent: 100 });
+    expect(firmwareStateOf(node(broke), remembered)).toEqual({ name: 'failed', percent: 100 });
+  });
+
+  it('falls back to idle once the plugin stops reporting progress', () => {
+    expect(firmwareStateOf(node(), undefined)).toEqual({ name: 'idle' });
+    expect(firmwareStateOf(node(), null)).toEqual({ name: 'idle' });
+  });
+
+  it('keeps a check, a found update and a starting update across a refresh', () => {
+    // The node list is refetched every five seconds; none of these three may be reset by it.
+    expect(stateFor('checking')).toEqual({ name: 'checking' });
+    expect(stateFor('available', '11.4')).toEqual({ name: 'available', version: '11.4' });
+    expect(stateFor('starting', '11.4')).toEqual({ name: 'starting', version: '11.4' });
+  });
+
+  it('shows no progress rather than NaN when the plugin reports an unusable percentage', () => {
+    expect(firmwareStateOf(node({ firmwareProgress: {} }), null)).toEqual({
+      name: 'updating',
+      percent: 0,
+    });
+  });
+});
+
+describe('firmware transitions', () => {
+  it('idle: clicking Check Update starts a check', () => {
+    expect(step(null, { type: 'check-clicked' })).toEqual({
+      record: { phase: 'checking' },
+      toast: null,
+      start: false,
+    });
+  });
+
+  it('checking: an update that comes back is remembered by version alone', () => {
+    const result = step('checking', {
+      type: 'check-result',
+      updates: [{ version: '11.4', files: ['payload'] }],
+    });
+
+    expect(result.record).toEqual({ phase: 'available', version: '11.4' });
+    // The payload must not survive the check; it is fetched again at the moment it is sent.
+    expect(JSON.stringify(result.record)).not.toContain('payload');
+  });
+
+  it('checking: no update, or a failed check, returns the node to idle', () => {
+    const empty = step('checking', { type: 'check-result', updates: [] });
+    expect(empty.record).toBeNull();
+    expect(empty.toast).toEqual({ type: 'info', text: 'No updates available for this device.' });
+
+    // A failed check reports the error itself, so the machine claims no wording of its own.
+    expect(step('checking', { type: 'check-failed' })).toEqual({
+      record: null,
+      toast: null,
+      start: false,
+    });
+  });
+
+  it('available: opening and cancelling the dialog change nothing and send nothing', () => {
+    const open = step('available', { type: 'update-clicked' }, '11.4');
+    const cancel = step('available', { type: 'dialog-cancelled' }, '11.4');
+
+    expect(open.record).toEqual({ phase: 'available', version: '11.4' });
+    expect(cancel.record).toEqual({ phase: 'available', version: '11.4' });
+    expect(open.start).toBe(false);
+    expect(cancel.start).toBe(false);
+  });
+
+  it('available: confirming the dialog moves to starting without sending anything yet', () => {
+    expect(step('available', { type: 'dialog-confirmed' }, '11.4')).toEqual({
+      record: { phase: 'starting', version: '11.4' },
+      toast: null,
+      start: false,
+    });
+  });
+
+  it('starting: the same version coming back is the one that gets sent', () => {
+    const result = step('starting', {
+      type: 'recheck-result',
+      updates: [{ version: '11.4' }],
+    }, '11.4');
+
+    expect(result.start).toBe(true);
+    expect(result.record).toEqual({ phase: 'starting', version: '11.4' });
+  });
+
+  it('starting: a different version is stored and reported, and nothing is sent', () => {
+    const result = step('starting', {
+      type: 'recheck-result',
+      updates: [{ version: '11.5' }],
+    }, '11.4');
+
+    expect(result.start).toBe(false);
+    expect(result.record).toEqual({ phase: 'available', version: '11.5' });
+    expect(result.toast).toEqual({
+      type: 'info',
+      text:
+        'The available firmware update changed to v11.5. The update was not started. Select Update again to continue.',
+    });
+  });
+
+  it('starting: an update that has gone away returns the node to idle', () => {
+    const result = step('starting', { type: 'recheck-result', updates: [] }, '11.4');
+
+    expect(result.start).toBe(false);
+    expect(result.record).toBeNull();
+    expect(result.toast).toEqual({
+      type: 'info',
+      text: 'That firmware update is no longer available. The update was not started.',
+    });
+  });
+
+  it('starting: a failed re-check or a refused start leaves the update there to retry', () => {
+    for (const type of ['recheck-failed', 'start-rejected']) {
+      const result = step('starting', { type }, '11.4');
+      expect(result.record).toEqual({ phase: 'available', version: '11.4' });
+      expect(result.start).toBe(false);
+    }
+  });
+
+  it('never offers an update it cannot name', () => {
+    // Without this the row would advertise an update to "vundefined".
+    expect(step('starting', { type: 'recheck-failed' }, undefined).record).toBeNull();
+    expect(step('checking', { type: 'check-result', updates: [{}] }).record).toBeNull();
+  });
+
+  it('forgets the update once the plugin confirms it finished', () => {
+    /**
+     * The request only resolves when the transfer is over and only when it succeeded, so the
+     * page knows the update is done without being told again by a refresh. Leaving the record
+     * would hold a disabled spinner in the row until a refresh happened to correct it, and a
+     * refresh can fail.
+     */
+    expect(step('starting', { type: 'update-finished' }, '1.31')).toEqual({
+      record: null,
+      toast: null,
+      start: false,
+    });
+  });
+
+  it('drops a progress snapshot that has outlived its update', () => {
+    /**
+     * The page redraws from the node list it last fetched, and the plugin keeps its own
+     * progress for thirty seconds, so a bar that has finished moving would go on being drawn
+     * from that snapshot until a refresh replaced it.
+     */
+    const nodes = [
+      { nodeId: 4, name: 'Repeater', firmwareProgress: { percent: 100, outcome: 'success' } },
+      { nodeId: 5, name: 'Shade', firmwareProgress: { percent: 40 } },
+    ];
+    const stripped = withoutFirmwareProgress(nodes, 4);
+
+    expect(stripped[0].firmwareProgress).toBeUndefined();
+    expect(stripped[0].name).toBe('Repeater');
+    // Another node's update is none of its business.
+    expect(stripped[1].firmwareProgress).toEqual({ percent: 40 });
+    // And the list it was given is left as it was.
+    expect(nodes[0].firmwareProgress).toEqual({ percent: 100, outcome: 'success' });
+  });
+
+  it('matches a node id given as a string or a number', () => {
+    const nodes = [{ nodeId: 4, firmwareProgress: { percent: 100 } }];
+
+    expect(withoutFirmwareProgress(nodes, '4')[0].firmwareProgress).toBeUndefined();
+    expect(withoutFirmwareProgress(nodes, 4)[0].firmwareProgress).toBeUndefined();
+    expect(withoutFirmwareProgress(nodes, 9)[0].firmwareProgress).toEqual({ percent: 100 });
+  });
+
+  it('a node that is gone is forgotten from any state', () => {
+    for (const phase of ['checking', 'available', 'starting']) {
+      expect(step(phase, { type: 'node-gone' }, '11.4').record).toBeNull();
+    }
+  });
+});
+
+describe('node action cell', () => {
+  const actionsFor = (phase: string | null, version?: string, over = {}) =>
+    describeNodeActions(node(over), firmwareStateOf(node(over), phase === null ? null : { phase, version }));
+
+  it('idle shows the five actions as icons, keeping the classes the page delegates on', () => {
+    const result = actionsFor(null);
+
+    expect(result.kind).toBe('buttons');
+    expect(result.buttons.map((b: any) => b.action)).toEqual([
+      'rename-node',
+      'refresh-node-info',
+      'node-diagnostics',
+      'check-update',
+      'remove-node',
+    ]);
+    expect(result.buttons.map((b: any) => b.variant)).toEqual([
+      'outline-secondary',
+      'outline-secondary',
+      'outline-secondary',
+      'outline-primary',
+      'outline-danger',
+    ]);
+    result.buttons.forEach((button: any) => {
+      expect(NODE_ICONS[button.icon]).toBeTruthy();
+      expect(button.label).toBeTruthy();
+      expect(button.disabled).toBe(false);
+    });
+  });
+
+  it('marks Refresh Info for the devices that have to be woken first', () => {
+    const sleeping = actionsFor(null, undefined, { isListening: false, isFrequentListening: false });
+    const awake = actionsFor(null, undefined, { isListening: true });
+    const slotOf = (result: any) =>
+      result.buttons.find((b: any) => b.action === 'refresh-node-info');
+
+    expect(slotOf(sleeping).requiresWakeup).toBe(true);
+    expect(slotOf(awake).requiresWakeup).toBe(false);
+  });
+
+  it('checking and starting show a disabled spinner in the Check Update slot only', () => {
+    for (const phase of ['checking', 'starting']) {
+      const result = actionsFor(phase, '11.4');
+      const slot = result.buttons.find((b: any) => b.action === 'check-update');
+
+      expect(slot.spinner).toBe(true);
+      expect(slot.disabled).toBe(true);
+      expect(result.buttons.filter((b: any) => b.disabled)).toHaveLength(1);
+      expect(result.buttons).toHaveLength(5);
+    }
+  });
+
+  it('an available update turns the same slot into a green Update button', () => {
+    const result = actionsFor('available', '11.4');
+    const slot = result.buttons[3];
+
+    expect(slot).toMatchObject({
+      action: 'start-update',
+      variant: 'success',
+      label: 'Update to v11.4',
+      disabled: false,
+      spinner: false,
+    });
+    expect(result.buttons).toHaveLength(5);
+  });
+
+  it('a running, finished or failed update replaces the group with a progress bar', () => {
+    const bar = (progress: Record<string, unknown>) =>
+      describeNodeActions(node(), firmwareStateOf(node({ firmwareProgress: progress }), null));
+
+    expect(bar({ percent: 37.5 })).toEqual({ kind: 'progress', percent: 38, failed: false });
+    expect(bar({ percent: 100, outcome: 'success' })).toEqual({
+      kind: 'progress',
+      percent: 100,
+      failed: false,
+    });
+    expect(bar({ percent: 100, outcome: 'failure' })).toEqual({
+      kind: 'progress',
+      percent: 100,
+      failed: true,
+    });
+  });
+
+  it('leaves the controller row without actions', () => {
+    expect(describeNodeActions(node({ nodeId: 1 }), { name: 'idle' })).toEqual({
+      kind: 'controller',
+    });
+  });
+});
+
+describe('node notices', () => {
+  const noticesFor = (over: Record<string, unknown>, phase: string | null = null, version?: string) =>
+    describeNodeNotices(
+      node(over),
+      firmwareStateOf(node(over), phase === null ? null : { phase, version }),
+    );
+
+  it('says nothing about a node with nothing to report', () => {
+    expect(noticesFor({})).toEqual([]);
+  });
+
+  it('carries each status with the wording and severity it was given', () => {
+    expect(noticesFor({ refreshState: 'waiting-wakeup' })).toEqual([
+      { severity: 'pending', text: 'Refresh queued until the device wakes', link: null },
+    ]);
+    expect(noticesFor({ refreshState: 'refreshing' })).toEqual([
+      { severity: 'info', text: 'Refresh in progress', link: null },
+    ]);
+    expect(noticesFor({ homekitState: 'cached-pending' })).toEqual([
+      {
+        severity: 'pending',
+        text: 'Cached in HomeKit; waiting for the device to wake so the interview can continue',
+        link: null,
+      },
+    ]);
+    expect(noticesFor({ homekitState: 'pending-interview' })).toEqual([
+      { severity: 'pending', text: 'Not yet in HomeKit; waiting for interview metadata', link: null },
+    ]);
+  });
+
+  it('carries each firmware state with the wording and severity it was given', () => {
+    expect(noticesFor({}, 'available', '11.4')).toEqual([
+      { severity: 'info', text: 'Firmware update available: v11.4', link: null },
+    ]);
+    expect(noticesFor({ firmwareProgress: { percent: 40 } })).toEqual([
+      { severity: 'info', text: 'Updating firmware', link: null },
+    ]);
+    expect(noticesFor({ firmwareProgress: { percent: 100, outcome: 'success' } })).toEqual([
+      { severity: 'info', text: 'Firmware update completed', link: null },
+    ]);
+    expect(noticesFor({ firmwareProgress: { percent: 100, outcome: 'failure' } })).toEqual([
+      { severity: 'error', text: 'Firmware update failed', link: null },
+    ]);
+  });
+
+  it('says nothing while a check or a start is in flight, because the spinner says it', () => {
+    expect(noticesFor({}, 'checking')).toEqual([]);
+    expect(noticesFor({}, 'starting', '11.4')).toEqual([]);
+  });
+
+  it('puts the most serious notice first', () => {
+    const notices = noticesFor(
+      { refreshState: 'refreshing', homekitState: 'cached-pending', firmwareProgress: { percent: 100, outcome: 'failure' } },
+    );
+
+    expect(notices.map((n: any) => n.severity)).toEqual(['error', 'pending', 'info']);
+  });
+
+  it('ignores a state it does not recognize rather than inheriting one from Object', () => {
+    expect(noticesFor({ refreshState: 'constructor', homekitState: 'toString' })).toEqual([]);
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -703,8 +1059,164 @@ describe('management page integration', () => {
 
     expect(darkRules.length).toBeGreaterThan(0);
     darkRules.forEach((selector) => {
-      const scoped = selector.includes('#maintenance') || selector.includes('#nodeTable');
+      const scoped =
+        selector.includes('#maintenance') ||
+        selector.includes('#nodeTable') ||
+        selector.includes('.node-notice');
       expect(`${selector} -> scoped`).toBe(`${selector} -> ${scoped ? 'scoped' : 'GLOBAL'}`);
     });
+  });
+
+  it('heads the action column "Actions" and leaves the status cell to the badge', () => {
+    const html = readPage();
+
+    expect(html).toMatch(/<th[^>]*>Actions<\/th>/);
+    expect(html).not.toMatch(/<th[^>]*>Action<\/th>/);
+    // The status texts live in the notice line now, so their lookup tables are gone from here.
+    expect(html).not.toContain('refreshStateMap');
+    expect(html).not.toContain('homeKitStateMap');
+  });
+
+  it('keeps no update payload in a global or in the markup', () => {
+    /**
+     * The payload used to be written into a data-update attribute and parsed back on click,
+     * so a dialog left open while the device was offered a different version could send the
+     * stale one. It is now read between the confirm-time re-check and the request.
+     */
+    const html = readPage();
+
+    expect(html).not.toContain('activeUpdateData');
+    expect(html).not.toContain('data-update=');
+  });
+
+  it('loads no resource beyond the one stylesheet it already had', () => {
+    // An icon font or a second CDN would leave the table unreadable on a host with no internet.
+    const external = [...readPage().matchAll(/(?:href|src)="(https?:\/\/[^"]+)"/g)].map((m) => m[1]);
+
+    expect(external).toEqual([
+      'https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css',
+    ]);
+  });
+
+  it('draws the action cell and the notices from the helpers rather than deciding for itself', () => {
+    const html = readPage();
+
+    for (const helper of ['firmwareStateOf', 'describeNodeActions', 'describeNodeNotices']) {
+      expect(html).toContain(`uiHelpers.${helper}(`);
+    }
+  });
+
+  it('reports the update as completed, because the request resolves only when it is', () => {
+    /**
+     * zwave-js resolves updateFirmware() after the process has completed, the IPC route answers
+     * in its `then`, and no layer in between sets a timeout. Announcing a start at that point
+     * would report the end of the transfer as its beginning.
+     */
+    const html = readPage();
+
+    expect(html).toContain("toast.success('Firmware update completed.')");
+    expect(html).not.toContain('Firmware update started');
+  });
+
+  it('keeps the tooltip reading as a sentence inside the host UI', () => {
+    /**
+     * The page is served inside config-ui-x, which replays its own stylesheet into it and sets
+     * `text-transform: uppercase` on `.btn`. A pseudo-element inherits that from the button it
+     * belongs to, which turned every tooltip into SHOUTING and made it wider.
+     */
+    const html = readPage();
+
+    expect(html).toMatch(/\.tip::after\s*\{[^}]*text-transform:\s*none/);
+    expect(html).toMatch(/\.tip::after\s*\{[^}]*letter-spacing:\s*normal/);
+  });
+
+  it('centers every tooltip on its own button, with no button singled out', () => {
+    // One rule for all five; the last button no longer anchors its tooltip differently.
+    const html = readPage();
+
+    expect(html).toMatch(/\.tip::after\s*\{[^}]*left:\s*50%/);
+    expect(html).toMatch(/\.tip::after\s*\{[^}]*transform:\s*translateX\(-50%\)/);
+    expect(html).not.toContain(':last-child::after');
+  });
+
+  it('stops the settings modal lending its own tooltip to anything on the page', () => {
+    /**
+     * A browser looks up the nearest ancestor carrying a title attribute, and the settings
+     * modal around this page has one, so anything here without its own showed the modal's
+     * "Plugin Config" beside the page's tooltip. An empty title ends that lookup, so every
+     * element the page puts at the top level needs one, the backdrop included.
+     */
+    const html = readPage();
+    const body = html.slice(html.indexOf('<body>'), html.indexOf('</body>'));
+    const topLevel = [...body.matchAll(/^ {2}<(\w+)([^>]*)>/gm)].filter(
+      ([, tag]) => tag !== 'script',
+    );
+
+    expect(topLevel.length).toBeGreaterThan(1);
+    topLevel.forEach(([, tag, attrs]) => {
+      expect(`${tag} ${attrs}`).toContain('title=""');
+    });
+
+    // And on the buttons themselves, matched in the markup rather than in the comment.
+    expect(html).toMatch(/title=""\s+data-tip=/);
+  });
+
+  it('carries notice colors for the dark themes as well as the light ones', () => {
+    /**
+     * config-ui-x puts `dark-mode` on the body and the card becomes #2b2b2b, where the light
+     * colors measure between 1.92:1 and 3.02:1. Measured ratios are in the comment beside them.
+     */
+    const html = readPage();
+
+    for (const severity of ['info', 'pending', 'error']) {
+      expect(html).toMatch(new RegExp(`body\\.dark-mode[^}]*\\.node-notice\\.${severity}[^}]*color:`));
+    }
+  });
+
+  it('gives every dialog the same button row', () => {
+    /**
+     * Cancel, OK, Save, Remove and Close all sit at the trailing edge of their dialog at one
+     * spacing. The Close button had been left on an older row that sat tighter to the content
+     * above it than the other three.
+     */
+    const html = readPage();
+
+    expect(html.match(/<div class="modal-actions">/g)).toHaveLength(4);
+    expect(html).not.toContain('text-right');
+  });
+
+  it('names the version in the confirmation, not just the warning', () => {
+    /**
+     * The button and the notice show the version, but the decision is taken in this dialog, so
+     * it has to say what is about to be installed rather than warning in the abstract.
+     */
+    const script = [...readPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)![1] as string;
+
+    expect(script).toContain('Install firmware update v${offered.version}?');
+    expect(script).toContain("firmwareRecords.get(String(nodeId))");
+  });
+
+  it('acts on a confirmed completion instead of waiting for a refresh to notice', () => {
+    /**
+     * The refresh that follows can fail, and the plugin drops its own progress thirty seconds
+     * later, so a row left in `starting` or redrawn from a stale snapshot would keep a
+     * disabled spinner or a moving bar with nothing left to correct it.
+     */
+    const script = [...readPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)![1] as string;
+    const success = script.slice(
+      script.indexOf("await window.homebridge.request('start-update'"),
+      script.indexOf("toast.success('Firmware update completed.')"),
+    );
+
+    expect(success).toContain("applyFirmwareEvent(nodeId, { type: 'update-finished' })");
+    expect(success).toContain('uiHelpers.withoutFirmwareProgress(lastNodes, nodeId)');
+  });
+
+  it('escapes every node-supplied value it writes into the row', () => {
+    const script = [...readPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)![1] as string;
+
+    for (const written of ['notice.text', 'button.label', 'nodeName', "node.firmwareVersion || 'Unknown'"]) {
+      expect(script).toContain(`uiHelpers.escapeHtml(${written})`);
+    }
   });
 });
