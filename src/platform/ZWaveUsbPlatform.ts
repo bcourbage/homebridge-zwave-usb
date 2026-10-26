@@ -81,7 +81,10 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    */
   private readonly matterAccessories = new MatterAccessories(this);
   private discoveryInFlight = new Set<number>();
-  private firmwareProgress = new Map<number, { sent: number; total: number; status?: number }>();
+  private firmwareProgress = new Map<
+    number,
+    { percent: number; outcome?: 'success' | 'failure' }
+  >();
   private refreshStates = new Map<number, 'waiting-wakeup' | 'refreshing'>();
 
   constructor(
@@ -126,12 +129,15 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       );
       this.zwaveController.on('value updated', (node, args) => this.handleValueUpdated(node, args));
 
-      this.zwaveController.on('firmware update progress', (nodeId, sent, total) => {
-        this.firmwareProgress.set(nodeId, { sent, total });
+      this.zwaveController.on('firmware update progress', (nodeId, percent) => {
+        this.firmwareProgress.set(nodeId, { percent });
       });
 
-      this.zwaveController.on('firmware update finished', (nodeId, status) => {
-        this.firmwareProgress.set(nodeId, { sent: 100, total: 100, status });
+      this.zwaveController.on('firmware update finished', (nodeId, success) => {
+        this.firmwareProgress.set(nodeId, {
+          percent: 100,
+          outcome: success ? 'success' : 'failure',
+        });
         setTimeout(() => this.firmwareProgress.delete(nodeId), 30000); // Clear after 30s
       });
 

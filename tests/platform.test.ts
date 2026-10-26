@@ -395,6 +395,66 @@ describe('ZWaveUsbPlatform', () => {
     }
   });
 
+  it('reports firmware progress and outcome to the management page', () => {
+    // The page draws the bar from `percent` and tells completed from failed using
+    // `outcome`, so the platform has to store the driver's own total percentage rather
+    // than a fragment count, and take the outcome from `success`.
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    const controller = (platform as any).zwaveController;
+    controller.homeId = 100;
+    controller.nodes = new Map([
+      [2, { nodeId: 2, name: 'Updating', ready: true, status: 4 }],
+      [3, { nodeId: 3, name: 'Done', ready: true, status: 4 }],
+      [4, { nodeId: 4, name: 'Broken', ready: true, status: 4 }],
+    ]);
+
+    jest.useFakeTimers();
+    try {
+      controller.emit('firmware update progress', 2, 37.5);
+      controller.emit('firmware update finished', 3, true);
+      controller.emit('firmware update finished', 4, false);
+
+      const fakeServer = new EventEmitter() as EventEmitter & {
+        listen: jest.Mock;
+        close: jest.Mock;
+        address: jest.Mock;
+      };
+      fakeServer.listen = jest.fn().mockImplementation((_port, _host, cb) => cb());
+      fakeServer.close = jest.fn();
+      fakeServer.address = jest.fn().mockReturnValue({ port: 12345, address: '127.0.0.1' });
+      const createServerSpy = jest.spyOn(http, 'createServer').mockReturnValue(fakeServer as never);
+
+      const req = { url: '/nodes', method: 'GET' } as EventEmitter & {
+        url?: string;
+        method?: string;
+      };
+      const res = { writeHead: jest.fn(), end: jest.fn() };
+
+      try {
+        (platform as any).startIpcServer();
+        const handler = createServerSpy.mock.calls.at(-1)?.[0];
+        handler(req, res);
+
+        const payload = JSON.parse((res.end as jest.Mock).mock.calls[0][0]);
+        const of = (id: number) => payload.find((node: any) => node.nodeId === id).firmwareProgress;
+        expect(of(2)).toEqual({ percent: 37.5 });
+        expect(of(3)).toEqual({ percent: 100, outcome: 'success' });
+        expect(of(4)).toEqual({ percent: 100, outcome: 'failure' });
+      } finally {
+        createServerSpy.mockRestore();
+      }
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it('should refresh a cached accessory for an unready node so fault state can surface', () => {
     const log = {
       debug: jest.fn(),
