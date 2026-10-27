@@ -25,6 +25,8 @@ import {
   STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS,
 } from '../zwave/coveringController';
 import { MatterAccessories } from '../matter/MatterAccessories';
+import { TypeOverrideResolver } from './TypeOverrideResolver';
+import { TypeOverrideStore } from './TypeOverrideStore';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -87,6 +89,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     { percent: number; outcome?: 'success' | 'failure' }
   >();
   private refreshStates = new Map<number, 'waiting-wakeup' | 'refreshing'>();
+  private typeOverrides?: TypeOverrideResolver;
 
   constructor(
     public readonly log: Logger,
@@ -621,6 +624,27 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     this.syncNodeAccessory(node);
   }
 
+  /**
+   * The saved type overrides for this network, read on first use.
+   *
+   * Not read at startup, because the home ID names the file and is not known until the driver
+   * has read the controller. Reading it here keeps it ahead of the first plan it affects, so a
+   * saved override is never published as the detected type and rebuilt a moment later.
+   */
+  private typeOverridesFor(homeId: number): TypeOverrideResolver {
+    if (!this.typeOverrides) {
+      const store = new TypeOverrideStore(this.api.user.storagePath(), homeId, this.log);
+      store.load();
+      this.typeOverrides = new TypeOverrideResolver(
+        store,
+        () => Array.from(this.zwaveController?.nodes.values() ?? []),
+        this.log,
+      );
+    }
+
+    return this.typeOverrides;
+  }
+
   private syncNodeAccessory(node: IZWaveNode) {
     // Skip Node 1 (the controller itself) as it's handled by ControllerAccessory
     if (Number(node.nodeId) === 1) {
@@ -642,8 +666,12 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
      * that is still interviewing a second time, and the two readings can differ, so the
      * accessory would carry a signature describing services it does not have.
      */
+    const typeOverrides = this.typeOverridesFor(homeId);
+    void typeOverrides.observe(node);
+
     let planned: EndpointPlan[] | undefined;
-    const featurePlans = () => (planned ??= AccessoryFactory.planFeatures(node));
+    const featurePlans = () =>
+      (planned ??= AccessoryFactory.planFeatures(node, typeOverrides.planOptionsFor(node)));
     const graphSignature = node.ready
       ? AccessoryFactory.signatureOfPlans(featurePlans())
       : undefined;

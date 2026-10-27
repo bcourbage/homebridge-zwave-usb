@@ -3,6 +3,8 @@ import { ZWaveUsbPlatform } from '../src/platform/ZWaveUsbPlatform';
 import { PLATFORM_NAME } from '../src/platform/settings';
 import { AccessoryFactory } from '../src/accessories/AccessoryFactory';
 import { ZWaveController } from '../src/zwave/ZWaveController';
+import { TypeOverrideResolver } from '../src/platform/TypeOverrideResolver';
+import { REALISTIC_DEVICES, buildNode } from './fixtures/realisticDevices';
 import fs from 'fs';
 import path from 'path';
 import http from 'http';
@@ -120,6 +122,61 @@ describe('ZWaveUsbPlatform', () => {
 
     if (fs.existsSync(storagePath)) {
       fs.rmSync(storagePath, { recursive: true, force: true });
+    }
+  });
+
+  it('builds a node from the type saved for its hardware', () => {
+    // The override is read from the file for this network before the node is first planned, so
+    // the accessory is built as the saved type rather than published as detected and rebuilt.
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+    const fingerprint = { manufacturerId: 2748, productType: 2, productId: 16 };
+    const device = REALISTIC_DEVICES.find(
+      (candidate) => candidate.name === 'covering (Multilevel Switch only)',
+    )!;
+    const shade = buildNode(device, { nodeId: 10, ...fingerprint });
+
+    fs.writeFileSync(
+      path.join(storagePath, 'homebridge-zwave-usb-overrides-00000064.json'),
+      JSON.stringify({
+        version: 1,
+        homeId: '00000064',
+        overrides: [
+          { fingerprint, primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },
+        ],
+        observations: [],
+      }),
+    );
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    (platform as any).zwaveController.homeId = 0x64;
+    (platform as any).zwaveController.nodes = new Map([[10, shade]]);
+
+    const observed = jest
+      .spyOn(TypeOverrideResolver.prototype, 'observe')
+      .mockResolvedValue(undefined);
+    const created = jest.spyOn(AccessoryFactory, 'create').mockReturnValue({
+      initialize: jest.fn(),
+      isInitialized: () => true,
+      getGraphSignature: () => undefined,
+      stop: jest.fn(),
+      refresh: jest.fn(),
+    } as never);
+    jest.spyOn((platform as any).matterAccessories, 'add').mockImplementation(() => undefined);
+
+    try {
+      (platform as any).syncNodeAccessory(shade);
+
+      expect(AccessoryFactory.planFeatures(shade)[0].effectiveKinds).toEqual(['multilevel-switch']);
+      expect((created.mock.calls[0][3] as any[])[0].effectiveKinds).toEqual(['window-covering']);
+      expect(observed).toHaveBeenCalledWith(shade);
+    } finally {
+      created.mockRestore();
+      observed.mockRestore();
     }
   });
 

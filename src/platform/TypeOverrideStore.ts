@@ -134,7 +134,7 @@ function findProblem(parsed: unknown, homeId: string): string | undefined {
 }
 
 /** A reason reads after the sentence before it, so a message from the system gets an end. */
-function describeError(error: unknown): string {
+export function describeError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
 
   return /[.!?]$/.test(message) ? message : `${message}.`;

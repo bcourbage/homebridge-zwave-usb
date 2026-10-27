@@ -54,14 +54,31 @@ export function binarySensorDevice(property: string): RealisticDevice {
   };
 }
 
+/** What a node reports about itself, beyond the capabilities the device describes. */
+export interface NodeIdentity {
+  nodeId?: number;
+  ready?: boolean;
+  manufacturerId?: number;
+  productType?: number;
+  productId?: number;
+  /** How many endpoints the node exposes. Each reports the same capabilities. */
+  endpoints?: number;
+}
+
 /** A node that answers the three questions classification asks, and nothing more. */
-export function buildNode(device: RealisticDevice): IZWaveNode {
+export function buildNode(device: RealisticDevice, identity: NodeIdentity = {}): IZWaveNode {
   const codes = new Set<number>(device.supported);
-  const endpoint = { index: 0, supportsCC: (cc: number) => codes.has(cc) };
+  const endpoints = Array.from({ length: identity.endpoints ?? 1 }, (_unused, index) => ({
+    index,
+    supportsCC: (cc: number) => codes.has(cc),
+  }));
   return {
-    nodeId: 7,
-    ready: true,
-    getAllEndpoints: () => [endpoint],
+    nodeId: identity.nodeId ?? 7,
+    ready: identity.ready ?? true,
+    manufacturerId: identity.manufacturerId,
+    productType: identity.productType,
+    productId: identity.productId,
+    getAllEndpoints: () => endpoints,
     getDefinedValueIDs: () => device.values,
     getValueMetadata: () => (device.sceneStates ? { states: { 1: 'Scene 1' } } : undefined),
     getValue: () => undefined,
