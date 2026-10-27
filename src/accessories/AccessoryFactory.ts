@@ -77,6 +77,37 @@ export interface PlanOptions {
   primaryOverride?: PrimaryKind;
 }
 
+/**
+ * What each primary kind needs before a device can be published as it.
+ *
+ * Separate from detection on purpose. Detection decides what a device publishes when nobody has
+ * said otherwise, and is broader in places, because a device that reports a command class is
+ * usually the thing that command class describes. Compatibility answers a different question:
+ * whether this feature could drive a working service on this endpoint if a user asked for it.
+ * Each predicate lives beside the feature it speaks for, so it is derived from the values that
+ * feature actually reads rather than restated here.
+ */
+export const PRIMARY_CAPABILITY: Record<
+  PrimaryKind,
+  (node: IZWaveNode, endpoint: Endpoint) => boolean
+> = {
+  thermostat: ThermostatFeature.canBePrimary,
+  'window-covering': WindowCoveringFeature.canBePrimary,
+  'garage-door': GarageDoorFeature.canBePrimary,
+  lock: LockFeature.canBePrimary,
+  'color-switch': ColorSwitchFeature.canBePrimary,
+  'multilevel-switch': MultilevelSwitchFeature.canBePrimary,
+  'binary-switch': BinarySwitchFeature.canBePrimary,
+  siren: SirenFeature.canBePrimary,
+  'leak-sensor': LeakSensorFeature.canBePrimary,
+  'motion-sensor': MotionSensorFeature.canBePrimary,
+  'contact-sensor': ContactSensorFeature.canBePrimary,
+  'smoke-sensor': SmokeSensorFeature.canBePrimary,
+  'carbon-monoxide-sensor': CarbonMonoxideSensorFeature.canBePrimary,
+  'multilevel-sensor': MultilevelSensorFeature.canBePrimary,
+  'central-scene': CentralSceneFeature.canBePrimary,
+};
+
 export class AccessoryFactory {
   private static readonly FEATURE_CATEGORY_PRIORITY: Array<[FeatureKind, number]> = [
     ['garage-door', 4],
@@ -231,6 +262,23 @@ export class AccessoryFactory {
 
       return { endpoint, effectiveKinds, primaryKind, primaryGroup };
     });
+  }
+
+  /**
+   * Every primary kind this node could be published as, in the primary rule's order.
+   *
+   * Only single-endpoint nodes are answered. A device with several endpoints has a primary per
+   * endpoint, and choosing one type for the node would be choosing which endpoint the node is.
+   */
+  public static compatiblePrimaryKinds(node: IZWaveNode): PrimaryKind[] {
+    const endpoints = node.getAllEndpoints();
+    if (endpoints.length !== 1) {
+      return [];
+    }
+
+    const endpoint = endpoints[0];
+
+    return PRIMARY_KINDS.filter((kind) => PRIMARY_CAPABILITY[kind](node, endpoint));
   }
 
   /** The first kind present by the primary rule's own order, not by the planner's push order. */
