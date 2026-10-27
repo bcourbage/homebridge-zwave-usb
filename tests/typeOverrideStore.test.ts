@@ -166,6 +166,13 @@ describe('TypeOverrideStore', () => {
           { id: 'b', nodeId: 9, fingerprint: { ...other }, appliedAt: 'now', orphanedAt: null },
         ],
       }],
+      ['two observations sharing an identifier', {
+        ...valid(),
+        observations: [
+          { id: 'a', nodeId: 9, fingerprint: other, appliedAt: 'now', orphanedAt: null },
+          { id: 'a', nodeId: 10, fingerprint: shade, appliedAt: 'now', orphanedAt: null },
+        ],
+      }],
       ['an observation with no identifier', {
         ...valid(),
         observations: [{ nodeId: 9, fingerprint: other, appliedAt: 'now', orphanedAt: null }],

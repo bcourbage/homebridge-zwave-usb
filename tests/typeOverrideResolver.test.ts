@@ -70,6 +70,14 @@ describe('TypeOverrideResolver', () => {
 
   const stored = () => JSON.parse(fs.readFileSync(path.join(directory, FILE), 'utf8'));
 
+  /** A resolver whose store refused its file, so it holds no decision and accepts no write. */
+  const refusedStore = () => {
+    fs.writeFileSync(path.join(directory, FILE), '{ not json');
+    const store = new TypeOverrideStore(directory, HOME_ID, log);
+    store.load();
+    return new TypeOverrideResolver(store, () => nodes, log, clock);
+  };
+
   beforeEach(() => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zwave-resolver-'));
     log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as never;
@@ -464,16 +472,546 @@ describe('TypeOverrideResolver', () => {
     });
   });
 
-  describe('when the record cannot be written', () => {
-    const unwritable = () => {
-      fs.writeFileSync(path.join(directory, FILE), '{ not json');
-      const store = new TypeOverrideStore(directory, HOME_ID, log);
-      store.load();
-      return new TypeOverrideResolver(store, () => nodes, log, clock);
-    };
+  describe('the revision a decision is made against', () => {
+    const revision = (subject: TypeOverrideResolver) => subject.cohortRevisionFor(SHADE);
 
+    beforeEach(() => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+    });
+
+    it('is eight hex digits', () => {
+      expect(revision(resolver())).toMatch(/^[0-9a-f]{8}$/);
+    });
+
+    it('is the same while nothing about the cohort changes', () => {
+      expect(revision(resolver())).toBe(revision(resolver()));
+    });
+
+    it('does not depend on the order the nodes were discovered in', () => {
+      nodes = [node('dimmer with battery', { nodeId: 11 }), node('colour bulb', { nodeId: 10 })];
+      const discovered = revision(resolver());
+      nodes = [nodes[1], nodes[0]];
+
+      expect(revision(resolver())).toBe(discovered);
+    });
+
+    it('changes when a node joins the cohort', () => {
+      const alone = revision(resolver());
+      nodes = [...nodes, node('colour bulb', { nodeId: 11 })];
+
+      expect(revision(resolver())).not.toBe(alone);
+    });
+
+    it('changes when the same devices answer to different node numbers', () => {
+      const asTen = revision(resolver());
+      nodes = [node('dimmer with battery', { nodeId: 11 })];
+
+      expect(revision(resolver())).not.toBe(asTen);
+    });
+
+    it('changes when a node reports different capabilities', () => {
+      const dimming = revision(resolver());
+      nodes = [node('colour bulb', { nodeId: 10 })];
+
+      expect(revision(resolver())).not.toBe(dimming);
+    });
+
+    it('changes when the stored decision changes', () => {
+      expect(revision(resolver([override(SHADE, 'window-covering')]))).not.toBe(
+        revision(resolver()),
+      );
+    });
+
+    it('changes when a decision no node can take is saved', () => {
+      // Nothing about the nodes changes, since none of them can be published as it. What
+      // changes is that Revert and Remove now mean something, so the revision has to move.
+      nodes = [sensor('Motion', { nodeId: 10 })];
+      const undecided = revision(resolver());
+
+      expect(revision(resolver([override(SHADE, 'contact-sensor')]))).not.toBe(undecided);
+    });
+
+    it('is not shared by two models on the same network', () => {
+      nodes = [
+        node('dimmer with battery', { nodeId: 10 }),
+        node('dimmer with battery', { nodeId: 11, ...OTHER }),
+      ];
+      const subject = resolver();
+
+      expect(subject.cohortRevisionFor(SHADE)).not.toBe(subject.cohortRevisionFor(OTHER));
+    });
+  });
+
+  describe('saving a type for a device', () => {
+    const request = (subject: TypeOverrideResolver, primaryKind: string, extra = {}) => ({
+      nodeId: 10,
+      primaryKind: primaryKind as never,
+      expectedFingerprint: SHADE,
+      expectedRevision: subject.cohortRevisionFor(SHADE),
+      ...extra,
+    });
+
+    beforeEach(() => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+    });
+
+    it('saves the decision for the hardware and names the nodes to rebuild', async () => {
+      nodes = [...nodes, node('covering (Multilevel Switch only)', { nodeId: 11 })];
+      const subject = resolver();
+
+      expect(await subject.setNodeType(request(subject, 'window-covering'))).toEqual({
+        rebuild: [10, 11],
+      });
+      expect(stored().overrides).toEqual([
+        { fingerprint: SHADE, primaryKind: 'window-covering', savedAt: NOW },
+      ]);
+    });
+
+    it('replaces a decision already saved for that hardware rather than adding another', async () => {
+      // A colour bulb, so that a third type is on offer beside the saved one and its own default.
+      nodes = [node('colour bulb', { nodeId: 10 })];
+      const subject = resolver([override(SHADE, 'window-covering')]);
+      await subject.setNodeType(request(subject, 'multilevel-switch'));
+
+      expect(stored().overrides).toEqual([
+        { fingerprint: SHADE, primaryKind: 'multilevel-switch', savedAt: NOW },
+      ]);
+    });
+
+    it('leaves a decision about other hardware alone', async () => {
+      const subject = resolver([override(OTHER, 'lock')]);
+      await subject.setNodeType(request(subject, 'window-covering'));
+
+      expect(stored().overrides).toHaveLength(2);
+      expect(stored().overrides[0]).toEqual(override(OTHER, 'lock'));
+    });
+
+    it('refuses a node it does not have', async () => {
+      const subject = resolver();
+      const sent = request(subject, 'window-covering', { nodeId: 99 });
+
+      expect(await subject.setNodeType(sent)).toEqual({ refusal: 'unknown-node', rebuild: [] });
+    });
+
+    it('refuses while the saved file could not be read', async () => {
+      const subject = refusedStore();
+
+      expect(await subject.setNodeType(request(subject, 'window-covering'))).toEqual({
+        refusal: 'read-only',
+        rebuild: [],
+      });
+    });
+
+    it.each([
+      ['its interview has not finished', { ready: false }],
+      ['it has several endpoints', { endpoints: 2 }],
+      ['it reports no fingerprint', { productId: undefined }],
+    ])('refuses a node because %s', async (_why, identity) => {
+      nodes = [node('dimmer with battery', { nodeId: 10, ...identity })];
+      const subject = resolver();
+
+      expect(await subject.setNodeType(request(subject, 'window-covering'))).toEqual({
+        refusal: 'not-overridable',
+        rebuild: [],
+      });
+    });
+
+    it('refuses when the node now reports other hardware', async () => {
+      const subject = resolver();
+      const sent = request(subject, 'window-covering', { expectedFingerprint: OTHER });
+
+      expect(await subject.setNodeType(sent)).toEqual({
+        refusal: 'fingerprint-changed',
+        rebuild: [],
+      });
+    });
+
+    it('refuses when the cohort changed since the decision was composed', async () => {
+      const subject = resolver();
+      const sent = request(subject, 'window-covering');
+      nodes = [...nodes, node('colour bulb', { nodeId: 11 })];
+
+      expect(await subject.setNodeType(sent)).toEqual({ refusal: 'cohort-changed', rebuild: [] });
+    });
+
+    it('refuses a type the named node could drive but another in the cohort could not', async () => {
+      // The colour bulb could be published as a colour switch; the dimmer beside it could not.
+      nodes = [...nodes, node('colour bulb', { nodeId: 11 })];
+      const subject = resolver();
+      const sent = { ...request(subject, 'color-switch'), nodeId: 11 };
+
+      expect(await subject.setNodeType(sent)).toEqual({
+        refusal: 'unsupported-type',
+        rebuild: [],
+      });
+    });
+
+    it('refuses the type already saved, which would change nothing', async () => {
+      const subject = resolver([override(SHADE, 'window-covering')]);
+
+      expect(await subject.setNodeType(request(subject, 'window-covering'))).toEqual({
+        refusal: 'already-current',
+        rebuild: [],
+      });
+    });
+
+    it('refuses a type every node in the cohort already publishes', async () => {
+      const subject = resolver();
+
+      expect(await subject.setNodeType(request(subject, 'multilevel-switch'))).toEqual({
+        refusal: 'already-default',
+        rebuild: [],
+      });
+    });
+
+    it('sends a revert to clearing rather than saving a default as a decision', async () => {
+      const subject = resolver([override(SHADE, 'window-covering')]);
+
+      expect(await subject.setNodeType(request(subject, 'multilevel-switch'))).toEqual({
+        refusal: 'use-clear',
+        rebuild: [],
+      });
+    });
+
+    it('accepts a type that is the default of only part of the cohort', async () => {
+      nodes = [...nodes, node('colour bulb', { nodeId: 11 })];
+      const subject = resolver();
+
+      expect(await subject.setNodeType(request(subject, 'multilevel-switch'))).toEqual({
+        rebuild: [10, 11],
+      });
+    });
+
+    it('writes nothing at all when it refuses', async () => {
+      const subject = resolver([override(OTHER, 'lock')]);
+      const before = fs.readFileSync(path.join(directory, FILE), 'utf8');
+      await subject.setNodeType(request(subject, 'multilevel-switch'));
+
+      expect(fs.readFileSync(path.join(directory, FILE), 'utf8')).toBe(before);
+    });
+  });
+
+  describe('clearing a saved type', () => {
+    const request = (subject: TypeOverrideResolver) => ({
+      nodeId: 10,
+      expectedFingerprint: SHADE,
+      expectedRevision: subject.cohortRevisionFor(SHADE),
+    });
+
+    beforeEach(() => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+    });
+
+    it('refuses when the hardware has no saved decision', async () => {
+      const subject = resolver();
+
+      expect(await subject.clearNodeType(request(subject))).toEqual({
+        refusal: 'no-override',
+        rebuild: [],
+      });
+    });
+
+    it('refuses when the cohort changed since the decision was composed', async () => {
+      const subject = resolver([override(SHADE, 'window-covering')]);
+      const sent = request(subject);
+      nodes = [...nodes, node('colour bulb', { nodeId: 11 })];
+
+      expect(await subject.clearNodeType(sent)).toEqual({ refusal: 'cohort-changed', rebuild: [] });
+    });
+
+    it('drops the decision and every record of where it was applied', async () => {
+      const subject = resolver(
+        [override(SHADE, 'window-covering')],
+        [observation('a', 10, SHADE), observation('b', 11, SHADE, '2026-01-01T00:00:00Z')],
+      );
+
+      expect(await subject.clearNodeType(request(subject))).toEqual({ rebuild: [10] });
+      expect(stored().overrides).toEqual([]);
+      expect(stored().observations).toEqual([]);
+    });
+
+    it('leaves the decision and records of another model alone', async () => {
+      const subject = resolver(
+        [override(SHADE, 'window-covering'), override(OTHER, 'lock')],
+        [observation('a', 10, SHADE), observation('b', 12, OTHER)],
+      );
+      await subject.clearNodeType(request(subject));
+
+      expect(stored().overrides).toEqual([override(OTHER, 'lock')]);
+      expect(stored().observations).toEqual([observation('b', 12, OTHER)]);
+    });
+  });
+
+  describe('discarding a decision no node can take', () => {
+    const request = (subject: TypeOverrideResolver) => ({
+      nodeId: 10,
+      expectedRevision: subject.cohortRevisionFor(SHADE),
+    });
+
+    beforeEach(() => {
+      nodes = [sensor('Motion', { nodeId: 10 })];
+    });
+
+    it('refuses when the hardware has no saved decision', async () => {
+      const subject = resolver();
+
+      expect(await subject.removeTypeOverride(request(subject))).toEqual({
+        refusal: 'no-override',
+        rebuild: [],
+      });
+    });
+
+    it('refuses while any node is published as it', async () => {
+      // The Door/Window sensor beside it can drive a contact sensor, so the decision is in use.
+      nodes = [...nodes, sensor('Door/Window', { nodeId: 11 })];
+      const subject = resolver([override(SHADE, 'contact-sensor')]);
+
+      expect(await subject.removeTypeOverride(request(subject))).toEqual({
+        refusal: 'override-in-use',
+        rebuild: [],
+      });
+    });
+
+    it('drops the decision and its records when no node takes it', async () => {
+      const subject = resolver(
+        [override(SHADE, 'contact-sensor')],
+        [observation('a', 10, SHADE, '2026-01-01T00:00:00Z')],
+      );
+
+      expect(await subject.removeTypeOverride(request(subject))).toEqual({ rebuild: [10] });
+      expect(stored()).toMatchObject({ overrides: [], observations: [] });
+    });
+  });
+
+  describe('acknowledging that a node reports other hardware', () => {
+    const request = { nodeId: 10, observationId: 'a', expectedFingerprint: SHADE };
+
+    beforeEach(() => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+    });
+
+    it('drops that one record and nothing else', async () => {
+      const subject = resolver(
+        [override(OTHER, 'lock')],
+        [observation('a', 10, OTHER, '2026-01-01T00:00:00Z'), observation('b', 11, OTHER)],
+      );
+
+      expect(await subject.acknowledgeTypeOrphan(request)).toEqual({ rebuild: [] });
+      expect(stored().observations).toEqual([observation('b', 11, OTHER)]);
+      expect(stored().overrides).toEqual([override(OTHER, 'lock')]);
+    });
+
+    it('refuses a record it does not have', async () => {
+      const subject = resolver([], [observation('b', 10, OTHER, '2026-01-01T00:00:00Z')]);
+
+      expect(await subject.acknowledgeTypeOrphan(request)).toEqual({
+        refusal: 'unknown-observation',
+        rebuild: [],
+      });
+    });
+
+    it('drops one record even when another carries the same identifier', async () => {
+      // The file validator refuses a shared identifier, so one is forced past it here. The
+      // delete names the whole record rather than resting on another module's invariant.
+      const subject = resolver([], [observation('a', 10, OTHER, '2026-01-01T00:00:00Z')]);
+      const intruder = { id: 'a', nodeId: 11, fingerprint: SHADE, appliedAt: NOW, orphanedAt: null };
+      await subject.store.update((data) => {
+        data.observations.push(intruder);
+      });
+
+      expect(await subject.acknowledgeTypeOrphan(request)).toEqual({ rebuild: [] });
+      expect(stored().observations).toEqual([intruder]);
+    });
+
+    it('refuses a record that is not orphaned', async () => {
+      // The page offers this only for an orphan. An active record is the plugin's own note that
+      // the decision is in force, and dropping it would be dropping a fact, not accepting one.
+      const subject = resolver([override(OTHER, 'lock')], [observation('a', 10, OTHER)]);
+
+      expect(await subject.acknowledgeTypeOrphan(request)).toEqual({
+        refusal: 'unknown-observation',
+        rebuild: [],
+      });
+      expect(stored().observations).toHaveLength(1);
+    });
+
+    it('refuses a record kept against another node', async () => {
+      const subject = resolver([], [observation('a', 11, OTHER, '2026-01-01T00:00:00Z')]);
+
+      expect(await subject.acknowledgeTypeOrphan(request)).toEqual({
+        refusal: 'unknown-observation',
+        rebuild: [],
+      });
+    });
+
+    it('refuses when the node now reports other hardware than the panel showed', async () => {
+      const subject = resolver([], [observation('a', 10, OTHER, '2026-01-01T00:00:00Z')]);
+      const sent = { ...request, expectedFingerprint: OTHER };
+
+      expect(await subject.acknowledgeTypeOrphan(sent)).toEqual({
+        refusal: 'fingerprint-changed',
+        rebuild: [],
+      });
+    });
+  });
+
+  describe('when two writes overlap', () => {
+    it('refuses a second decision carrying the revision the first one consumed', async () => {
+      nodes = [node('colour bulb', { nodeId: 10 })];
+      const subject = resolver();
+      const expectedRevision = subject.cohortRevisionFor(SHADE);
+      const sent = (primaryKind: string) => ({
+        nodeId: 10,
+        primaryKind: primaryKind as never,
+        expectedFingerprint: SHADE,
+        expectedRevision,
+      });
+
+      const [first, second] = await Promise.all([
+        subject.setNodeType(sent('window-covering')),
+        subject.setNodeType(sent('multilevel-switch')),
+      ]);
+
+      expect(first).toEqual({ rebuild: [10] });
+      expect(second).toEqual({ refusal: 'cohort-changed', rebuild: [] });
+      expect(stored().overrides).toEqual([
+        { fingerprint: SHADE, primaryKind: 'window-covering', savedAt: NOW },
+      ]);
+    });
+
+    it('refuses a clear carrying the revision a save consumed', async () => {
+      nodes = [node('colour bulb', { nodeId: 10 })];
+      const subject = resolver();
+      const expectedRevision = subject.cohortRevisionFor(SHADE);
+
+      const [saved, cleared] = await Promise.all([
+        subject.setNodeType({
+          nodeId: 10,
+          primaryKind: 'window-covering',
+          expectedFingerprint: SHADE,
+          expectedRevision,
+        }),
+        subject.clearNodeType({ nodeId: 10, expectedFingerprint: SHADE, expectedRevision }),
+      ]);
+
+      expect(saved).toEqual({ rebuild: [10] });
+      expect(cleared).toEqual({ refusal: 'cohort-changed', rebuild: [] });
+      expect(stored().overrides).toHaveLength(1);
+    });
+
+    it('runs the next command after one of them fails', async () => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+      const subject = resolver();
+      const sent = {
+        nodeId: 10,
+        primaryKind: 'window-covering' as const,
+        expectedFingerprint: SHADE,
+        expectedRevision: subject.cohortRevisionFor(SHADE),
+      };
+      const update = jest
+        .spyOn(subject.store, 'update')
+        .mockRejectedValueOnce(new Error('Disk is full'));
+
+      await expect(subject.setNodeType(sent)).rejects.toThrow('Disk is full');
+      update.mockRestore();
+
+      expect(await subject.setNodeType(sent)).toEqual({ rebuild: [10] });
+    });
+
+    it('does not record a decision that was cleared while the pass was in flight', async () => {
+      const shade = node('covering (Multilevel Switch only)', { nodeId: 10 });
+      nodes = [shade];
+      const subject = resolver([override(SHADE, 'window-covering')]);
+      const sent = {
+        nodeId: 10,
+        expectedFingerprint: SHADE,
+        expectedRevision: subject.cohortRevisionFor(SHADE),
+      };
+
+      const clearing = subject.clearNodeType(sent);
+      // Let the clear reach its write before the pass starts. The pass then reads a decision
+      // that is on its way out but still stored, and its own write lands behind the clear's.
+      await Promise.resolve();
+      const observing = subject.observe(shade);
+      await Promise.all([clearing, observing]);
+
+      expect(stored()).toMatchObject({ overrides: [], observations: [] });
+    });
+  });
+
+  describe('a request missing what it must carry', () => {
+    beforeEach(() => {
+      nodes = [node('dimmer with battery', { nodeId: 10 })];
+    });
+
+    const incomplete = { refusal: 'incomplete-request', rebuild: [] };
+
+    it.each([
+      ['no hardware', { expectedFingerprint: undefined }],
+      ['no revision', { expectedRevision: undefined }],
+      ['an unreadable fingerprint', { expectedFingerprint: { manufacturerId: 2748 } }],
+      ['a revision that is not text', { expectedRevision: 7 }],
+    ])('refuses a save sent with %s', async (_why, forged) => {
+      const subject = resolver();
+      const sent = {
+        nodeId: 10,
+        primaryKind: 'window-covering',
+        expectedFingerprint: SHADE,
+        expectedRevision: subject.cohortRevisionFor(SHADE),
+        ...forged,
+      } as never;
+
+      expect(await subject.setNodeType(sent)).toEqual(incomplete);
+    });
+
+    it.each([
+      ['no hardware', { expectedFingerprint: undefined }],
+      ['no revision', { expectedRevision: undefined }],
+    ])('refuses a clear sent with %s', async (_why, forged) => {
+      const subject = resolver([override(SHADE, 'window-covering')]);
+      const sent = {
+        nodeId: 10,
+        expectedFingerprint: SHADE,
+        expectedRevision: subject.cohortRevisionFor(SHADE),
+        ...forged,
+      } as never;
+
+      expect(await subject.clearNodeType(sent)).toEqual(incomplete);
+    });
+
+    it('refuses a discard sent with no revision', async () => {
+      nodes = [sensor('Motion', { nodeId: 10 })];
+      const subject = resolver([override(SHADE, 'contact-sensor')]);
+
+      expect(await subject.removeTypeOverride({ nodeId: 10 } as never)).toEqual(incomplete);
+    });
+
+    it('refuses an acknowledgement sent with no hardware', async () => {
+      const subject = resolver([], [observation('a', 10, OTHER, '2026-01-01T00:00:00Z')]);
+      const sent = { nodeId: 10, observationId: 'a' } as never;
+
+      expect(await subject.acknowledgeTypeOrphan(sent)).toEqual(incomplete);
+    });
+
+    it('refuses a type this plugin does not publish', async () => {
+      const subject = resolver();
+      const sent = {
+        nodeId: 10,
+        primaryKind: 'teapot',
+        expectedFingerprint: SHADE,
+        expectedRevision: subject.cohortRevisionFor(SHADE),
+      } as never;
+
+      expect(await subject.setNodeType(sent)).toEqual({
+        refusal: 'unsupported-type',
+        rebuild: [],
+      });
+    });
+  });
+
+  describe('when the saved file could not be read', () => {
     it('publishes every node as planned, because it knows of no decision', () => {
-      const subject = unwritable();
+      const subject = refusedStore();
       const shade = node('covering (Multilevel Switch only)', { nodeId: 10 });
 
       expect(subject.planOptionsFor(shade)).toEqual({});
@@ -482,13 +1020,16 @@ describe('TypeOverrideResolver', () => {
     });
 
     it('finds nothing to record, so it never reaches the write the store would refuse', async () => {
-      const subject = unwritable();
+      const subject = refusedStore();
       const update = jest.spyOn(subject.store, 'update');
       await subject.observe(node('covering (Multilevel Switch only)', { nodeId: 10 }));
 
       expect(update).not.toHaveBeenCalled();
     });
 
+  });
+
+  describe('when a write fails', () => {
     it('reports a failing write once for a node rather than on every event', async () => {
       const shade = node('covering (Multilevel Switch only)', { nodeId: 10 });
       const subject = resolver([override(SHADE, 'window-covering')]);

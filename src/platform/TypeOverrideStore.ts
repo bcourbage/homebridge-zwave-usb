@@ -47,7 +47,7 @@ export function fingerprintKey(fingerprint: DeviceFingerprint): string {
   return `${fingerprint.manufacturerId}:${fingerprint.productType}:${fingerprint.productId}`;
 }
 
-function isFingerprint(value: unknown): value is DeviceFingerprint {
+export function isFingerprint(value: unknown): value is DeviceFingerprint {
   if (!isObject(value)) {
     return false;
   }
@@ -105,6 +105,7 @@ function findProblem(parsed: unknown, homeId: string): string | undefined {
     seenOverrides.add(key);
   }
 
+  const seenIds = new Set<string>();
   const seenObservations = new Set<string>();
   for (const observation of parsed.observations) {
     if (!isObject(observation) || !isFingerprint(observation.fingerprint)) {
@@ -122,6 +123,12 @@ function findProblem(parsed: unknown, homeId: string): string | undefined {
     if (observation.orphanedAt !== null && !isNonEmptyString(observation.orphanedAt)) {
       return 'An observation records an unreadable orphan time.';
     }
+
+    // Acknowledgement names one record by its identifier, so two records cannot share one.
+    if (seenIds.has(observation.id)) {
+      return 'Two observations share an identifier.';
+    }
+    seenIds.add(observation.id);
 
     const key = `${observation.nodeId}@${fingerprintKey(observation.fingerprint)}`;
     if (seenObservations.has(key)) {
@@ -275,8 +282,9 @@ export class TypeOverrideStore {
   }
 
   private enqueue<T>(task: () => Promise<T>): Promise<T> {
-    // Run whether or not the previous write succeeded, so one failure does not refuse the rest.
-    const run = this.pending.then(task, task);
+    // What is kept is the settled promise, never the rejected one, so a failed write is waited
+    // on by the write behind it but does not refuse it.
+    const run = this.pending.then(task);
     this.pending = run.catch(() => undefined);
 
     return run;
