@@ -830,14 +830,16 @@ describe('ZWaveUsbPlatform', () => {
     const matterAdd = jest.fn();
     (platform as any).matterAccessories.add = matterAdd;
 
-    const graphSpy = jest.spyOn(AccessoryFactory, 'getGraphSignature').mockReturnValue('new-graph');
+    const graphSpy = jest
+      .spyOn(AccessoryFactory, 'signatureOfPlans')
+      .mockReturnValue('new-graph');
     const createSpy = jest.spyOn(AccessoryFactory, 'create').mockReturnValue(reconciled as any);
 
     try {
       (platform as any).handleNodeUpdated(node);
 
       expect(existing.stop).toHaveBeenCalled();
-      expect(createSpy).toHaveBeenCalledWith(platform, node, 100);
+      expect(createSpy).toHaveBeenCalledWith(platform, node, 100, expect.any(Array));
       expect(reconciled.initialize).toHaveBeenCalledWith({ pruneUnmanagedServices: true });
       expect(existing.updateNode).not.toHaveBeenCalled();
       expect(existing.refresh).not.toHaveBeenCalled();
@@ -849,6 +851,67 @@ describe('ZWaveUsbPlatform', () => {
       expect(matterAdd).toHaveBeenCalledWith(reconciled);
     } finally {
       graphSpy.mockRestore();
+      createSpy.mockRestore();
+    }
+  });
+
+  it('plans a node once per pass and builds from that same plan', () => {
+    /**
+     * The platform takes a node's signature to decide whether to rebuild, then builds. Those
+     * were two separate readings of the node, and a node that is still interviewing answers
+     * differently as it goes, so an accessory could be built from the second reading and
+     * labelled with the first. Its stored signature would then describe services it does not
+     * have, and the next comparison would rebuild it again.
+     */
+    const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+
+    const platform = new ZWaveUsbPlatform(log, config, api);
+    (platform as any).zwaveController.homeId = 100;
+
+    const node = {
+      nodeId: 2,
+      name: 'Interviewing Node',
+      ready: true,
+      status: 4,
+      deviceConfig: { label: 'Interviewing Node', manufacturer: 'Maker' },
+      getAllEndpoints: jest
+        .fn()
+        .mockReturnValue([{ index: 0, supportsCC: jest.fn().mockReturnValue(false) }]),
+      getDefinedValueIDs: jest.fn().mockReturnValue([]),
+      getValueMetadata: jest.fn(),
+      getValue: jest.fn(),
+      supportsCC: jest.fn().mockReturnValue(false),
+    };
+
+    const existing = {
+      isInitialized: jest.fn().mockReturnValue(true),
+      getGraphSignature: jest.fn().mockReturnValue('old-graph'),
+      stop: jest.fn(),
+      updateNode: jest.fn(),
+      refresh: jest.fn(),
+    };
+    (platform as any).zwaveAccessories.set(2, existing);
+    (platform as any).matterAccessories.add = jest.fn();
+
+    const planSpy = jest.spyOn(AccessoryFactory, 'planFeatures');
+    const createSpy = jest
+      .spyOn(AccessoryFactory, 'create')
+      .mockReturnValue({ initialize: jest.fn(), stop: jest.fn() } as any);
+
+    try {
+      (platform as any).handleNodeUpdated(node);
+
+      // One reading, and the build was handed exactly the plan that reading produced.
+      expect(planSpy).toHaveBeenCalledTimes(1);
+      expect(createSpy).toHaveBeenCalledTimes(1);
+      expect(createSpy.mock.calls[0][3]).toBe(planSpy.mock.results[0].value);
+    } finally {
+      planSpy.mockRestore();
       createSpy.mockRestore();
     }
   });
@@ -899,7 +962,7 @@ describe('ZWaveUsbPlatform', () => {
     (platform as any).matterAccessories.add = matterAdd;
 
     const graphSpy = jest
-      .spyOn(AccessoryFactory, 'getGraphSignature')
+      .spyOn(AccessoryFactory, 'signatureOfPlans')
       .mockReturnValue('same-graph');
     const createSpy = jest.spyOn(AccessoryFactory, 'create');
 

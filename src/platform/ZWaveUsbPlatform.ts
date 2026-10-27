@@ -15,7 +15,7 @@ import { ZWaveController } from '../zwave/ZWaveController';
 import { IZWaveController, IZWaveNode, ZWaveValueEvent } from '../zwave/interfaces';
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
 import { BatterySnapshot } from '../features/ZWaveFeature';
-import { AccessoryFactory } from '../accessories/AccessoryFactory';
+import { AccessoryFactory, EndpointPlan } from '../accessories/AccessoryFactory';
 import { ControllerAccessory } from '../accessories/ControllerAccessory';
 import { readCoveringPosition } from '../zwave/coveringTravel';
 import { HAP_COMMUNICATION_FAILURE } from '../features/ZWaveFeature';
@@ -636,7 +636,17 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       return;
     }
 
-    const graphSignature = node.ready ? AccessoryFactory.getGraphSignature(node) : undefined;
+    /**
+     * One reading of the node for this pass. The signature compared below and every accessory
+     * built from it describe the same plan. Planning again inside the build would read a node
+     * that is still interviewing a second time, and the two readings can differ, so the
+     * accessory would carry a signature describing services it does not have.
+     */
+    let planned: EndpointPlan[] | undefined;
+    const featurePlans = () => (planned ??= AccessoryFactory.planFeatures(node));
+    const graphSignature = node.ready
+      ? AccessoryFactory.signatureOfPlans(featurePlans())
+      : undefined;
 
     const existing = this.zwaveAccessories.get(node.nodeId);
     if (existing || this.discoveryInFlight.has(node.nodeId)) {
@@ -649,7 +659,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
            * has to be requested here rather than inferred from a later comparison.
            */
           existing.stop();
-          const hydratedAccessory = AccessoryFactory.create(this, node, homeId);
+          const hydratedAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
           hydratedAccessory.initialize({ removeSupersededServices: true });
           this.matterAccessories.add(hydratedAccessory);
@@ -666,7 +676,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
             `Rebuilding accessory graph for Node ${node.nodeId} after capability change was detected.`,
           );
           existing.stop();
-          const reconciledAccessory = AccessoryFactory.create(this, node, homeId);
+          const reconciledAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
           this.matterAccessories.add(reconciledAccessory);
@@ -698,7 +708,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           `Refreshing cached accessory for Node ${node.nodeId} before interview completion so HomeKit can surface fault state.`,
         );
       }
-      const accessory = AccessoryFactory.create(this, node, homeId);
+      const accessory = AccessoryFactory.create(this, node, homeId, featurePlans());
       this.zwaveAccessories.set(node.nodeId, accessory);
 
       if (node.ready) {
