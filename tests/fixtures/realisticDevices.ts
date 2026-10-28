@@ -95,7 +95,7 @@ export const REALISTIC_DEVICES: RealisticDevice[] = [
   { name: 'garage door', supported: [CC['Barrier Operator']], values: [v(CC['Barrier Operator'], 'currentState'), v(CC['Barrier Operator'], 'targetState'), v(CC['Barrier Operator'], 'obstruction')] },
   { name: 'door lock', supported: [CC['Door Lock']], values: [v(CC['Door Lock'], 'currentMode'), v(CC['Door Lock'], 'targetMode')] },
   { name: 'legacy lock', supported: [CC.Lock], values: [v(CC.Lock, 'locked')] },
-  { name: 'thermostat', supported: [CC['Thermostat Mode'], CC['Multilevel Sensor']], values: [v(CC['Thermostat Mode'], 'mode'), v(CC['Thermostat Setpoint'], 'setpoint', 1), v(CC['Thermostat Setpoint'], 'setpoint', 2), v(CC['Multilevel Sensor'], 'Air temperature')] },
+  { name: 'thermostat', supported: [CC['Thermostat Mode'], CC['Thermostat Setpoint'], CC['Multilevel Sensor']], values: [v(CC['Thermostat Mode'], 'mode'), v(CC['Thermostat Setpoint'], 'setpoint', 1), v(CC['Thermostat Setpoint'], 'setpoint', 2), v(CC['Multilevel Sensor'], 'Air temperature')] },
   { name: 'siren (Sound Switch)', supported: [CC['Sound Switch'], CC['Binary Switch']], values: [...BS, v(CC['Sound Switch'], 'toneId'), v(CC['Sound Switch'], 'defaultVolume')] },
   { name: 'leak sensor (notification)', supported: [CC.Notification, CC.Battery], values: [v(CC.Notification, 'Water Alarm', 'Water leak status'), ...BATTERY] },
   { name: 'leak sensor (binary)', supported: [CC['Binary Sensor'], CC.Battery], values: [v(CC['Binary Sensor'], 'Water'), ...BATTERY] },
