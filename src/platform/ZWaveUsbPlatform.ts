@@ -15,7 +15,7 @@ import { ZWaveController } from '../zwave/ZWaveController';
 import { IZWaveController, IZWaveNode, ZWaveValueEvent } from '../zwave/interfaces';
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
 import { BatterySnapshot } from '../features/ZWaveFeature';
-import { AccessoryFactory, EndpointPlan } from '../accessories/AccessoryFactory';
+import { AccessoryFactory, EndpointPlan, PrimaryKind } from '../accessories/AccessoryFactory';
 import { ControllerAccessory } from '../accessories/ControllerAccessory';
 import { readCoveringPosition } from '../zwave/coveringTravel';
 import { HAP_COMMUNICATION_FAILURE } from '../features/ZWaveFeature';
@@ -25,8 +25,9 @@ import {
   STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS,
 } from '../zwave/coveringController';
 import { MatterAccessories } from '../matter/MatterAccessories';
-import { TypeOverrideResolver } from './TypeOverrideResolver';
-import { TypeOverrideStore } from './TypeOverrideStore';
+import { TypeOverrideResolver, WriteResult } from './TypeOverrideResolver';
+import { DeviceFingerprint, TypeOverrideStore, describeError } from './TypeOverrideStore';
+import { NodeTypePayload, buildNodeTypePayload, summarizeNodeType } from './NodeTypePayload';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -63,6 +64,28 @@ function describeRequestFailure(err: unknown): string {
   }
 
   return `The command failed with HomeKit status ${String(err)}.`;
+}
+
+/**
+ * The body of a type write, as it arrived over IPC.
+ *
+ * Its fields are declared as the write expects them rather than as optional, because the write
+ * is what validates them: it states which guards it requires and refuses a request missing one
+ * with no change. Checking them here as well would be a second rule to keep in step with it.
+ */
+interface TypeWriteBody {
+  primaryKind: PrimaryKind;
+  expectedFingerprint: DeviceFingerprint;
+  expectedRevision: string;
+  observationId: string;
+}
+
+/** What a type write did, which the panels redraw from. */
+export interface TypeWriteOutcome {
+  payload: NodeTypePayload | null;
+  rebuilt: number[];
+  failed: { nodeId: number; error: string }[];
+  refusal?: string;
 }
 
 export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
@@ -191,6 +214,35 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         res.end(JSON.stringify(data));
       };
 
+      /**
+       * Hands the parsed request body to a handler that answers for itself.
+       *
+       * The body is whatever the caller sent. Nothing here decides it is well formed: a write
+       * states which fields it needs and refuses a request that is missing one, so a body that
+       * is not an object arrives as an empty one and is refused the same way.
+       */
+      const readBody = (handle: (body: TypeWriteBody) => Promise<unknown>) => {
+        let body = '';
+        req.on('data', (chunk) => (body += chunk));
+        req.on('end', () => {
+          let parsed: unknown;
+          try {
+            parsed = body ? JSON.parse(body) : {};
+          } catch (err) {
+            return sendJson({ error: describeError(err) }, 400);
+          }
+          const fields =
+            typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? parsed : {};
+
+          void handle(fields as TypeWriteBody)
+            .then((answer) => sendJson(answer))
+            .catch((err) => {
+              this.log.error(`IPC Management Error: ${err}`);
+              sendJson({ error: describeError(err) }, 500);
+            });
+        });
+      };
+
       try {
         if (normalizedUrl === '/nodes' && method === 'GET') {
           const nodes = Array.from(this.zwaveController?.nodes.values() || []).map((node) => ({
@@ -207,6 +259,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
             refreshState: this.refreshStates.get(node.nodeId),
             homekitState: this.getHomeKitPublicationState(node),
             battery: this.readBatteryState(node),
+            ...this.typeSummaryFor(node),
           }));
           return sendJson(nodes);
         }
@@ -442,6 +495,69 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
+        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type')) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+
+          if (method === 'GET') {
+            const payload = this.nodeTypePayload(nodeId);
+            return payload
+              ? sendJson(payload)
+              : sendJson({ error: `Node ${nodeId} is not in the network` }, 404);
+          }
+
+          if (method === 'POST') {
+            readBody((body) =>
+              this.writeNodeType(nodeId, (resolver) =>
+                resolver.setNodeType({
+                  nodeId,
+                  primaryKind: body.primaryKind,
+                  expectedFingerprint: body.expectedFingerprint,
+                  expectedRevision: body.expectedRevision,
+                }),
+              ),
+            );
+            return;
+          }
+        }
+
+        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/clear')) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          readBody((body) =>
+            this.writeNodeType(nodeId, (resolver) =>
+              resolver.clearNodeType({
+                nodeId,
+                expectedFingerprint: body.expectedFingerprint,
+                expectedRevision: body.expectedRevision,
+              }),
+            ),
+          );
+          return;
+        }
+
+        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/remove')) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          readBody((body) =>
+            this.writeNodeType(nodeId, (resolver) =>
+              resolver.removeTypeOverride({ nodeId, expectedRevision: body.expectedRevision }),
+            ),
+          );
+          return;
+        }
+
+        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/acknowledge')) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          readBody((body) =>
+            this.writeNodeType(nodeId, (resolver) =>
+              resolver.acknowledgeTypeOrphan({
+                nodeId,
+                observationId: body.observationId,
+                expectedFingerprint: body.expectedFingerprint,
+              }),
+            ),
+          );
+          return;
+        }
+
         this.log.warn(`IPC Management: Path not found: ${normalizedUrl}`);
         sendJson({ error: `Path not found: ${normalizedUrl}` }, 404);
       } catch (err) {
@@ -643,6 +759,106 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     return this.typeOverrides;
+  }
+
+  /** The resolver for the running network, or none while the controller is still starting. */
+  private typeOverridesNow(): TypeOverrideResolver | undefined {
+    const homeId = this.zwaveController?.homeId;
+
+    return homeId ? this.typeOverridesFor(homeId) : undefined;
+  }
+
+  /** Whether a live Matter endpoint is publishing this node, which only a restart replaces. */
+  private matterPublishes(nodeId: number): boolean {
+    const accessory = this.zwaveAccessories.get(nodeId);
+
+    return accessory ? this.matterAccessories.publishes(accessory.platformAccessory.UUID) : false;
+  }
+
+  /** Everything the node's type panel draws, or none when the node has left the network. */
+  public nodeTypePayload(nodeId: number): NodeTypePayload | undefined {
+    const node = this.zwaveController?.nodes.get(nodeId);
+    const resolver = this.typeOverridesNow();
+    if (!node || !resolver) {
+      return undefined;
+    }
+
+    return buildNodeTypePayload(resolver, node, { matterActive: this.matterPublishes(nodeId) });
+  }
+
+  /** What the node table shows about a node's type, which is a summary of the same decision. */
+  private typeSummaryFor(node: IZWaveNode) {
+    const resolver = this.typeOverridesNow();
+
+    return resolver
+      ? summarizeNodeType(resolver, node)
+      : { typeOverride: null, typeInvalid: false, typeOrphans: 0 };
+  }
+
+  /**
+   * Runs a type write and rebuilds what it changed.
+   *
+   * The payload returned describes the network after the write, whether the write was accepted
+   * or refused, so a panel that refreshes from it is showing the state a refusal was measured
+   * against rather than the stale one the request was composed from.
+   */
+  private async writeNodeType(
+    nodeId: number,
+    write: (resolver: TypeOverrideResolver) => Promise<WriteResult>,
+  ): Promise<TypeWriteOutcome> {
+    const resolver = this.typeOverridesNow();
+    if (!resolver) {
+      throw new Error('Controller not initialized');
+    }
+
+    const result = await write(resolver);
+    const { rebuilt, failed } = result.refusal
+      ? { rebuilt: [], failed: [] }
+      : this.rebuildForTypeChange(result.rebuild);
+
+    return {
+      payload: this.nodeTypePayload(nodeId) ?? null,
+      rebuilt,
+      failed,
+      ...(result.refusal ? { refusal: result.refusal } : {}),
+    };
+  }
+
+  /**
+   * Rebuilds the accessories a saved decision reached.
+   *
+   * The decision is already on disk, so a node that cannot be rebuilt is reported rather than
+   * rolled back: it publishes the saved type from the next restart, and the nodes after it in
+   * the list are still rebuilt. Whether a node was rebuilt is read from its graph signature,
+   * the same comparison the sync makes, so a cohort node the decision did not change is not
+   * claimed as rebuilt.
+   */
+  private rebuildForTypeChange(nodeIds: readonly number[]): {
+    rebuilt: number[];
+    failed: { nodeId: number; error: string }[];
+  } {
+    const rebuilt: number[] = [];
+    const failed: { nodeId: number; error: string }[] = [];
+
+    for (const nodeId of nodeIds) {
+      const node = this.zwaveController?.nodes.get(nodeId);
+      if (!node) {
+        continue;
+      }
+
+      const before = this.zwaveAccessories.get(nodeId)?.getGraphSignature();
+      try {
+        this.syncNodeAccessory(node);
+        if (this.zwaveAccessories.get(nodeId)?.getGraphSignature() !== before) {
+          rebuilt.push(nodeId);
+        }
+      } catch (err) {
+        this.log.error(`Failed to rebuild Node ${nodeId} after a type change: ${err}`);
+        failed.push({ nodeId, error: describeError(err) });
+      }
+    }
+
+    return { rebuilt, failed };
   }
 
   private syncNodeAccessory(node: IZWaveNode) {

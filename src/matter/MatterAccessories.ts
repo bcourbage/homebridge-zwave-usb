@@ -280,6 +280,17 @@ export class MatterAccessories {
     this.publishTimer.unref();
   }
 
+  /**
+   * Whether a live Matter endpoint is publishing this accessory.
+   *
+   * A published endpoint keeps the device type it was registered with, because registering a
+   * live endpoint a second time is rejected, so a type change reaches Matter only after a
+   * restart. The panels disclose that, and only for the devices it is true of.
+   */
+  public publishes(uuid: string): boolean {
+    return this.tracked.has(uuid);
+  }
+
   public supports(accessory: ZWaveAccessory): boolean {
     return (
       serviceMappings(this.platform, accessory, {
