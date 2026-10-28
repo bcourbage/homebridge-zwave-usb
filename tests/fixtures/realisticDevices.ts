@@ -63,6 +63,10 @@ export interface NodeIdentity {
   productId?: number;
   /** How many endpoints the node exposes. Each reports the same capabilities. */
   endpoints?: number;
+  /** The name the user gave the node, which panels show beside its number. */
+  name?: string;
+  /** The model name the device reports, which is shown as the device label. */
+  label?: string;
 }
 
 /** A node that answers the three questions classification asks, and nothing more. */
@@ -75,6 +79,8 @@ export function buildNode(device: RealisticDevice, identity: NodeIdentity = {}):
   return {
     nodeId: identity.nodeId ?? 7,
     ready: identity.ready ?? true,
+    name: identity.name,
+    label: identity.label,
     manufacturerId: identity.manufacturerId,
     productType: identity.productType,
     productId: identity.productId,
