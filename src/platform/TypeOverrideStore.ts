@@ -63,44 +63,73 @@ const isNonEmptyString = (value: unknown): value is string =>
   typeof value === 'string' && value.length > 0;
 
 /**
- * Reports what is wrong with a parsed file, as a sentence the UI can show after its own, or
- * nothing when the file can be used. Anything this
+ * Why a saved file could not be used.
+ *
+ * The store names the fault and stops there. The view turns the code into the sentence a user
+ * reads, and the log keeps the detail, so neither has to take apart a sentence the other wrote.
+ */
+export type StoreErrorCode =
+  | 'permission-denied'
+  | 'unreadable'
+  | 'invalid-json'
+  | 'unsupported-version'
+  | 'wrong-network'
+  | 'invalid-data';
+
+/** A refused file: a code for the view, and a clause the log frame completes into a sentence. */
+interface StoreProblem {
+  code: StoreErrorCode;
+  detail: string;
+}
+
+/** An error as a clause, without the full stop `describeError` ends its sentence with. */
+const clauseOf = (error: unknown): string => describeError(error).replace(/\.$/, '');
+
+const invalidData = (detail: string): StoreProblem => ({ code: 'invalid-data', detail });
+
+/**
+ * Reports what is wrong with a parsed file, or nothing when the file can be used. Anything this
  * rejects leaves the stored file untouched, so a file written by a later version of the plugin,
  * or damaged in place, is never overwritten by this one.
  */
-function findProblem(parsed: unknown, homeId: string): string | undefined {
+function findProblem(parsed: unknown, homeId: string): StoreProblem | undefined {
   if (!isObject(parsed)) {
-    return 'The file does not hold an object.';
+    return invalidData('it does not hold an object');
   }
 
   if (parsed.version !== VERSION) {
-    return `The file is version ${JSON.stringify(parsed.version)}, and this plugin reads version ${VERSION}.`;
+    return {
+      code: 'unsupported-version',
+      detail: `it is version ${JSON.stringify(parsed.version)}, and this plugin reads version ${VERSION}`,
+    };
   }
 
   if (parsed.homeId !== homeId) {
-    return `The file names network ${JSON.stringify(parsed.homeId)}, and this network is ${homeId}.`;
+    return { code: 'wrong-network', detail: `it names network ${JSON.stringify(parsed.homeId)}` };
   }
 
   if (!Array.isArray(parsed.overrides) || !Array.isArray(parsed.observations)) {
-    return 'The file is missing its list of overrides or its list of observations.';
+    return invalidData('it is missing its list of overrides or its list of observations');
   }
 
   const kinds = new Set<string>(PRIMARY_KINDS);
   const seenOverrides = new Set<string>();
   for (const override of parsed.overrides) {
     if (!isObject(override) || !isFingerprint(override.fingerprint)) {
-      return 'An override does not name a device.';
+      return invalidData('an override does not name a device');
     }
     if (typeof override.primaryKind !== 'string' || !kinds.has(override.primaryKind)) {
-      return `An override names the type ${JSON.stringify(override.primaryKind)}, which this plugin does not publish.`;
+      return invalidData(
+        `an override names the type ${JSON.stringify(override.primaryKind)}, which this plugin does not publish`,
+      );
     }
     if (!isNonEmptyString(override.savedAt)) {
-      return 'An override does not record when it was saved.';
+      return invalidData('an override does not record when it was saved');
     }
 
     const key = fingerprintKey(override.fingerprint);
     if (seenOverrides.has(key)) {
-      return 'Two overrides name the same device.';
+      return invalidData('two overrides name the same device');
     }
     seenOverrides.add(key);
   }
@@ -109,30 +138,30 @@ function findProblem(parsed: unknown, homeId: string): string | undefined {
   const seenObservations = new Set<string>();
   for (const observation of parsed.observations) {
     if (!isObject(observation) || !isFingerprint(observation.fingerprint)) {
-      return 'An observation does not name a device.';
+      return invalidData('an observation does not name a device');
     }
     if (!isNonEmptyString(observation.id)) {
-      return 'An observation has no identifier.';
+      return invalidData('an observation has no identifier');
     }
     if (!Number.isInteger(observation.nodeId)) {
-      return 'An observation does not name a node.';
+      return invalidData('an observation does not name a node');
     }
     if (!isNonEmptyString(observation.appliedAt)) {
-      return 'An observation does not record when it was applied.';
+      return invalidData('an observation does not record when it was applied');
     }
     if (observation.orphanedAt !== null && !isNonEmptyString(observation.orphanedAt)) {
-      return 'An observation records an unreadable orphan time.';
+      return invalidData('an observation records an unreadable orphan time');
     }
 
     // Acknowledgement names one record by its identifier, so two records cannot share one.
     if (seenIds.has(observation.id)) {
-      return 'Two observations share an identifier.';
+      return invalidData('two observations share an identifier');
     }
     seenIds.add(observation.id);
 
     const key = `${observation.nodeId}@${fingerprintKey(observation.fingerprint)}`;
     if (seenObservations.has(key)) {
-      return 'Two observations name the same node and device.';
+      return invalidData('two observations name the same node and device');
     }
     seenObservations.add(key);
   }
@@ -171,7 +200,7 @@ export class TypeOverrideStore {
 
   private readonly homeIdHex: string;
   private data: TypeOverrideData;
-  private problem?: string;
+  private problem?: StoreProblem;
   private pending: Promise<unknown> = Promise.resolve();
   private temporaryFiles = 0;
 
@@ -185,9 +214,9 @@ export class TypeOverrideStore {
     this.data = { version: VERSION, homeId: this.homeIdHex, overrides: [], observations: [] };
   }
 
-  /** The reason writes are refused, or nothing when the store is usable. */
-  public get readOnlyReason(): string | undefined {
-    return this.problem;
+  /** Why writes are refused, or nothing when the store is usable. */
+  public get readOnlyCode(): StoreErrorCode | undefined {
+    return this.problem?.code;
   }
 
   public get readOnly(): boolean {
@@ -203,11 +232,18 @@ export class TypeOverrideStore {
     try {
       contents = fs.readFileSync(this.filePath, 'utf8');
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      const errno = (error as NodeJS.ErrnoException).code;
+      if (errno === 'ENOENT') {
         this.log.debug(`No saved type overrides for network ${this.homeIdHex}.`);
         return;
       }
-      this.refuse(`The file could not be read. ${describeError(error)}`);
+
+      // Permission is the one read failure a user can act on, so it is named rather than relayed.
+      this.refuse(
+        errno === 'EACCES' || errno === 'EPERM'
+          ? { code: 'permission-denied', detail: 'permission denied' }
+          : { code: 'unreadable', detail: clauseOf(error) },
+      );
       return;
     }
 
@@ -215,7 +251,7 @@ export class TypeOverrideStore {
     try {
       parsed = JSON.parse(contents);
     } catch (error) {
-      this.refuse(`The file is not readable JSON. ${describeError(error)}`);
+      this.refuse({ code: 'invalid-json', detail: `not valid JSON (${clauseOf(error)})` });
       return;
     }
 
@@ -272,12 +308,17 @@ export class TypeOverrideStore {
     });
   }
 
-  private refuse(problem: string): void {
+  /**
+   * The one place the fault is written out in full. The panel says only that the overrides are
+   * unavailable and sends the reader here, so this names the file even when the fault is in its
+   * contents rather than in reaching it.
+   */
+  private refuse(problem: StoreProblem): void {
     this.problem = problem;
     this.log.error(
-      `Saved type overrides for network ${this.homeIdHex} were not applied. ${problem} ` +
-        'No type override is in effect and none can be saved until this is resolved. ' +
-        `The file was left as it is: ${this.filePath}`,
+      `Could not load saved type overrides for network ${this.homeIdHex} from ${this.filePath}: ` +
+        `${problem.detail}. No overrides were applied, editing is disabled, and the file was ` +
+        'left unchanged.',
     );
   }
 

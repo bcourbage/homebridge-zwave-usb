@@ -27,7 +27,12 @@ import {
 import { MatterAccessories } from '../matter/MatterAccessories';
 import { TypeOverrideResolver, WriteResult } from './TypeOverrideResolver';
 import { DeviceFingerprint, TypeOverrideStore, describeError } from './TypeOverrideStore';
-import { NodeTypePayload, buildNodeTypePayload, summarizeNodeType } from './NodeTypePayload';
+import {
+  NodeTypePayload,
+  NodeTypeSummary,
+  buildNodeTypePayload,
+  summarizeNodeType,
+} from './NodeTypePayload';
 import {
   STATUS_CHAR_UUID,
   PIN_CHAR_UUID,
@@ -107,6 +112,13 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    */
   private readonly matterAccessories = new MatterAccessories(this);
   private discoveryInFlight = new Set<number>();
+
+  /**
+   * Nodes whose last rebuild after a type change failed, with the error, until one succeeds or
+   * the plugin restarts. Held here rather than derived, because the saved decision is what every
+   * other answer is read from, and the saved decision is exactly what these nodes do not publish.
+   */
+  private readonly rebuildFailures = new Map<number, string>();
   private firmwareProgress = new Map<
     number,
     { percent: number; outcome?: 'success' | 'failure' }
@@ -520,7 +532,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           }
         }
 
-        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/clear')) {
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/type/clear') &&
+          method === 'POST'
+        ) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
           readBody((body) =>
             this.writeNodeType(nodeId, (resolver) =>
@@ -534,7 +550,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
-        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/remove')) {
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/type/remove') &&
+          method === 'POST'
+        ) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
           readBody((body) =>
             this.writeNodeType(nodeId, (resolver) =>
@@ -544,7 +564,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
-        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type/acknowledge')) {
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/type/acknowledge') &&
+          method === 'POST'
+        ) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
           readBody((body) =>
             this.writeNodeType(nodeId, (resolver) =>
@@ -783,16 +807,38 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       return undefined;
     }
 
-    return buildNodeTypePayload(resolver, node, { matterActive: this.matterPublishes(nodeId) });
+    return buildNodeTypePayload(resolver, node, {
+      matterActive: this.matterPublishes(nodeId),
+      rebuildFailure: this.rebuildFailures.get(nodeId) ?? null,
+    });
   }
 
   /** What the node table shows about a node's type, which is a summary of the same decision. */
-  private typeSummaryFor(node: IZWaveNode) {
-    const resolver = this.typeOverridesNow();
+  private typeSummaryFor(node: IZWaveNode): NodeTypeSummary {
+    const neutral: NodeTypeSummary = {
+      typeOverride: null,
+      typeInvalid: false,
+      typeOrphans: 0,
+      typeRebuildFailed: false,
+    };
 
-    return resolver
-      ? summarizeNodeType(resolver, node)
-      : { typeOverride: null, typeInvalid: false, typeOrphans: 0 };
+    const resolver = this.typeOverridesNow();
+    if (!resolver) {
+      return neutral;
+    }
+
+    /**
+     * Called per node while the list is built, so a failure here is contained to its own row,
+     * as the battery read beside it is. Deciding what a node could be published as reaches the
+     * node and each of its endpoints, and one node that answers badly would otherwise answer
+     * the whole page with a 500 and leave the table with no rows at all.
+     */
+    try {
+      return summarizeNodeType(resolver, node, this.rebuildFailures.has(node.nodeId));
+    } catch (err) {
+      this.log.debug(`Type [Node ${node.nodeId}]: no summary for the node list: ${err}`);
+      return neutral;
+    }
   }
 
   /**
@@ -815,6 +861,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const { rebuilt, failed } = result.refusal
       ? { rebuilt: [], failed: [] }
       : this.rebuildForTypeChange(result.rebuild);
+
+    // Rebuilding records where the decision landed, and the payload below reports those records.
+    await resolver.settled();
 
     return {
       payload: this.nodeTypePayload(nodeId) ?? null,
@@ -840,25 +889,70 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const rebuilt: number[] = [];
     const failed: { nodeId: number; error: string }[] = [];
 
+    const homeId = this.zwaveController?.homeId;
+
     for (const nodeId of nodeIds) {
       const node = this.zwaveController?.nodes.get(nodeId);
       if (!node) {
         continue;
       }
 
-      const before = this.zwaveAccessories.get(nodeId)?.getGraphSignature();
+      const existing = this.zwaveAccessories.get(nodeId);
+      const before = existing?.getGraphSignature();
+
+      /**
+       * A cohort node the decision does not change is left alone rather than synced and then
+       * compared. The sync reaches `updateNode` and `refresh` on its way past an accessory that
+       * needs no rebuild, and either can throw, which would report a rebuild failure for a node
+       * that was never going to be rebuilt. Planning can throw too, and a plan that cannot be
+       * read is simply no reason to skip, so it falls through to the sync and its own guard.
+       */
+      let planned: string | undefined;
+      try {
+        planned = existing?.isInitialized() ? this.plannedSignature(node, homeId) : undefined;
+      } catch (err) {
+        this.log.debug(`Node ${nodeId}: could not be planned before a rebuild: ${err}`);
+      }
+
+      if (planned !== undefined && planned === before) {
+        // The decision still reaches this node, and the sync is the only other thing that records it.
+        if (homeId) {
+          void this.typeOverridesFor(homeId).observe(node);
+        }
+        this.rebuildFailures.delete(nodeId);
+        continue;
+      }
+
       try {
         this.syncNodeAccessory(node);
         if (this.zwaveAccessories.get(nodeId)?.getGraphSignature() !== before) {
           rebuilt.push(nodeId);
         }
+        this.rebuildFailures.delete(nodeId);
       } catch (err) {
+        const error = describeError(err);
         this.log.error(`Failed to rebuild Node ${nodeId} after a type change: ${err}`);
-        failed.push({ nodeId, error: describeError(err) });
+        this.rebuildFailures.set(nodeId, error);
+        failed.push({ nodeId, error });
       }
     }
 
     return { rebuilt, failed };
+  }
+
+  /**
+   * The graph signature this node would have if it were rebuilt now, or nothing when there is no
+   * network or the node is not ready. Planned exactly as the sync plans it, so that comparing the
+   * two is comparing like with like.
+   */
+  private plannedSignature(node: IZWaveNode, homeId?: number): string | undefined {
+    if (!homeId || !node.ready) {
+      return undefined;
+    }
+
+    return AccessoryFactory.signatureOfPlans(
+      AccessoryFactory.planFeatures(node, this.typeOverridesFor(homeId).planOptionsFor(node)),
+    );
   }
 
   private syncNodeAccessory(node: IZWaveNode) {

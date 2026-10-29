@@ -2616,5 +2616,130 @@ describe('ZWaveUsbPlatform', () => {
         typeOrphans: 0,
       });
     });
+
+    it('leaves an unchanged node alone rather than syncing it and comparing afterwards', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      const unchanged = AccessoryFactory.signatureOfPlans(
+        AccessoryFactory.planFeatures(shadeNode(10), { primaryOverride: 'window-covering' }),
+      );
+      const accessory = published(10, unchanged);
+      accessory.refresh = jest.fn(() => {
+        throw new Error('the device stopped answering');
+      });
+      platform.zwaveAccessories = new Map([[10, accessory]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+
+      const { body } = await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      // The sync reaches these on its way past an accessory it will not replace.
+      expect(accessory.refresh).not.toHaveBeenCalled();
+      expect(accessory.updateNode).not.toHaveBeenCalled();
+      expect(body.rebuilt).toEqual([]);
+      expect(body.failed).toEqual([]);
+    });
+
+    it('answers only once the records the rebuild started have been written', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      // The sync starts the record and does not wait for it, so the reply has to.
+      expect(onDisk().observations).toEqual([
+        expect.objectContaining({ nodeId: 10, fingerprint: FINGERPRINT, orphanedAt: null }),
+      ]);
+    });
+
+    it('keeps the node list whole when one node cannot be summarized', async () => {
+      saved();
+      const unreadable = shadeNode(11);
+      unreadable.getAllEndpoints = () => {
+        throw new Error('the node is still being interviewed');
+      };
+      const platform = newPlatform(
+        new Map([
+          [10, shadeNode(10)],
+          [11, unreadable],
+        ]),
+      );
+
+      const { status, body } = await driveRoute(platform, '/nodes', 'GET');
+
+      expect(status).toBe(200);
+      expect(body.map((row: { nodeId: number }) => row.nodeId)).toEqual([10, 11]);
+      expect(body[1]).toMatchObject({ typeOverride: null, typeInvalid: false, typeOrphans: 0 });
+      expect(platform.log.debug).toHaveBeenCalledWith(
+        expect.stringContaining('no summary for the node list'),
+      );
+    });
+
+    it.each(['/type/clear', '/type/remove', '/type/acknowledge'])(
+      'does not let a GET reach the write behind %s',
+      async (suffix) => {
+        saved([
+          {
+            fingerprint: FINGERPRINT,
+            primaryKind: 'window-covering',
+            savedAt: '2026-10-12T18:20:00Z',
+          },
+        ]);
+        const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+
+        const { status, body } = await driveRoute(platform, `/nodes/10${suffix}`, 'GET');
+
+        expect(status).toBe(404);
+        expect(body.error).toContain('Path not found');
+        expect(onDisk().overrides).toHaveLength(1);
+      },
+    );
+
+    it('keeps reporting a node that could not be rebuilt until one succeeds', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      const write = await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+      expect(write.body.failed).toEqual([{ nodeId: 10, error: 'HomeKit refused the service.' }]);
+
+      /**
+       * Every other field is read from the saved decision, which is the one thing this node is
+       * not publishing, so without the mismatch the next refresh would quietly contradict the
+       * message the write just returned.
+       */
+      const stale = await driveRoute(platform, '/nodes/10/type', 'GET');
+      expect(stale.body.primaryKind).toBe('window-covering');
+      expect(stale.body.rebuildFailure).toEqual({ error: 'HomeKit refused the service.' });
+      expect((await driveRoute(platform, '/nodes', 'GET')).body[0].typeRebuildFailed).toBe(true);
+
+      platform.syncNodeAccessory = real;
+      await driveRoute(platform, '/nodes/10/type/clear', 'POST', {
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision,
+      });
+
+      const healed = await driveRoute(platform, '/nodes/10/type', 'GET');
+      expect(healed.body.rebuildFailure).toBeNull();
+      expect((await driveRoute(platform, '/nodes', 'GET')).body[0].typeRebuildFailed).toBe(false);
+    });
   });
 });

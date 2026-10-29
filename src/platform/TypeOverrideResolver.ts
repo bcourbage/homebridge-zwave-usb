@@ -354,6 +354,17 @@ export class TypeOverrideResolver {
     return this.serialize(() => this.record(node));
   }
 
+  /**
+   * Resolves once everything already queued has run.
+   *
+   * Recording where an override is applied is started by the sync and not waited on, because
+   * publishing a device does not depend on it. A reply that describes the network does depend on
+   * it, so the reply waits here rather than racing the records it has just caused.
+   */
+  public settled(): Promise<void> {
+    return this.commands.then(() => undefined);
+  }
+
   private serialize<T>(task: () => Promise<T>): Promise<T> {
     // What is kept is the settled promise, never the rejected one, so a failed command is
     // waited on by the command behind it but does not refuse it.

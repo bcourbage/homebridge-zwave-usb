@@ -185,20 +185,57 @@ describe('TypeOverrideStore', () => {
       const s = loaded(contents);
 
       expect(s.readOnly).toBe(true);
-      expect(s.readOnlyReason).toEqual(expect.any(String));
+      expect(s.readOnlyCode).toEqual(expect.any(String));
       expect(s.snapshot().overrides).toEqual([]);
       expect(log.error).toHaveBeenCalledTimes(1);
     });
 
-    it('ends every reason as a sentence, so the line it joins reads as one', () => {
-      expect(loaded('{ not json').readOnlyReason).toMatch(/\.$/);
-      expect(loaded({ version: 2 }).readOnlyReason).toMatch(/\.$/);
+    it('names the fault by code, so the panel never reads a sentence', () => {
+      expect(loaded('{ not json').readOnlyCode).toBe('invalid-json');
+      expect(loaded(7).readOnlyCode).toBe('invalid-data');
+      expect(loaded({ ...valid(), version: 2 }).readOnlyCode).toBe('unsupported-version');
+      expect(loaded({ ...valid(), homeId: 'c41b7e59' }).readOnlyCode).toBe('wrong-network');
+      expect(loaded({ ...valid(), overrides: 'no list' }).readOnlyCode).toBe('invalid-data');
+    });
 
-      fs.rmSync(path.join(directory, FILE));
-      fs.mkdirSync(path.join(directory, FILE));
-      const unreadable = store();
-      unreadable.load();
-      expect(unreadable.readOnlyReason).toMatch(/\.$/);
+    it('names a permission failure as its own fault, and relays any other', () => {
+      const throwing = (code: string, message: string) => () => {
+        throw Object.assign(new Error(message), { code });
+      };
+
+      const reading = jest.spyOn(fs, 'readFileSync');
+
+      reading.mockImplementationOnce(throwing('EACCES', 'permission denied, open'));
+      const denied = store();
+      denied.load();
+      expect(denied.readOnlyCode).toBe('permission-denied');
+      expect(log.error.mock.calls[0][0]).toContain(': permission denied.');
+
+      reading.mockImplementationOnce(throwing('EIO', 'EIO: i/o error, read'));
+      const broken = store();
+      broken.load();
+      expect(broken.readOnlyCode).toBe('unreadable');
+      expect(log.error.mock.calls[1][0]).toContain('EIO: i/o error, read.');
+    });
+
+    it('writes the fault, the file and what it did about it as one line', () => {
+      loaded({ ...valid(), version: 2 });
+
+      expect(log.error).toHaveBeenCalledTimes(1);
+      expect(log.error.mock.calls[0][0]).toBe(
+        'Could not load saved type overrides for network e4a1c0f2 from ' +
+          `${path.join(directory, FILE)}: it is version 2, and this plugin reads version 1. ` +
+          'No overrides were applied, editing is disabled, and the file was left unchanged.',
+      );
+    });
+
+    it('names the file even when the fault is in what it holds', () => {
+      loaded({ ...valid(), overrides: [{ fingerprint: shade, primaryKind: 'window-covering' }] });
+
+      expect(log.error.mock.calls[0][0]).toContain(path.join(directory, FILE));
+      expect(log.error.mock.calls[0][0]).toContain(
+        'an override does not record when it was saved.',
+      );
     });
 
     it('refuses a file it cannot read at all', () => {

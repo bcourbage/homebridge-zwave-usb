@@ -62,8 +62,12 @@ describe('node type payload', () => {
     return new TypeOverrideResolver(store, () => nodes, log);
   };
 
-  const payloadFor = (target: IZWaveNode, built = resolver(), matterActive = true) =>
-    buildNodeTypePayload(built, target, { matterActive });
+  const payloadFor = (
+    target: IZWaveNode,
+    built = resolver(),
+    matterActive = true,
+    rebuildFailure: string | null = null,
+  ) => buildNodeTypePayload(built, target, { matterActive, rebuildFailure });
 
   beforeEach(() => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zwave-payload-'));
@@ -85,7 +89,7 @@ describe('node type payload', () => {
         fingerprint: SHADE,
         multiEndpoint: false,
         primaryKind: 'multilevel-switch',
-        endpointKinds: ['multilevel-switch'],
+        endpointTypes: [{ endpointIndex: 0, primaryKind: 'multilevel-switch' }],
         source: 'detected',
         defaultKind: 'multilevel-switch',
         defaultSource: 'detected',
@@ -183,7 +187,7 @@ describe('node type payload', () => {
       // One endpoint publishes one type, so the two readings of it have to agree.
       expect(payloadFor(nodes[0], built)).toMatchObject({
         primaryKind: 'window-covering',
-        endpointKinds: ['window-covering'],
+        endpointTypes: [{ endpointIndex: 0, primaryKind: 'window-covering' }],
       });
     });
 
@@ -238,7 +242,7 @@ describe('node type payload', () => {
         multiEndpoint: true,
         primaryKind: null,
         defaultKind: null,
-        endpointKinds: ['binary-switch'],
+        endpointTypes: [{ endpointIndex: 1, primaryKind: 'binary-switch' }],
         cohort: [],
         options: [],
         cohortRevision: '',
@@ -344,12 +348,31 @@ describe('node type payload', () => {
       const payload = buildNodeTypePayload(
         new TypeOverrideResolver(store, () => nodes, log),
         nodes[0],
-        { matterActive: true },
+        { matterActive: true, rebuildFailure: null },
       );
 
       expect(payload.store.readable).toBe(false);
-      expect(payload.store.error).toEqual(expect.any(String));
+      expect(payload.store.error).toEqual({ code: 'invalid-json' });
       expect(payload).toMatchObject({ source: 'detected', override: null });
+    });
+  });
+
+  describe('a decision this node could not be rebuilt for', () => {
+    it('reports the mismatch beside the saved decision it describes', () => {
+      nodes = [shade({ nodeId: 10 })];
+      const built = resolver([override(SHADE, 'window-covering')]);
+
+      const payload = payloadFor(nodes[0], built, true, 'HomeKit refused the service.');
+
+      // The saved decision is still what every other field reads, which is why this is needed.
+      expect(payload.primaryKind).toBe('window-covering');
+      expect(payload.rebuildFailure).toEqual({ error: 'HomeKit refused the service.' });
+    });
+
+    it('reports no mismatch when the node publishes what was saved', () => {
+      nodes = [shade({ nodeId: 10 })];
+
+      expect(payloadFor(nodes[0]).rebuildFailure).toBeNull();
     });
   });
 
@@ -358,10 +381,11 @@ describe('node type payload', () => {
       nodes = [shade({ nodeId: 10 }), shade({ nodeId: 11 }), shade({ nodeId: 12 })];
       const built = resolver([override(SHADE, 'window-covering')]);
 
-      expect(summarizeNodeType(built, nodes[0])).toEqual({
+      expect(summarizeNodeType(built, nodes[0], false)).toEqual({
         typeOverride: { primaryKind: 'window-covering', sharedWith: [11, 12] },
         typeInvalid: false,
         typeOrphans: 0,
+        typeRebuildFailed: false,
       });
     });
 
@@ -369,7 +393,7 @@ describe('node type payload', () => {
       nodes = [shade({ nodeId: 10 }), node('relay', { nodeId: 11 })];
       const built = resolver([override(SHADE, 'window-covering')]);
 
-      expect(summarizeNodeType(built, nodes[0]).typeOverride).toEqual({
+      expect(summarizeNodeType(built, nodes[0], false).typeOverride).toEqual({
         primaryKind: 'window-covering',
         sharedWith: [],
       });
@@ -379,7 +403,7 @@ describe('node type payload', () => {
       nodes = [shade({ nodeId: 10 }), node('relay', { nodeId: 11 })];
       const built = resolver([override(SHADE, 'window-covering')]);
 
-      expect(summarizeNodeType(built, nodes[1])).toMatchObject({
+      expect(summarizeNodeType(built, nodes[1], false)).toMatchObject({
         typeOverride: null,
         typeInvalid: true,
       });
@@ -396,7 +420,15 @@ describe('node type payload', () => {
         ],
       );
 
-      expect(summarizeNodeType(built, nodes[0]).typeOrphans).toBe(1);
+      expect(summarizeNodeType(built, nodes[0], false).typeOrphans).toBe(1);
+    });
+
+    it('carries the rebuild failure the platform is holding for this node', () => {
+      nodes = [shade({ nodeId: 10 })];
+      const built = resolver([override(SHADE, 'window-covering')]);
+
+      expect(summarizeNodeType(built, nodes[0], true).typeRebuildFailed).toBe(true);
+      expect(summarizeNodeType(built, nodes[0], false).typeRebuildFailed).toBe(false);
     });
   });
 });

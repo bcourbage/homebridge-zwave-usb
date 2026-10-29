@@ -1,7 +1,18 @@
 import { AccessoryFactory, PrimaryKind } from '../accessories/AccessoryFactory';
 import { IZWaveNode } from '../zwave/interfaces';
 import { TypeOverrideResolver, TypeSource } from './TypeOverrideResolver';
-import { DeviceFingerprint, TypeOverride } from './TypeOverrideStore';
+import { DeviceFingerprint, StoreErrorCode, TypeOverride } from './TypeOverrideStore';
+
+/**
+ * One endpoint's published type, named by the endpoint it belongs to.
+ *
+ * The index is carried rather than the position in a list, because an endpoint that publishes
+ * no primary type contributes no entry: after that, position names nothing.
+ */
+export interface EndpointType {
+  endpointIndex: number;
+  primaryKind: PrimaryKind;
+}
 
 /** One node the decision about this hardware reaches. */
 export interface CohortMember {
@@ -43,7 +54,7 @@ export interface NodeTypePayload {
    * is the only reading of what it publishes. The root endpoint of such a device is deliberately
    * left empty by the planner, because its children carry the functions, so it adds no entry.
    */
-  endpointKinds: PrimaryKind[];
+  endpointTypes: EndpointType[];
   source: TypeSource;
   defaultKind: PrimaryKind | null;
   defaultSource: 'registry' | 'detected';
@@ -54,13 +65,22 @@ export interface NodeTypePayload {
   cohortRevision: string;
   invalid: InvalidOverrideReport | null;
   orphans: OrphanReport[];
-  store: { readable: boolean; error: string | null };
+  store: { readable: boolean; error: { code: StoreErrorCode } | null };
+  /**
+   * Set while this node publishes something other than the decision saved for it, because the
+   * rebuild that would have applied it failed. Everything else here describes the saved
+   * decision, so without this the panel would report the new type as published from the next
+   * refresh onwards, having said a moment earlier that it could not be applied.
+   */
+  rebuildFailure: { error: string } | null;
   matterActive: boolean;
 }
 
 /** What the plugin knows about a node that the resolver does not decide. */
 export interface PayloadContext {
   matterActive: boolean;
+  /** The error from the last rebuild of this node, until one succeeds or the plugin restarts. */
+  rebuildFailure: string | null;
 }
 
 const nameOf = (node: IZWaveNode): string => node.name || `Node ${node.nodeId}`;
@@ -73,14 +93,17 @@ const nameOf = (node: IZWaveNode): string => node.name || `Node ${node.nodeId}`;
  * the single endpoint that can carry a decision. A device with several endpoints never carries
  * one, so each of its endpoints publishes what it was detected as.
  */
-const endpointKindsOf = (node: IZWaveNode, published?: PrimaryKind): PrimaryKind[] => {
-  if (node.getAllEndpoints().length === 1) {
-    return published ? [published] : [];
+const endpointTypesOf = (node: IZWaveNode, published?: PrimaryKind): EndpointType[] => {
+  const endpoints = node.getAllEndpoints();
+  if (endpoints.length === 1) {
+    return published ? [{ endpointIndex: endpoints[0].index, primaryKind: published }] : [];
   }
 
-  return AccessoryFactory.planFeatures(node)
-    .map((plan) => plan.primaryKind)
-    .filter((kind): kind is PrimaryKind => kind !== undefined);
+  return AccessoryFactory.planFeatures(node).flatMap((plan) =>
+    plan.primaryKind === undefined
+      ? []
+      : [{ endpointIndex: plan.endpoint.index, primaryKind: plan.primaryKind }],
+  );
 };
 
 /**
@@ -143,7 +166,7 @@ export function buildNodeTypePayload(
     label: node.label || node.deviceConfig?.label || null,
     multiEndpoint: node.getAllEndpoints().length > 1,
     primaryKind: published ?? null,
-    endpointKinds: endpointKindsOf(node, published),
+    endpointTypes: endpointTypesOf(node, published),
     source: resolver.sourceFor(node),
     defaultKind: defaults.kind ?? null,
     defaultSource: defaults.source,
@@ -167,7 +190,11 @@ export function buildNodeTypePayload(
         }
       : null,
     orphans,
-    store: { readable: !resolver.store.readOnly, error: resolver.store.readOnlyReason ?? null },
+    store: {
+      readable: !resolver.store.readOnly,
+      error: resolver.store.readOnlyCode ? { code: resolver.store.readOnlyCode } : null,
+    },
+    rebuildFailure: context.rebuildFailure ? { error: context.rebuildFailure } : null,
     matterActive: context.matterActive,
   };
 }
@@ -177,12 +204,15 @@ export interface NodeTypeSummary {
   typeOverride: { primaryKind: PrimaryKind; sharedWith: number[] } | null;
   typeInvalid: boolean;
   typeOrphans: number;
+  /** Set while the node publishes something other than the decision saved for it. */
+  typeRebuildFailed: boolean;
 }
 
 /** The row-sized view of the same facts, so the table does not fetch a payload per node. */
 export function summarizeNodeType(
   resolver: TypeOverrideResolver,
   node: IZWaveNode,
+  rebuildFailed: boolean,
 ): NodeTypeSummary {
   const applied = resolver.appliedOverrideFor(node);
   const fingerprint = TypeOverrideResolver.fingerprintOf(node);
@@ -201,6 +231,7 @@ export function summarizeNodeType(
         }
       : null,
     typeInvalid: resolver.invalidOverrideFor(node) !== undefined,
+    typeRebuildFailed: rebuildFailed,
     typeOrphans: resolver.store
       .snapshot()
       .observations.filter(
