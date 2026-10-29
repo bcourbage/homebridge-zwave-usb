@@ -873,6 +873,91 @@ describe('node notices', () => {
     ]);
   });
 
+  it('names the type a node is published as, and every node the decision reaches', () => {
+    expect(noticesFor({ typeOverride: { primaryKind: 'window-covering', sharedWith: [] } })).toEqual([
+      { severity: 'info', text: 'Window Covering, overridden for this hardware', link: null },
+    ]);
+    expect(noticesFor({ typeOverride: { primaryKind: 'garage-door', sharedWith: [8] } })).toEqual([
+      {
+        severity: 'info',
+        text: 'Garage Door, overridden for this hardware (also applies to Node 8)',
+        link: null,
+      },
+    ]);
+    expect(
+      noticesFor({ typeOverride: { primaryKind: 'lock', sharedWith: [8, 11] } }),
+    ).toEqual([
+      {
+        severity: 'info',
+        text: 'Lock, overridden for this hardware (also applies to Nodes 8 and 11)',
+        link: null,
+      },
+    ]);
+    expect(
+      noticesFor({ typeOverride: { primaryKind: 'siren', sharedWith: [8, 11, 12] } }),
+    ).toEqual([
+      {
+        severity: 'info',
+        text: 'Siren, overridden for this hardware (also applies to Nodes 8, 11 and 12)',
+        link: null,
+      },
+    ]);
+  });
+
+  it('sends a node whose decision needs looking at to its own page', () => {
+    const review = { href: '#node-5', text: 'Review' };
+
+    expect(noticesFor({ typeInvalid: true })).toEqual([
+      {
+        severity: 'warning',
+        text: 'Saved type override cannot be applied to this device',
+        link: review,
+      },
+    ]);
+    expect(noticesFor({ typeOrphans: 1 })).toEqual([
+      { severity: 'warning', text: 'A saved type override no longer matches this node', link: review },
+    ]);
+    expect(noticesFor({ typeOrphans: 3 })).toEqual([
+      {
+        severity: 'warning',
+        text: '3 saved type overrides no longer match this node',
+        link: review,
+      },
+    ]);
+    expect(
+      noticesFor({
+        typeRebuildFailed: true,
+        typeOverride: { primaryKind: 'window-covering', sharedWith: [] },
+      })[0],
+    ).toEqual({
+      severity: 'warning',
+      text: 'Window Covering is saved for this hardware but is not published here',
+      link: review,
+    });
+  });
+
+  it('says nothing about a type it cannot name', () => {
+    // A node reported as behind a decision that is no longer saved for it has no type to name,
+    // which is the state a failed revert leaves behind.
+    expect(noticesFor({ typeRebuildFailed: true })).toEqual([]);
+  });
+
+  it('reads the worst of the type news first, and the rest in turn', () => {
+    expect(
+      noticesFor({
+        typeOrphans: 2,
+        typeRebuildFailed: true,
+        typeOverride: { primaryKind: 'thermostat', sharedWith: [] },
+        refreshState: 'refreshing',
+      }).map((notice) => notice.text),
+    ).toEqual([
+      '2 saved type overrides no longer match this node',
+      'Thermostat is saved for this hardware but is not published here',
+      'Refresh in progress',
+      'Thermostat, overridden for this hardware',
+    ]);
+  });
+
   it('carries each firmware state with the wording and severity it was given', () => {
     expect(noticesFor({}, 'available', '11.4')).toEqual([
       { severity: 'info', text: 'Firmware update available: v11.4', link: null },

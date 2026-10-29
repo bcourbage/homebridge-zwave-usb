@@ -530,6 +530,106 @@
     failed: { severity: 'error', text: 'Firmware update failed' },
   };
 
+  /** The name of every type a device can be published as. A kind is never shown. */
+  const TYPE_NAMES = {
+    'binary-switch': 'Binary Switch',
+    'multilevel-switch': 'Multilevel Switch',
+    'color-switch': 'Color Switch',
+    'window-covering': 'Window Covering',
+    'garage-door': 'Garage Door',
+    lock: 'Lock',
+    thermostat: 'Thermostat',
+    'motion-sensor': 'Motion Sensor',
+    'contact-sensor': 'Contact Sensor',
+    'leak-sensor': 'Leak Sensor',
+    'smoke-sensor': 'Smoke Sensor',
+    'carbon-monoxide-sensor': 'Carbon Monoxide Sensor',
+    'multilevel-sensor': 'Multilevel Sensor',
+    'central-scene': 'Central Scene',
+    siren: 'Siren',
+  };
+
+  /**
+   * A type's name. A kind the table does not know is title-cased rather than shown as it is
+   * written, so a type added to the plugin before this table reads as a name either way.
+   */
+  function typeName(kind) {
+    if (TYPE_NAMES[kind]) {
+      return TYPE_NAMES[kind];
+    }
+
+    return String(kind || '')
+      .split('-')
+      .filter(Boolean)
+      .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+      .join(' ');
+  }
+
+  /** "8", "8 and 11", "8, 11 and 12". */
+  function listNodeNumbers(nodeIds) {
+    const numbers = (nodeIds || []).map(String);
+    if (numbers.length <= 1) {
+      return numbers.join('');
+    }
+
+    return numbers.slice(0, -1).join(', ') + ' and ' + numbers[numbers.length - 1];
+  }
+
+  /**
+   * What a node's row says about the type it is published as. Each one is its own sentence,
+   * because a node can be behind a decision, carrying one that does not fit, and holding a
+   * record of hardware that changed, all at once.
+   */
+  function describeTypeNotices(node) {
+    const notices = [];
+    const review = { href: `#node-${node.nodeId}`, text: 'Review' };
+
+    if (node.typeInvalid) {
+      notices.push({
+        severity: 'warning',
+        text: 'Saved type override cannot be applied to this device',
+        link: review,
+      });
+    }
+
+    if (node.typeOrphans === 1) {
+      notices.push({
+        severity: 'warning',
+        text: 'A saved type override no longer matches this node',
+        link: review,
+      });
+    } else if (node.typeOrphans > 1) {
+      notices.push({
+        severity: 'warning',
+        text: `${node.typeOrphans} saved type overrides no longer match this node`,
+        link: review,
+      });
+    }
+
+    if (node.typeRebuildFailed && node.typeOverride) {
+      notices.push({
+        severity: 'warning',
+        text: `${typeName(node.typeOverride.primaryKind)} is saved for this hardware but is not published here`,
+        link: review,
+      });
+    }
+
+    if (node.typeOverride) {
+      const shared = node.typeOverride.sharedWith || [];
+      const also =
+        shared.length === 0
+          ? ''
+          : ` (also applies to ${shared.length === 1 ? 'Node' : 'Nodes'} ${listNodeNumbers(shared)})`;
+      notices.push({
+        severity: 'info',
+        text: `${typeName(node.typeOverride.primaryKind)}, overridden for this hardware${also}`,
+        link: null,
+      });
+    }
+
+    return notices;
+  }
+
   /**
    * The sentences shown under a node row, in the order they are to be read. Checking and
    * starting say nothing, because the spinner in the action cell already says it. The text is
@@ -556,6 +656,8 @@
     } else {
       add(lookup(FIRMWARE_NOTICES, state.name));
     }
+
+    describeTypeNotices(node || {}).forEach(add);
 
     return notices.sort(
       (a, b) => SEVERITY_ORDER.indexOf(a.severity) - SEVERITY_ORDER.indexOf(b.severity),
@@ -615,5 +717,8 @@
     describeNodeNotices,
     withoutFirmwareProgress,
     describeBattery,
+    TYPE_NAMES,
+    typeName,
+    listNodeNumbers,
   };
 });
