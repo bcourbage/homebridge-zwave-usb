@@ -3141,5 +3141,61 @@ describe('ZWaveUsbPlatform', () => {
 
       expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
     });
+
+    /**
+     * Whichever path reaches it, HomeKit holds the new service the moment `initialize` returns.
+     * The Matter layer is told afterward and answers for its own bookkeeping; this warning is
+     * only ever about what HomeKit publishes.
+     */
+    it.each([
+      ['a rebuild', () => new Map([[10, published(10, 'before')]])],
+      [
+        'a cached accessory',
+        () =>
+          new Map([
+            [
+              10,
+              {
+                ...published(
+                  10,
+                  AccessoryFactory.signatureOfPlans(
+                    AccessoryFactory.planFeatures(shadeNode(10), {
+                      primaryOverride: 'window-covering',
+                    }),
+                  ),
+                ),
+                isInitialized: () => false,
+              },
+            ],
+          ]),
+      ],
+      ['a first build', () => new Map()],
+    ])('settles the warning when %s publishes and Matter then fails', async (_path, accessories) => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      platform.zwaveAccessories = accessories();
+      (platform.matterAccessories.add as jest.Mock).mockImplementation(() => {
+        throw new Error('the Matter server is not running');
+      });
+      platform.syncNodeAccessory = real;
+      expect(() => platform.syncNodeAccessory(platform.zwaveController.nodes.get(10))).toThrow();
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
   });
 });

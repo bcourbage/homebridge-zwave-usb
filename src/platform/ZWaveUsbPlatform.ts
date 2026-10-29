@@ -999,10 +999,11 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * A node publishing the plan made for this pass is no longer behind the type saved for it,
    * whatever brought it up to date.
    *
-   * Every call below sits after `initialize` rather than after the accessory reaches the map,
-   * because the services an accessory describes do not exist until that call returns. Settling
-   * the warning on the map entry would settle it on the way into a rebuild that then fails,
-   * and nothing outside a write would set it again.
+   * Every call below sits immediately after `initialize`. Before it, the services an accessory
+   * describes do not exist, so the warning would be settled on the way into a rebuild that then
+   * fails, and nothing outside a write would set it again. After the Matter layer is told, the
+   * warning would answer for that layer's bookkeeping as well, and this warning is only ever
+   * about what HomeKit publishes.
    */
   private settleRebuildWarning(nodeId: number): void {
     this.rebuildFailures.delete(nodeId);
@@ -1068,8 +1069,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
           hydratedAccessory.initialize({ removeSupersededServices: true });
-          this.matterAccessories.add(hydratedAccessory);
           this.settleRebuildWarning(node.nodeId);
+          this.matterAccessories.add(hydratedAccessory);
           return;
         }
 
@@ -1086,8 +1087,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           const reconciledAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
-          this.matterAccessories.add(reconciledAccessory);
           this.settleRebuildWarning(node.nodeId);
+          this.matterAccessories.add(reconciledAccessory);
           return;
         }
 
@@ -1125,8 +1126,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
          * classification differed, so the graph is reconciled as part of the first build.
          */
         accessory.initialize({ removeSupersededServices: true });
-        this.matterAccessories.add(accessory);
         this.settleRebuildWarning(node.nodeId);
+        this.matterAccessories.add(accessory);
       } else {
         // A node partway through its interview publishes nothing to be behind or up to date on.
         accessory.refresh();
