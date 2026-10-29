@@ -999,14 +999,31 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * A node publishing the plan made for this pass is no longer behind the type saved for it,
    * whatever brought it up to date.
    *
-   * Every call below sits immediately after `initialize`. Before it, the services an accessory
-   * describes do not exist, so the warning would be settled on the way into a rebuild that then
-   * fails, and nothing outside a write would set it again. After the Matter layer is told, the
-   * warning would answer for that layer's bookkeeping as well, and this warning is only ever
-   * about what HomeKit publishes.
+   * Every call below sits immediately after `initialize`, which is the call that gives the
+   * accessory its services. Before it they do not exist, so the warning would be settled on the
+   * way into a rebuild that then fails, and nothing outside a write would set it again.
    */
   private settleRebuildWarning(nodeId: number): void {
     this.rebuildFailures.delete(nodeId);
+  }
+
+  /**
+   * Offers a built accessory to the Matter layer, which publishes it on its own schedule.
+   *
+   * A failure here is logged and goes no further. HomeKit has the accessory by this point, so
+   * letting the fault out would abort a sync that has already done its work: an event handler
+   * would lose the rest of its pass, and a type write would record a HomeKit rebuild failure,
+   * and warn about one, for a device HomeKit rebuilt.
+   */
+  private offerToMatter(accessory: ZWaveAccessory, nodeId: number): void {
+    try {
+      this.matterAccessories.add(accessory);
+    } catch (err) {
+      this.log.error(
+        `Node ${nodeId}: HomeKit was updated, but the accessory could not be offered to ` +
+          `the Matter layer: ${err}`,
+      );
+    }
   }
 
   private syncNodeAccessory(node: IZWaveNode, plans?: EndpointPlan[]) {
@@ -1070,7 +1087,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
           hydratedAccessory.initialize({ removeSupersededServices: true });
           this.settleRebuildWarning(node.nodeId);
-          this.matterAccessories.add(hydratedAccessory);
+          this.offerToMatter(hydratedAccessory, node.nodeId);
           return;
         }
 
@@ -1088,7 +1105,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
           this.settleRebuildWarning(node.nodeId);
-          this.matterAccessories.add(reconciledAccessory);
+          this.offerToMatter(reconciledAccessory, node.nodeId);
           return;
         }
 
@@ -1127,7 +1144,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
          */
         accessory.initialize({ removeSupersededServices: true });
         this.settleRebuildWarning(node.nodeId);
-        this.matterAccessories.add(accessory);
+        this.offerToMatter(accessory, node.nodeId);
       } else {
         // A node partway through its interview publishes nothing to be behind or up to date on.
         accessory.refresh();

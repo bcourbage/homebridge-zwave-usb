@@ -3144,8 +3144,8 @@ describe('ZWaveUsbPlatform', () => {
 
     /**
      * Whichever path reaches it, HomeKit holds the new service the moment `initialize` returns.
-     * The Matter layer is told afterward and answers for its own bookkeeping; this warning is
-     * only ever about what HomeKit publishes.
+     * Offering the accessory to Matter comes after that and answers for itself: the fault is
+     * logged, the sync finishes, and the warning about what HomeKit publishes is settled.
      */
     it.each([
       ['a rebuild', () => new Map([[10, published(10, 'before')]])],
@@ -3170,7 +3170,7 @@ describe('ZWaveUsbPlatform', () => {
           ]),
       ],
       ['a first build', () => new Map()],
-    ])('settles the warning when %s publishes and Matter then fails', async (_path, accessories) => {
+    ])('finishes a sync when %s publishes and Matter then fails', async (_path, accessories) => {
       saved();
       const platform = newPlatform(new Map([[10, shadeNode(10)]]));
       platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
@@ -3191,9 +3191,38 @@ describe('ZWaveUsbPlatform', () => {
         throw new Error('the Matter server is not running');
       });
       platform.syncNodeAccessory = real;
-      expect(() => platform.syncNodeAccessory(platform.zwaveController.nodes.get(10))).toThrow();
+      platform.syncNodeAccessory(platform.zwaveController.nodes.get(10));
       // The sync starts a record and does not wait for it; nothing else here will either.
       await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect(platform.log.error).toHaveBeenCalledWith(expect.stringContaining('Matter'));
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('reports a write that HomeKit took and Matter did not as the success it is', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      (platform.matterAccessories.add as jest.Mock).mockImplementation(() => {
+        throw new Error('the Matter server is not running');
+      });
+
+      const write = await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * The device publishes the type that was asked for. Reporting the Matter fault here would
+       * tell the user their rebuild failed, and leave a warning saying so, about a device that
+       * was rebuilt.
+       */
+      expect(write.body.rebuilt).toEqual([10]);
+      expect(write.body.failed).toEqual([]);
+      expect(write.body.payload.rebuildFailure).toBeNull();
+      expect(platform.log.error).toHaveBeenCalledWith(expect.stringContaining('Matter'));
 
       expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
     });
