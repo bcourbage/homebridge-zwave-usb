@@ -984,7 +984,6 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         if (this.zwaveAccessories.get(nodeId)?.getGraphSignature() !== before) {
           rebuilt.push(nodeId);
         }
-        this.rebuildFailures.delete(nodeId);
       } catch (err) {
         const error = describeError(err);
         this.log.error(`Failed to rebuild Node ${nodeId} after a type change: ${err}`);
@@ -994,6 +993,19 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     return { rebuilt, failed };
+  }
+
+  /**
+   * A node publishing the plan made for this pass is no longer behind the type saved for it,
+   * whatever brought it up to date.
+   *
+   * Every call below sits after `initialize` rather than after the accessory reaches the map,
+   * because the services an accessory describes do not exist until that call returns. Settling
+   * the warning on the map entry would settle it on the way into a rebuild that then fails,
+   * and nothing outside a write would set it again.
+   */
+  private settleRebuildWarning(nodeId: number): void {
+    this.rebuildFailures.delete(nodeId);
   }
 
   private syncNodeAccessory(node: IZWaveNode, plans?: EndpointPlan[]) {
@@ -1032,10 +1044,16 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     /**
      * However a node came to publish what was planned for it, it is no longer behind the
      * decision saved for it. An ordinary reconcile reaching it in the background settles the
-     * warning as well as a rebuild started from the panel does.
+     * warning as well as a rebuild started from the panel does. A cached accessory answers with
+     * the signature the last run stored for it while its services have yet to be built in this
+     * one, so having been initialized is part of being current.
      */
-    if (graphSignature !== undefined && existing?.getGraphSignature() === graphSignature) {
-      this.rebuildFailures.delete(node.nodeId);
+    if (
+      graphSignature !== undefined &&
+      existing?.isInitialized() &&
+      existing.getGraphSignature() === graphSignature
+    ) {
+      this.settleRebuildWarning(node.nodeId);
     }
     if (existing || this.discoveryInFlight.has(node.nodeId)) {
       if (existing) {
@@ -1049,9 +1067,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           existing.stop();
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
-          this.rebuildFailures.delete(node.nodeId);
           hydratedAccessory.initialize({ removeSupersededServices: true });
           this.matterAccessories.add(hydratedAccessory);
+          this.settleRebuildWarning(node.nodeId);
           return;
         }
 
@@ -1067,9 +1085,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           existing.stop();
           const reconciledAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
-          this.rebuildFailures.delete(node.nodeId);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
           this.matterAccessories.add(reconciledAccessory);
+          this.settleRebuildWarning(node.nodeId);
           return;
         }
 
@@ -1100,7 +1118,6 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       }
       const accessory = AccessoryFactory.create(this, node, homeId, featurePlans());
       this.zwaveAccessories.set(node.nodeId, accessory);
-      this.rebuildFailures.delete(node.nodeId);
 
       if (node.ready) {
         /**
@@ -1109,7 +1126,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
          */
         accessory.initialize({ removeSupersededServices: true });
         this.matterAccessories.add(accessory);
+        this.settleRebuildWarning(node.nodeId);
       } else {
+        // A node partway through its interview publishes nothing to be behind or up to date on.
         accessory.refresh();
       }
     } finally {

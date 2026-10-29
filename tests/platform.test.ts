@@ -2284,6 +2284,20 @@ describe('ZWaveUsbPlatform', () => {
       return platform;
     };
 
+    const buildsButCannotPublish = () =>
+      (AccessoryFactory.create as jest.Mock).mockImplementation(((
+        _platform: unknown,
+        node: any,
+        _homeId: unknown,
+        plans: any,
+      ) => ({
+        ...published(node.nodeId, AccessoryFactory.signatureOfPlans(plans)),
+        isInitialized: () => false,
+        initialize: () => {
+          throw new Error('HomeKit refused the service');
+        },
+      })) as never);
+
     afterEach(() => jest.restoreAllMocks());
 
     it('answers with everything the type panel draws', async () => {
@@ -2929,6 +2943,201 @@ describe('ZWaveUsbPlatform', () => {
         expectedFingerprint: FINGERPRINT,
         expectedRevision: (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision,
       });
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('keeps the warning when the rebuild it is waiting for fails to publish', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * A background reconcile replaces the accessory, and the replacement is in the map before
+       * its services exist. Settling the warning there would settle it on the way into the
+       * rebuild that fails, and nothing outside a write would set it again.
+       */
+      buildsButCannotPublish();
+      platform.syncNodeAccessory = real;
+      expect(() => platform.syncNodeAccessory(platform.zwaveController.nodes.get(10))).toThrow();
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+    });
+
+    it('keeps the warning when a cached accessory only names the plan it has yet to build', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * A restart hands the node back the signature the last run stored for it, which is the
+       * saved type, while the services behind it have yet to be built in this one. The node is
+       * named as current by that signature and rebuilt in the same pass, so reading it alone
+       * would settle the warning for a rebuild that has not happened.
+       */
+      const current = AccessoryFactory.signatureOfPlans(
+        AccessoryFactory.planFeatures(shadeNode(10), { primaryOverride: 'window-covering' }),
+      );
+      platform.zwaveAccessories = new Map([
+        [10, { ...published(10, current), isInitialized: () => false }],
+      ]);
+      buildsButCannotPublish();
+      platform.syncNodeAccessory = real;
+      expect(() => platform.syncNodeAccessory(platform.zwaveController.nodes.get(10))).toThrow();
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+    });
+
+    it('settles the warning when a node with no accessory at all is finally built', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map();
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const factory = (AccessoryFactory.create as jest.Mock).getMockImplementation()!;
+      (AccessoryFactory.create as jest.Mock).mockImplementation((() => {
+        throw new Error('HomeKit refused the service');
+      }) as never);
+
+      /**
+       * The first build of this node threw, so it has a warning and no accessory to its name.
+       * Discovery is the path that reaches it next, and it is the path that answers the warning.
+       */
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+      expect(platform.zwaveAccessories.has(10)).toBe(false);
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+
+      (AccessoryFactory.create as jest.Mock).mockImplementation(factory as never);
+      platform.syncNodeAccessory(platform.zwaveController.nodes.get(10));
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('keeps the warning when a first build reaches the map and fails to publish', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map();
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      (AccessoryFactory.create as jest.Mock).mockImplementation((() => {
+        throw new Error('HomeKit refused the service');
+      }) as never);
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      // Discovery puts the accessory in the map before building its services, as the other two
+      // paths do, so the warning it answers has to wait for the same call to return.
+      buildsButCannotPublish();
+      expect(() => platform.syncNodeAccessory(platform.zwaveController.nodes.get(10))).toThrow();
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+    });
+
+    it('keeps the warning when neither the node nor its accessory names a plan', async () => {
+      saved();
+      const node = shadeNode(10);
+      const platform = newPlatform(new Map([[10, node]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * An accessory cached by a version that stored no signature, on a node too early in its
+       * interview to be planned. Neither side names anything, and two unknowns matching is not
+       * the node having caught up.
+       */
+      platform.zwaveAccessories = new Map([
+        [10, { ...published(10, 'before'), getGraphSignature: () => undefined }],
+      ]);
+      node.ready = false;
+      platform.syncNodeAccessory = real;
+      platform.syncNodeAccessory(node);
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+    });
+
+    it('settles the warning when a later pass builds the accessory the failure left', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const factory = (AccessoryFactory.create as jest.Mock).getMockImplementation()!;
+      buildsButCannotPublish();
+
+      /**
+       * The rebuild got as far as HomeKit and failed there, so the node is left holding an
+       * accessory whose services were never built. The next sync finds it and builds it, which
+       * is the path a cached accessory takes rather than a rebuild, and the warning is answered
+       * there too.
+       */
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+
+      (AccessoryFactory.create as jest.Mock).mockImplementation(factory as never);
+      platform.syncNodeAccessory(platform.zwaveController.nodes.get(10));
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
 
       expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
     });
