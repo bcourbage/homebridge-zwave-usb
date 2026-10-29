@@ -108,24 +108,41 @@
      * without being cut off or adding to the width the table can scroll.
      */
     .tip { position: relative; }
+    /*
+     * Hidden by display rather than by opacity. A tooltip that is invisible but still laid out
+     * counts toward the table's scrollable width, which is the measurement this column has to
+     * pass, so one that is not being read does not exist.
+     */
     .tip::after {
-      content: attr(data-tip); position: absolute; bottom: calc(100% + 6px);
+      content: attr(data-tip); display: none; position: absolute; bottom: calc(100% + 6px);
       left: 50%; transform: translateX(-50%);
       padding: 4px 7px; border-radius: 3px; white-space: nowrap;
-      font-size: 12px; line-height: 1.3; pointer-events: none; opacity: 0; z-index: 5;
+      font-size: 12px; line-height: 1.3; pointer-events: none; z-index: 5;
       background: var(--hb-text-color, #212529); color: var(--hb-background-color, #fff);
       /* A tooltip is a sentence, not a button label. The host stylesheet sets
          text-transform and letter-spacing on .btn, which a pseudo-element inherits. */
       text-transform: none; letter-spacing: normal; font-weight: 400;
     }
-    .tip:hover::after, .tip:focus-visible::after { opacity: 1; }
+    .tip:hover::after, .tip:focus-visible::after { display: block; }
+
+    /* The way into the node, outside the group of things done to it. */
+    .node-action-cell { display: inline-flex; align-items: center; gap: 6px; }
+
+    /*
+     * The two buttons nearest the right edge hang their tooltip from that edge instead of
+     * centering it on the button, which is what put it past the table.
+     */
+    .node-action-cell > .tip:last-child::after,
+    .node-action-cell .btn-group .tip:last-child::after {
+      left: auto; right: 0; transform: none;
+    }
 
     @media (min-width: 576px) {
       #maintenance .table-responsive { overflow: visible; }
     }
     /* Below 576 px the visual tooltip is hidden; the aria-label still carries the name. */
     @media (max-width: 575.98px) {
-      .tip::after { display: none; }
+      .tip::after, .tip:hover::after, .tip:focus-visible::after { display: none; }
     }
 
     #nodeTable th.col-actions, #nodeTable td.node-actions { text-align: right; }
@@ -517,9 +534,9 @@
               `;
         }
 
-        return `<div class="btn-group">${actions.buttons
+        return `<div class="node-action-cell"><div class="btn-group">${actions.buttons
           .map((button) => actionButtonHtml(nodeId, button))
-          .join('')}</div>`;
+          .join('')}</div>${actionButtonHtml(nodeId, actions.open)}</div>`;
       };
 
       const batteryHtml = (battery) => {

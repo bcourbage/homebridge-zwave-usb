@@ -244,6 +244,7 @@
    * would leave the table unreadable on a Homebridge host with no internet access.
    */
   const NODE_ICONS = {
+    open: '<path d="M6 3l5 5-5 5"/>',
     rename: '<path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/><path d="M9.5 4l2.5 2.5"/>',
     refresh: '<path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1"/><path d="M13.5 2v3h-3"/>',
     diagnostics: '<path d="M3 13V10M6.3 13V7.5M9.7 13V5M13 13V2.5"/>',
@@ -502,7 +503,23 @@
       return Object.assign({}, button, { disabled: false, spinner: false });
     });
 
-    return { kind: 'buttons', buttons };
+    /**
+     * The way into the node sits outside the group of things you do to the node, so it reads
+     * as a different kind of action. Its name carries the node number, because a screen reader
+     * meets it out of the row's context.
+     */
+    return {
+      kind: 'buttons',
+      buttons,
+      open: {
+        action: 'open-node',
+        label: `Open node ${node.nodeId}`,
+        variant: 'outline-secondary',
+        icon: 'open',
+        disabled: false,
+        spinner: false,
+      },
+    };
   }
 
   /** Most serious first, so a failure is never read after the routine news below it. */
@@ -554,8 +571,9 @@
    * written, so a type added to the plugin before this table reads as a name either way.
    */
   function typeName(kind) {
-    if (TYPE_NAMES[kind]) {
-      return TYPE_NAMES[kind];
+    const known = lookup(TYPE_NAMES, kind);
+    if (known) {
+      return known;
     }
 
     return String(kind || '')
@@ -606,12 +624,26 @@
       });
     }
 
-    if (node.typeRebuildFailed && node.typeOverride) {
-      notices.push({
-        severity: 'warning',
-        text: `${typeName(node.typeOverride.primaryKind)} is saved for this hardware but is not published here`,
-        link: review,
-      });
+    /**
+     * The warning names the type this node should be publishing. With an override applied to
+     * it that is the override's type. Without one the node belongs on its default, whether
+     * because the override was reverted or because this node cannot take it, and the default
+     * needs no naming here: the node's own page names it.
+     */
+    if (node.typeRebuildFailed) {
+      notices.push(
+        node.typeOverride
+          ? {
+              severity: 'warning',
+              text: `${typeName(node.typeOverride.primaryKind)} is saved for this hardware but is not published here`,
+              link: review,
+            }
+          : {
+              severity: 'warning',
+              text: 'The default device type could not be restored',
+              link: review,
+            },
+      );
     }
 
     if (node.typeOverride) {

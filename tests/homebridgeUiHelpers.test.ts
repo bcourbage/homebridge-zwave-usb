@@ -13,6 +13,7 @@ const { describeHealStart, healIsRunning,
   nextFirmwareRecord,
   describeNodeActions,
   describeNodeNotices,
+  typeName,
   withoutFirmwareProgress,
   describeBattery,
 } = require('../homebridge-ui/public/ui-helpers.js');
@@ -783,6 +784,23 @@ describe('node action cell', () => {
     });
   });
 
+  it('offers a way into every node but the controller, named for that node', () => {
+    expect(actionsFor(null, undefined, { nodeId: 7 }).open).toEqual({
+      action: 'open-node',
+      label: 'Open node 7',
+      variant: 'outline-secondary',
+      icon: 'open',
+      disabled: false,
+      spinner: false,
+    });
+
+    // It sits beside the group rather than in it, so it is not one of the things done to a node.
+    expect(
+      actionsFor(null, undefined, { nodeId: 7 }).buttons.map((b: any) => b.action),
+    ).not.toContain('open-node');
+    expect(describeNodeActions(node({ nodeId: 1 }), { name: 'idle' }).open).toBeUndefined();
+  });
+
   it('marks Refresh Info for the devices that have to be woken first', () => {
     const sleeping = actionsFor(null, undefined, { isListening: false, isFrequentListening: false });
     const awake = actionsFor(null, undefined, { isListening: true });
@@ -807,7 +825,8 @@ describe('node action cell', () => {
 
   it('an available update turns the same slot into a green Update button', () => {
     const result = actionsFor('available', '11.4');
-    const slot = result.buttons[3];
+    // The same slot, found by what it is rather than by where it sits in the group.
+    const slot = result.buttons.find((b: any) => b.icon === 'update');
 
     expect(slot).toMatchObject({
       action: 'start-update',
@@ -936,10 +955,23 @@ describe('node notices', () => {
     });
   });
 
-  it('says nothing about a type it cannot name', () => {
-    // A node reported as behind a decision that is no longer saved for it has no type to name,
-    // which is the state a failed revert leaves behind.
-    expect(noticesFor({ typeRebuildFailed: true })).toEqual([]);
+  it('reports a default that could not be restored without naming it', () => {
+    // A node with no override applied belongs on its default, whether the override was
+    // reverted or this node cannot take it. Its own page is where the default is named.
+    expect(noticesFor({ typeRebuildFailed: true })).toEqual([
+      {
+        severity: 'warning',
+        text: 'The default device type could not be restored',
+        link: { href: '#node-5', text: 'Review' },
+      },
+    ]);
+  });
+
+  it('does not take a type name from the object prototype', () => {
+    for (const kind of ['constructor', 'toString', 'hasOwnProperty']) {
+      expect(typeof typeName(kind)).toBe('string');
+    }
+    expect(typeName('constructor')).toBe('Constructor');
   });
 
   it('reads the worst of the type news first, and the rest in turn', () => {
@@ -1305,13 +1337,32 @@ describe('management page integration', () => {
     expect(html).toMatch(/\.tip::after\s*\{[^}]*letter-spacing:\s*normal/);
   });
 
-  it('centers every tooltip on its own button, with no button singled out', () => {
-    // One rule for all five; the last button no longer anchors its tooltip differently.
+  it('centers a tooltip on its button, except where that would reach past the table', () => {
     const html = readPage();
 
     expect(html).toMatch(/\.tip::after\s*\{[^}]*left:\s*50%/);
     expect(html).toMatch(/\.tip::after\s*\{[^}]*transform:\s*translateX\(-50%\)/);
-    expect(html).not.toContain(':last-child::after');
+
+    // The way in, and the last of the group beside it, hang theirs from the right edge.
+    expect(html).toMatch(
+      /\.node-action-cell > \.tip:last-child::after,\s*\.node-action-cell \.btn-group \.tip:last-child::after\s*\{[^}]*right:\s*0/,
+    );
+  });
+
+  it('keeps a tooltip out of the layout until it is read', () => {
+    /**
+     * An invisible tooltip that is still laid out counts toward the table's scrollable width,
+     * which is the measurement the action column has to pass, so hiding one by opacity alone
+     * puts the column over the limit while showing nothing.
+     */
+    const html = readPage();
+
+    expect(html).toMatch(/\.tip::after\s*\{[^}]*display:\s*none/);
+    expect(html).not.toMatch(/\.tip::after\s*\{[^}]*opacity:/);
+    expect(html).toMatch(/\.tip:hover::after,\s*\.tip:focus-visible::after\s*\{\s*display:\s*block/);
+    expect(html).toMatch(
+      /max-width: 575\.98px\)\s*\{\s*\.tip::after,\s*\.tip:hover::after,\s*\.tip:focus-visible::after\s*\{\s*display:\s*none/,
+    );
   });
 
   it('stops the settings modal lending its own tooltip to anything on the page', () => {
