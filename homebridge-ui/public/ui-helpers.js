@@ -466,12 +466,28 @@
       return { kind: 'controller' };
     }
 
+    /**
+     * The way into the node sits outside the group of things you do to the node, so it reads
+     * as a different kind of action, and it is offered whatever else the node is doing. A node
+     * in the middle of a firmware update is one a reader is more likely to want to look at,
+     * not less.
+     */
+    const open = {
+      action: 'open-node',
+      label: `Open node ${node.nodeId}`,
+      variant: 'outline-secondary',
+      icon: 'open',
+      disabled: false,
+      spinner: false,
+    };
+
     if (state.name === 'updating' || state.name === 'completed' || state.name === 'failed') {
       const reported = Math.round(Number(state.percent));
       return {
         kind: 'progress',
         percent: Number.isFinite(reported) ? Math.min(100, Math.max(0, reported)) : 0,
         failed: state.name === 'failed',
+        open,
       };
     }
 
@@ -503,23 +519,7 @@
       return Object.assign({}, button, { disabled: false, spinner: false });
     });
 
-    /**
-     * The way into the node sits outside the group of things you do to the node, so it reads
-     * as a different kind of action. Its name carries the node number, because a screen reader
-     * meets it out of the row's context.
-     */
-    return {
-      kind: 'buttons',
-      buttons,
-      open: {
-        action: 'open-node',
-        label: `Open node ${node.nodeId}`,
-        variant: 'outline-secondary',
-        icon: 'open',
-        disabled: false,
-        spinner: false,
-      },
-    };
+    return { kind: 'buttons', buttons, open };
   }
 
   /** Most serious first, so a failure is never read after the routine news below it. */
@@ -546,6 +546,30 @@
     completed: { severity: 'info', text: 'Firmware update completed' },
     failed: { severity: 'error', text: 'Firmware update failed' },
   };
+
+  /** What a node reports about itself, in the order a Z-Wave controller numbers them. */
+  const NODE_STATUS = ['Unknown', 'Asleep', 'Awake', 'Dead', 'Alive'];
+
+  /**
+   * What a node's own page says about it above everything else: who it is, whether it is
+   * answering, and whether it can be reached without waiting for it to wake.
+   */
+  function describeNodeHeader(node) {
+    const status = NODE_STATUS[node.status] || 'Unknown';
+
+    return {
+      name: node.name || node.label || `Node ${node.nodeId}`,
+      nodeId: node.nodeId,
+      status,
+      statusTone: status === 'Alive' || status === 'Awake' ? 'success' : 'secondary',
+      firmware: node.firmwareVersion ? `Firmware ${node.firmwareVersion}` : 'Firmware unknown',
+      listening: node.isListening
+        ? 'Always listening'
+        : node.isFrequentListening
+          ? 'Listens frequently'
+          : 'Sleeps between reports',
+    };
+  }
 
   /** The name of every type a device can be published as. A kind is never shown. */
   const TYPE_NAMES = {
@@ -749,6 +773,8 @@
     describeNodeNotices,
     withoutFirmwareProgress,
     describeBattery,
+    NODE_STATUS,
+    describeNodeHeader,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

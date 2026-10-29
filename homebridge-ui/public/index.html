@@ -147,6 +147,15 @@
 
     #nodeTable th.col-actions, #nodeTable td.node-actions { text-align: right; }
 
+    /* A node's own page, which replaces the table rather than sitting beside it. */
+    .node-detail-back { display: inline-block; margin-bottom: 12px; }
+    .node-detail-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+    .node-detail-head h5 { margin: 0; }
+    .node-detail-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+      margin-top: 6px; font-size: 85%; }
+    .node-detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 14px 0 4px; }
+    .node-detail-actions .ico { margin-right: 5px; vertical-align: -2px; }
+
     /* The gap the paired buttons in this page's dialogs already sit at. */
     .maintenance-actions { gap: 0.5rem; }
     .modal-actions { margin-top: 1rem; display: flex; justify-content: flex-end; gap: 0.5rem; }
@@ -306,7 +315,7 @@
 
       <!-- Maintenance Tab -->
       <div class="tab-pane fade" id="maintenance" role="tabpanel">
-        <div class="card card-body">
+        <div class="card card-body" id="nodeList">
           <h5>Z-Wave Node Maintenance</h5>
           <p class="text-muted small">
             View and manage your Z-Wave nodes. Check for official firmware updates via Z-Wave JS Service.
@@ -349,6 +358,11 @@
               </tbody>
             </table>
           </div>
+        </div>
+
+        <div class="card card-body" id="nodeDetail" style="display: none;" title="">
+          <a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>
+          <div id="nodeDetailHeader"></div>
         </div>
       </div>
     </div>
@@ -526,10 +540,14 @@
 
         if (actions.kind === 'progress') {
           return `
-                <div class="progress" style="height: 20px;">
-                  <div class="progress-bar progress-bar-striped progress-bar-animated${
-                    actions.failed ? ' bg-danger' : ''
-                  }" role="progressbar" style="width: ${actions.percent}%">${actions.percent}%</div>
+                <div class="node-action-cell">
+                  <div class="progress" style="height: 20px; flex: 1;">
+                    <div class="progress-bar progress-bar-striped progress-bar-animated${
+                      actions.failed ? ' bg-danger' : ''
+                    }" role="progressbar" style="width: ${actions.percent}%">${
+                      actions.percent
+                    }%</div>
+                  </div>${actionButtonHtml(nodeId, actions.open)}
                 </div>
               `;
         }
@@ -606,6 +624,90 @@
 
       const rerenderNodes = () => renderNodes(lastNodes);
 
+      /** The node whose own page is open, or null while the list is showing. */
+      let detailNodeId = null;
+
+      /**
+       * A labeled button for the node's page. It carries the same action class and node number
+       * the list's icon buttons do, so one handler answers for both.
+       */
+      const detailButtonHtml = (nodeId, button) => {
+        const body = button.spinner
+          ? '<span class="spinner-border spinner-border-sm" role="status"></span>'
+          : `${iconSvg(button.icon)}${uiHelpers.escapeHtml(button.label)}`;
+
+        return `<button type="button" class="btn btn-sm btn-${button.variant} ${
+          button.action
+        }" data-nodeid="${nodeId}"${
+          button.action === 'refresh-node-info'
+            ? ` data-requires-wakeup="${button.requiresWakeup}"`
+            : ''
+        }${button.disabled ? ' disabled' : ''} title="">${body}</button>`;
+      };
+
+      const renderNodeDetail = () => {
+        const node = lastNodes.find((n) => String(n.nodeId) === String(detailNodeId));
+        const host = document.getElementById('nodeDetailHeader');
+        if (!host) return;
+
+        if (!node) {
+          // Requirement: a node that leaves the network while its page is open says so here
+          // rather than leaving the page describing something that is gone.
+          host.innerHTML =
+            '<p class="small text-muted">This node is no longer in the network.</p>';
+          return;
+        }
+
+        const head = uiHelpers.describeNodeHeader(node);
+        const firmwareState = uiHelpers.firmwareStateOf(
+          node,
+          firmwareRecords.get(String(node.nodeId)),
+        );
+        const actions = uiHelpers.describeNodeActions(node, firmwareState);
+        const buttons = actions.kind === 'buttons' ? actions.buttons : [];
+        const rename = buttons.find((b) => b.action === 'rename-node');
+        const labeled = buttons.filter((b) =>
+          ['refresh-node-info', 'check-update', 'start-update', 'remove-node'].includes(b.action),
+        );
+
+        host.innerHTML = `
+          <div class="node-detail-head">
+            <h5 id="node-name-${node.nodeId}">${uiHelpers.escapeHtml(head.name)}</h5>
+            ${rename ? actionButtonHtml(node.nodeId, rename) : ''}
+          </div>
+          <div class="node-detail-facts">
+            <span class="text-muted">Node ${node.nodeId}</span>
+            <span class="badge badge-${head.statusTone}">${head.status}</span>
+            <span class="text-muted">${uiHelpers.escapeHtml(head.firmware)}</span>
+            <span class="text-muted">${uiHelpers.escapeHtml(head.listening)}</span>
+          </div>
+          ${
+            actions.kind === 'progress'
+              ? `<div class="progress mt-3" style="height: 20px;"><div class="progress-bar progress-bar-striped progress-bar-animated${
+                  actions.failed ? ' bg-danger' : ''
+                }" role="progressbar" style="width: ${actions.percent}%">${
+                  actions.percent
+                }%</div></div>`
+              : `<div class="node-detail-actions">${labeled
+                  .map((button) => detailButtonHtml(node.nodeId, button))
+                  .join('')}</div>`
+          }
+        `;
+      };
+
+      const openNodeDetail = (nodeId) => {
+        detailNodeId = String(nodeId);
+        document.getElementById('nodeList').style.display = 'none';
+        document.getElementById('nodeDetail').style.display = '';
+        renderNodeDetail();
+      };
+
+      const closeNodeDetail = () => {
+        detailNodeId = null;
+        document.getElementById('nodeDetail').style.display = 'none';
+        document.getElementById('nodeList').style.display = '';
+      };
+
       const loadNodes = async () => {
         if (isPromptOpen) return;
         try {
@@ -630,6 +732,7 @@
 
           lastNodes = nodes;
           renderNodes(nodes);
+          if (detailNodeId !== null) renderNodeDetail();
         } catch (err) {
           const tbody = document.getElementById('nodeTableBody');
           if (tbody) {
@@ -657,13 +760,22 @@
         activeMaintenanceAction = null;
       };
 
-      // Event Delegation for Table Actions (Rename & Firmware)
-      document.getElementById('nodeTableBody').addEventListener('click', async (e) => {
+      /**
+       * One handler for both places a node's actions are offered. The list and the node's own
+       * page render the same buttons from the same description, so neither needs its own copy
+       * of what the buttons do.
+       */
+      const handleNodeAction = async (e) => {
         const target = e.target.closest('button');
         if (!target) return;
 
         const nodeId = target.getAttribute('data-nodeid');
         if (!nodeId) return;
+
+        if (target.classList.contains('open-node')) {
+          openNodeDetail(nodeId);
+          return;
+        }
 
         // 1. Rename Logic
         if (target.classList.contains('rename-node')) {
@@ -770,6 +882,22 @@
               : `${warning} Proceed?`;
           showModal('confirmModal');
         }
+      };
+
+      document.getElementById('nodeTableBody').addEventListener('click', handleNodeAction);
+      document.getElementById('nodeDetail').addEventListener('click', handleNodeAction);
+
+      document.getElementById('backToNodes').addEventListener('click', (e) => {
+        e.preventDefault();
+        closeNodeDetail();
+      });
+
+      // A notice that asks the reader to review a node sends them to that node's own page.
+      document.getElementById('nodeTableBody').addEventListener('click', (e) => {
+        const link = e.target.closest('a[href^="#node-"]');
+        if (!link) return;
+        e.preventDefault();
+        openNodeDetail(link.getAttribute('href').slice('#node-'.length));
       });
 
       /**

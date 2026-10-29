@@ -801,6 +801,18 @@ describe('node action cell', () => {
     expect(describeNodeActions(node({ nodeId: 1 }), { name: 'idle' }).open).toBeUndefined();
   });
 
+  it('offers the way in while a firmware update is running', () => {
+    // The row shows progress in place of the group, and a node being updated is one a reader
+    // is more likely to want to look at, not less.
+    const updating = describeNodeActions(
+      node({ nodeId: 7 }),
+      firmwareStateOf(node({ nodeId: 7, firmwareProgress: { percent: 40 } }), null),
+    ) as any;
+
+    expect(updating.kind).toBe('progress');
+    expect(updating.open).toMatchObject({ action: 'open-node', label: 'Open node 7' });
+  });
+
   it('marks Refresh Info for the devices that have to be woken first', () => {
     const sleeping = actionsFor(null, undefined, { isListening: false, isFrequentListening: false });
     const awake = actionsFor(null, undefined, { isListening: true });
@@ -839,8 +851,13 @@ describe('node action cell', () => {
   });
 
   it('a running, finished or failed update replaces the group with a progress bar', () => {
-    const bar = (progress: Record<string, unknown>) =>
-      describeNodeActions(node(), firmwareStateOf(node({ firmwareProgress: progress }), null));
+    const bar = (progress: Record<string, unknown>) => {
+      const { open, ...rest } = describeNodeActions(
+        node(),
+        firmwareStateOf(node({ firmwareProgress: progress }), null),
+      ) as any;
+      return rest;
+    };
 
     expect(bar({ percent: 37.5 })).toEqual({ kind: 'progress', percent: 38, failed: false });
     expect(bar({ percent: 100, outcome: 'success' })).toEqual({
