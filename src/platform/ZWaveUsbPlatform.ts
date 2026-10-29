@@ -26,7 +26,12 @@ import {
 } from '../zwave/coveringController';
 import { MatterAccessories } from '../matter/MatterAccessories';
 import { TypeOverrideResolver, WriteResult } from './TypeOverrideResolver';
-import { DeviceFingerprint, TypeOverrideStore, describeError } from './TypeOverrideStore';
+import {
+  DeviceFingerprint,
+  TypeOverrideStore,
+  describeError,
+  fingerprintKey,
+} from './TypeOverrideStore';
 import {
   NodeTypePayload,
   NodeTypeSummary,
@@ -114,11 +119,15 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   private discoveryInFlight = new Set<number>();
 
   /**
-   * Nodes whose last rebuild after a type change failed, with the error, until one succeeds or
-   * the plugin restarts. Held here rather than derived, because the saved decision is what every
-   * other answer is read from, and the saved decision is exactly what these nodes do not publish.
+   * Nodes whose last rebuild after a type change failed, until one succeeds or the plugin
+   * restarts. Held here rather than derived, because the saved decision is what every other
+   * answer is read from, and the saved decision is exactly what these nodes do not publish.
+   *
+   * Each record names the hardware it was written for as well as the node number, because
+   * Z-Wave hands a freed number to the next device to join, and that device has not failed
+   * at anything.
    */
-  private readonly rebuildFailures = new Map<number, string>();
+  private readonly rebuildFailures = new Map<number, { error: string; fingerprint: string | null }>();
   private firmwareProgress = new Map<
     number,
     { percent: number; outcome?: 'success' | 'failure' }
@@ -799,6 +808,34 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     return accessory ? this.matterAccessories.publishes(accessory.platformAccessory.UUID) : false;
   }
 
+  /** This node's hardware as the records name it, or none when it has not reported any. */
+  private fingerprintKeyOf(node: IZWaveNode): string | null {
+    const fingerprint = TypeOverrideResolver.fingerprintOf(node);
+
+    return fingerprint ? fingerprintKey(fingerprint) : null;
+  }
+
+  /**
+   * The error from this node's last failed rebuild, while the record still describes the device
+   * that is there now. A node that cannot be read cannot be shown to be a different device, so
+   * its record stands rather than being discarded on a reading that failed.
+   */
+  private rebuildFailureFor(node: IZWaveNode): string | null {
+    const failure = this.rebuildFailures.get(node.nodeId);
+    if (!failure) {
+      return null;
+    }
+
+    let current = failure.fingerprint;
+    try {
+      current = this.fingerprintKeyOf(node);
+    } catch (err) {
+      this.log.debug(`Node ${node.nodeId}: hardware unreadable for its rebuild record: ${err}`);
+    }
+
+    return current === failure.fingerprint ? failure.error : null;
+  }
+
   /** Everything the node's type panel draws, or none when the node has left the network. */
   public nodeTypePayload(nodeId: number): NodeTypePayload | undefined {
     const node = this.zwaveController?.nodes.get(nodeId);
@@ -809,17 +846,22 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
 
     return buildNodeTypePayload(resolver, node, {
       matterActive: this.matterPublishes(nodeId),
-      rebuildFailure: this.rebuildFailures.get(nodeId) ?? null,
+      rebuildFailure: this.rebuildFailureFor(node),
     });
   }
 
   /** What the node table shows about a node's type, which is a summary of the same decision. */
   private typeSummaryFor(node: IZWaveNode): NodeTypeSummary {
+    /**
+     * Read before anything that can fail, because this comes from the platform's own record
+     * rather than from classifying the node. A node too broken to summarize is exactly the one
+     * whose accessory is most likely to be behind its saved decision.
+     */
     const neutral: NodeTypeSummary = {
       typeOverride: null,
       typeInvalid: false,
       typeOrphans: 0,
-      typeRebuildFailed: false,
+      typeRebuildFailed: this.rebuildFailureFor(node) !== null,
     };
 
     const resolver = this.typeOverridesNow();
@@ -834,7 +876,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
      * the whole page with a 500 and leave the table with no rows at all.
      */
     try {
-      return summarizeNodeType(resolver, node, this.rebuildFailures.has(node.nodeId));
+      return summarizeNodeType(resolver, node, neutral.typeRebuildFailed);
     } catch (err) {
       this.log.debug(`Type [Node ${node.nodeId}]: no summary for the node list: ${err}`);
       return neutral;
@@ -901,16 +943,30 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       const before = existing?.getGraphSignature();
 
       /**
-       * A cohort node the decision does not change is left alone rather than synced and then
-       * compared. The sync reaches `updateNode` and `refresh` on its way past an accessory that
-       * needs no rebuild, and either can throw, which would report a rebuild failure for a node
-       * that was never going to be rebuilt. Planning can throw too, and a plan that cannot be
-       * read is simply no reason to skip, so it falls through to the sync and its own guard.
+       * One reading of the node, which both decides whether anything changes and builds the
+       * accessory when it does. Planning here and again inside the sync would compare one
+       * reading of a node and build from another, which is the inconsistency the shared plan
+       * exists to prevent.
+       *
+       * A cohort node the decision does not change is then left alone rather than synced and
+       * compared afterwards. The sync reaches `updateNode` and `refresh` on its way past an
+       * accessory it will not replace, and either can throw, which would report a rebuild
+       * failure for a node that was never going to be rebuilt. Planning can throw too, and a
+       * plan that cannot be read is no reason to skip, so it falls through to the sync and the
+       * guard around it.
        */
+      let plans: EndpointPlan[] | undefined;
       let planned: string | undefined;
       try {
-        planned = existing?.isInitialized() ? this.plannedSignature(node, homeId) : undefined;
+        if (homeId && node.ready) {
+          const overrides = this.typeOverridesFor(homeId);
+          plans = AccessoryFactory.planFeatures(node, overrides.planOptionsFor(node));
+          planned = existing?.isInitialized()
+            ? AccessoryFactory.signatureOfPlans(plans)
+            : undefined;
+        }
       } catch (err) {
+        plans = undefined;
         this.log.debug(`Node ${nodeId}: could not be planned before a rebuild: ${err}`);
       }
 
@@ -924,7 +980,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       }
 
       try {
-        this.syncNodeAccessory(node);
+        this.syncNodeAccessory(node, plans);
         if (this.zwaveAccessories.get(nodeId)?.getGraphSignature() !== before) {
           rebuilt.push(nodeId);
         }
@@ -932,7 +988,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       } catch (err) {
         const error = describeError(err);
         this.log.error(`Failed to rebuild Node ${nodeId} after a type change: ${err}`);
-        this.rebuildFailures.set(nodeId, error);
+        this.rebuildFailures.set(nodeId, { error, fingerprint: this.fingerprintKeyOf(node) });
         failed.push({ nodeId, error });
       }
     }
@@ -940,22 +996,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     return { rebuilt, failed };
   }
 
-  /**
-   * The graph signature this node would have if it were rebuilt now, or nothing when there is no
-   * network or the node is not ready. Planned exactly as the sync plans it, so that comparing the
-   * two is comparing like with like.
-   */
-  private plannedSignature(node: IZWaveNode, homeId?: number): string | undefined {
-    if (!homeId || !node.ready) {
-      return undefined;
-    }
-
-    return AccessoryFactory.signatureOfPlans(
-      AccessoryFactory.planFeatures(node, this.typeOverridesFor(homeId).planOptionsFor(node)),
-    );
-  }
-
-  private syncNodeAccessory(node: IZWaveNode) {
+  private syncNodeAccessory(node: IZWaveNode, plans?: EndpointPlan[]) {
     // Skip Node 1 (the controller itself) as it's handled by ControllerAccessory
     if (Number(node.nodeId) === 1) {
       this.log.info(
@@ -979,7 +1020,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const typeOverrides = this.typeOverridesFor(homeId);
     void typeOverrides.observe(node);
 
-    let planned: EndpointPlan[] | undefined;
+    let planned: EndpointPlan[] | undefined = plans;
     const featurePlans = () =>
       (planned ??= AccessoryFactory.planFeatures(node, typeOverrides.planOptionsFor(node)));
     const graphSignature = node.ready
@@ -987,6 +1028,15 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       : undefined;
 
     const existing = this.zwaveAccessories.get(node.nodeId);
+
+    /**
+     * However a node came to publish what was planned for it, it is no longer behind the
+     * decision saved for it. An ordinary reconcile reaching it in the background settles the
+     * warning as well as a rebuild started from the panel does.
+     */
+    if (graphSignature !== undefined && existing?.getGraphSignature() === graphSignature) {
+      this.rebuildFailures.delete(node.nodeId);
+    }
     if (existing || this.discoveryInFlight.has(node.nodeId)) {
       if (existing) {
         if (node.ready && !existing.isInitialized()) {
@@ -999,6 +1049,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           existing.stop();
           const hydratedAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
+          this.rebuildFailures.delete(node.nodeId);
           hydratedAccessory.initialize({ removeSupersededServices: true });
           this.matterAccessories.add(hydratedAccessory);
           return;
@@ -1016,6 +1067,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           existing.stop();
           const reconciledAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
           this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
+          this.rebuildFailures.delete(node.nodeId);
           reconciledAccessory.initialize({ pruneUnmanagedServices: true });
           this.matterAccessories.add(reconciledAccessory);
           return;
@@ -1048,6 +1100,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       }
       const accessory = AccessoryFactory.create(this, node, homeId, featurePlans());
       this.zwaveAccessories.set(node.nodeId, accessory);
+      this.rebuildFailures.delete(node.nodeId);
 
       if (node.ready) {
         /**
@@ -1559,13 +1612,17 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const remaining = this.accessories.filter((accessory) => !staleUuids.has(accessory.UUID));
     this.accessories.length = 0;
     this.accessories.push(...remaining);
-    staleNodeIds.forEach((nodeId) => this.zwaveAccessories.delete(nodeId));
+    staleNodeIds.forEach((nodeId) => {
+      this.zwaveAccessories.delete(nodeId);
+      this.rebuildFailures.delete(nodeId);
+    });
 
     return staleAccessories.length;
   }
 
   private handleNodeRemoved(node: IZWaveNode) {
     this.refreshStates.delete(node.nodeId);
+    this.rebuildFailures.delete(node.nodeId);
     this.log.info(`Node ${node.nodeId} removed`);
 
     const homeId = this.zwaveController?.homeId;

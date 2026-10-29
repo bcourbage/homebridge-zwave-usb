@@ -2741,5 +2741,196 @@ describe('ZWaveUsbPlatform', () => {
       expect(healed.body.rebuildFailure).toBeNull();
       expect((await driveRoute(platform, '/nodes', 'GET')).body[0].typeRebuildFailed).toBe(false);
     });
+
+    it('builds a changed node from the plan it was compared against', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const handed: unknown[] = [];
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = (node: any, plans: any) => {
+        handed.push(plans);
+        return real(node, plans);
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * Planning answers with a new array every time, so the accessory can only hold the object
+       * the comparison used if that one object was carried through rather than read again.
+       */
+      expect(handed[0]).toBeDefined();
+      expect((AccessoryFactory.create as jest.Mock).mock.calls.at(-1)?.[3]).toBe(handed[0]);
+    });
+
+    it('settles the warning when an ordinary sync brings the node up to date', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+
+      // Nothing about the type is written here. The node simply catches up on its own.
+      platform.syncNodeAccessory = real;
+      platform.syncNodeAccessory(platform.zwaveController.nodes.get(10));
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('does not hand a node number the warning left by the device before it', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      // Z-Wave hands a freed number to the next device to join, and that device failed at nothing.
+      const successor = buildNode(
+        REALISTIC_DEVICES.find((c) => c.name === 'covering (Multilevel Switch only)')!,
+        { nodeId: 10, manufacturerId: 99, productType: 7, productId: 3 },
+      );
+      platform.zwaveController.nodes = new Map([[10, successor]]);
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+      expect((await driveRoute(platform, '/nodes', 'GET')).body[0].typeRebuildFailed).toBe(false);
+    });
+
+    it('still flags a node behind its saved type when it cannot be summarized', async () => {
+      saved();
+      const node = shadeNode(10);
+      const platform = newPlatform(new Map([[10, node]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      // The flag is the platform's own record, so classifying the node has no part in it.
+      node.getAllEndpoints = () => {
+        throw new Error('the node is still being interviewed');
+      };
+      const { body } = await driveRoute(platform, '/nodes', 'GET');
+
+      expect(body[0]).toMatchObject({ typeOverride: null, typeRebuildFailed: true });
+    });
+
+    it('clears the warning when the node leaves the network', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      platform.handleNodeRemoved(platform.zwaveController.nodes.get(10));
+
+      // The same device rejoining starts clean rather than inheriting a failure it has outlived.
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('settles the warning when a sync finds the node already publishing it', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      const real = platform.syncNodeAccessory.bind(platform);
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+
+      /**
+       * The accessory caught up by some other route, so this sync replaces nothing. Reaching a
+       * node that is already right is still the moment the warning stops being true.
+       */
+      const current = AccessoryFactory.signatureOfPlans(
+        AccessoryFactory.planFeatures(shadeNode(10), { primaryOverride: 'window-covering' }),
+      );
+      platform.zwaveAccessories = new Map([[10, published(10, current)]]);
+      platform.syncNodeAccessory = real;
+      platform.syncNodeAccessory(platform.zwaveController.nodes.get(10));
+      // The sync starts a record and does not wait for it; nothing else here will either.
+      await platform.typeOverridesFor(platform.zwaveController.homeId).settled();
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
+
+    it('settles the warning when reverting leaves the node as it already is', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      const asDefault = AccessoryFactory.signatureOfPlans(
+        AccessoryFactory.planFeatures(shadeNode(10)),
+      );
+      platform.zwaveAccessories = new Map([[10, published(10, asDefault)]]);
+      const revision = (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision;
+      platform.syncNodeAccessory = () => {
+        throw new Error('HomeKit refused the service');
+      };
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: revision,
+      });
+      expect(
+        (await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure,
+      ).not.toBeNull();
+
+      /**
+       * The rebuild failed, so the node is still publishing its default, and reverting to that
+       * default asks nothing of it. Nothing is rebuilt, and the warning is no longer true.
+       */
+      await driveRoute(platform, '/nodes/10/type/clear', 'POST', {
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: (await driveRoute(platform, '/nodes/10/type', 'GET')).body.cohortRevision,
+      });
+
+      expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.rebuildFailure).toBeNull();
+    });
   });
 });
