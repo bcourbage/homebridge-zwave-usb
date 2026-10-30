@@ -23,6 +23,7 @@ const { describeHealStart, healIsRunning,
   nextSectionTab,
   describeDiagnosticsSection,
   describeTypePanel,
+  describeTypeForm,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1564,6 +1565,180 @@ describe('the Device type section', () => {
     expect(reverted.rows[0].label).toBe('Default type');
     expect(reverted.panels[0].heading).toBe('The default type has not been restored.');
     expect(reverted.panels[0].body).toContain('Multilevel Switch is the default for this device');
+  });
+});
+
+describe('choosing a device type', () => {
+  const member = (nodeId: number, over: Record<string, unknown> = {}) => ({
+    nodeId,
+    name: `Node ${nodeId} shade`,
+    primaryKind: 'window-covering',
+    defaultKind: 'multilevel-switch',
+    takesOverride: true,
+    ...over,
+  });
+
+  const overridden = (over: Record<string, unknown> = {}) => ({
+    nodeId: 10,
+    fingerprint: { manufacturerId: 2748, productType: 2, productId: 16 },
+    multiEndpoint: false,
+    primaryKind: 'window-covering',
+    source: 'override',
+    defaultKind: 'multilevel-switch',
+    defaultSource: 'detected',
+    options: ['multilevel-switch', 'window-covering'],
+    override: { primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },
+    cohort: [member(10), member(11)],
+    cohortRevision: 'abc',
+    store: { readable: true, error: null },
+    rebuildFailure: null,
+    ...over,
+  });
+
+  const plain = (over: Record<string, unknown> = {}) =>
+    overridden({
+      primaryKind: 'multilevel-switch',
+      source: 'detected',
+      override: null,
+      cohort: [member(10, { primaryKind: 'multilevel-switch' })],
+      ...over,
+    });
+
+  it('says who else the choice reaches, before and after an override exists', () => {
+    expect(describeTypeForm(plain(), null).cohort).toMatchObject({
+      heading: 'A type chosen here applies to this hardware, not only to this node.',
+      count: '1 node reports this fingerprint:',
+    });
+
+    expect(describeTypeForm(overridden(), null).cohort).toMatchObject({
+      heading: 'This override is saved for the hardware, not only for this node.',
+      count: '2 nodes report this fingerprint:',
+    });
+  });
+
+  it('marks this node among the others, and names what one of them cannot take', () => {
+    const chips = describeTypeForm(
+      overridden({ cohort: [member(10), member(11, { takesOverride: false })] }),
+      null,
+    ).cohort.chips;
+
+    expect(chips[0]).toMatchObject({ nodeId: 10, thisNode: true, note: null });
+    expect(chips[1]).toMatchObject({
+      nodeId: 11,
+      thisNode: false,
+      note: '(cannot take Window Covering)',
+    });
+  });
+
+  it('offers the current type first, then the node default, then the rest', () => {
+    expect(describeTypeForm(overridden(), null).select).toMatchObject({
+      label: 'Publish this device as',
+      value: 'window-covering',
+    });
+
+    expect(describeTypeForm(overridden(), null).select.options.map((o: any) => o.label)).toEqual([
+      'Window Covering (your override)',
+      'Multilevel Switch (detected default)',
+    ]);
+
+    expect(
+      describeTypeForm(plain({ defaultSource: 'registry', source: 'registry' }), null).select.options.map(
+        (o: any) => o.label,
+      ),
+    ).toEqual(['Multilevel Switch (verified default)', 'Window Covering']);
+  });
+
+  it('keeps the chosen type rather than the published one', () => {
+    // The draft is passed in, so a refresh replaces the payload without touching the choice.
+    const form = describeTypeForm(plain(), 'window-covering');
+
+    expect(form.select.value).toBe('window-covering');
+    expect(form.apply).toMatchObject({ label: 'Apply to 1 node', disabled: false });
+  });
+
+  it('counts the nodes an apply would change, and only those', () => {
+    /**
+     * A chosen type that is also every node's default is the Revert case whatever the count,
+     * so this counts against a third type rather than against the default.
+     */
+    const form = describeTypeForm(
+      overridden({
+        options: ['multilevel-switch', 'window-covering', 'binary-switch'],
+        cohort: [member(10), member(11), member(12, { primaryKind: 'binary-switch' })],
+      }),
+      'binary-switch',
+    );
+
+    expect(form.apply).toMatchObject({ label: 'Apply to 2 nodes', disabled: false });
+  });
+
+  it('refuses an apply that would change nothing', () => {
+    // Mirrors the backend, which refuses a kind equal to the existing override.
+    expect(describeTypeForm(overridden(), 'window-covering').apply).toMatchObject({
+      label: 'Apply',
+      disabled: true,
+      hint: null,
+    });
+  });
+
+  it('sends the reader to Revert when they have picked the default back', () => {
+    expect(describeTypeForm(overridden(), 'multilevel-switch').apply).toMatchObject({
+      label: 'Apply',
+      disabled: true,
+      hint: 'Use Revert to return to the default type.',
+    });
+  });
+
+  it('offers Revert only against an override, and names what it returns to', () => {
+    expect(describeTypeForm(plain(), null).revert).toBeNull();
+
+    expect(describeTypeForm(overridden(), null).revert).toMatchObject({
+      label: 'Revert 2 nodes to Multilevel Switch',
+      disabled: false,
+    });
+
+    expect(
+      describeTypeForm(overridden({ cohort: [member(10)] }), null).revert!.label,
+    ).toBe('Revert 1 node to Multilevel Switch');
+  });
+
+  it('does not name one default when the nodes have different ones', () => {
+    const form = describeTypeForm(
+      overridden({ cohort: [member(10), member(11, { defaultKind: 'binary-switch' })] }),
+      null,
+    );
+
+    expect(form.revert!.label).toBe('Revert 2 nodes to their default types');
+  });
+
+  it('warns about as many accessories as the buttons below it would touch', () => {
+    const one = describeTypeForm(plain(), 'window-covering');
+    expect(one.warning).toContain('on this accessory');
+
+    const many = describeTypeForm(overridden(), 'multilevel-switch');
+    expect(many.warning).toContain('on each affected accessory');
+
+    // Neither button can be pressed, so the cohort is what a change here would reach.
+    expect(describeTypeForm(plain(), null).warning).toContain('on this accessory');
+  });
+
+  it('offers nothing to choose where nothing can be chosen', () => {
+    const states = [
+      overridden({ multiEndpoint: true, primaryKind: null }),
+      overridden({ fingerprint: null }),
+      overridden({ store: { readable: false, error: { code: 'invalid-json' } } }),
+      overridden({ primaryKind: null }),
+    ];
+
+    states.forEach((payload) => {
+      const form = describeTypeForm(payload, null);
+
+      expect(form.select).toMatchObject({ disabled: true, placeholder: 'Not available' });
+      expect(form.select.options).toEqual([]);
+      expect(form.apply).toMatchObject({ label: 'Apply', disabled: true });
+      expect(form.revert).toBeNull();
+      expect(form.cohort).toBeNull();
+    });
   });
 });
 

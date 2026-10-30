@@ -814,6 +814,137 @@
     return { panels, rows, notices };
   }
 
+  const REBUILD_WARNING_ONE =
+    'Changing the device type replaces the corresponding HomeKit service on this accessory. Scenes and automations that use the replaced service may need to be set up again.';
+
+  const REBUILD_WARNING_MANY =
+    'Changing the device type replaces the corresponding HomeKit service on each affected accessory. Scenes and automations that use the replaced service may need to be set up again.';
+
+  /** How a type reads in the select when it is one of the two the device already knows about. */
+  function selectOptionLabel(kind, role, defaultSource) {
+    const name = typeName(kind);
+
+    if (role === 'override') {
+      return `${name} (your override)`;
+    }
+    if (role === 'default') {
+      return defaultSource === 'registry' ? `${name} (verified default)` : `${name} (detected default)`;
+    }
+
+    return name;
+  }
+
+  /**
+   * Everything the Device type section offers once a type can be chosen: who the choice
+   * reaches, the list to choose from, and what each button would do.
+   *
+   * `draft` is the type the reader has selected and has not yet applied. It is passed in rather
+   * than read from the payload, so a refresh arriving mid-decision replaces what the plugin
+   * reports without touching what the reader has chosen.
+   */
+  function describeTypeForm(payload, draft) {
+    const data = payload || {};
+    const cohortMembers = Array.isArray(data.cohort) ? data.cohort : [];
+    const override = data.override || null;
+    const storeError = data.store && data.store.error ? data.store.error.code : null;
+    const editable = Boolean(data.fingerprint) && !data.multiEndpoint && !storeError && Boolean(data.primaryKind);
+
+    if (!editable) {
+      return {
+        cohort: null,
+        select: { label: 'Publish this device as', value: null, options: [], disabled: true, placeholder: 'Not available' },
+        hint: null,
+        warning: null,
+        apply: { label: 'Apply', disabled: true, hint: null },
+        revert: null,
+      };
+    }
+
+    const chosen = draft || data.primaryKind;
+
+    const seen = new Set();
+    const options = [];
+    const offer = (kind, role) => {
+      if (!kind || seen.has(kind)) return;
+      seen.add(kind);
+      options.push({ kind, label: selectOptionLabel(kind, role, data.defaultSource) });
+    };
+
+    offer(data.primaryKind, data.source === 'override' ? 'override' : 'default');
+    offer(data.defaultKind, 'default');
+    (data.options || []).forEach((kind) => offer(kind, 'other'));
+
+    const changing = cohortMembers.filter((member) => member.primaryKind !== chosen);
+    const reverting = cohortMembers.filter(
+      (member) => member.defaultKind && member.primaryKind !== member.defaultKind,
+    );
+
+    const matchesOverride = Boolean(override) && override.primaryKind === chosen;
+    const everyDefault =
+      Boolean(override) && cohortMembers.length > 0 && cohortMembers.every((member) => member.defaultKind === chosen);
+    const applyDisabled = changing.length === 0 || matchesOverride || everyDefault;
+
+    const defaults = new Set(reverting.map((member) => member.defaultKind));
+    const revertCount = reverting.length;
+
+    /**
+     * The warning describes what the buttons below it would do, so it counts whichever of them
+     * can be pressed. With neither available nothing would change at all, and the cohort is
+     * then the only honest answer to how many accessories a change here reaches.
+     */
+    const changeCount = !applyDisabled
+      ? changing.length
+      : revertCount > 0
+        ? revertCount
+        : cohortMembers.length;
+
+    return {
+      cohort: {
+        heading: override
+          ? 'This override is saved for the hardware, not only for this node.'
+          : 'A type chosen here applies to this hardware, not only to this node.',
+        count:
+          cohortMembers.length === 1
+            ? '1 node reports this fingerprint:'
+            : `${cohortMembers.length} nodes report this fingerprint:`,
+        chips: cohortMembers.map((member) => ({
+          nodeId: member.nodeId,
+          name: member.name,
+          thisNode: member.nodeId === data.nodeId,
+          note:
+            override && member.takesOverride === false
+              ? `(cannot take ${typeName(override.primaryKind)})`
+              : null,
+        })),
+      },
+      select: {
+        label: 'Publish this device as',
+        value: chosen,
+        options,
+        disabled: false,
+        placeholder: null,
+      },
+      hint: 'Other services on this device, such as Battery, are kept as they are.',
+      warning: changeCount === 1 ? REBUILD_WARNING_ONE : REBUILD_WARNING_MANY,
+      apply: {
+        label: applyDisabled
+          ? 'Apply'
+          : `Apply to ${changing.length} ${changing.length === 1 ? 'node' : 'nodes'}`,
+        disabled: applyDisabled,
+        hint: everyDefault ? 'Use Revert to return to the default type.' : null,
+      },
+      revert: override
+        ? {
+            label:
+              defaults.size === 1
+                ? `Revert ${revertCount} ${revertCount === 1 ? 'node' : 'nodes'} to ${typeName([...defaults][0])}`
+                : `Revert ${revertCount} nodes to their default types`,
+            disabled: revertCount === 0,
+          }
+        : null,
+    };
+  }
+
   /**
    * The tab an arrow key moves to, or null for a key the strip does not answer, so the page
    * leaves every other key alone. Both ends wrap, which is what a tab strip does.
@@ -1092,6 +1223,7 @@
     nextSectionTab,
     describeDiagnosticsSection,
     describeTypePanel,
+    describeTypeForm,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

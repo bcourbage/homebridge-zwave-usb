@@ -1050,8 +1050,9 @@
       };
 
       /**
-       * A warning interrupts; the informational states do not. They are polite, so a reader is
-       * told when an interview finishes under them without being talked over when it has not.
+       * A warning interrupts; the informational states do not. Waiting for an interview and
+       * having several endpoints are ordinary facts about a device, and reading one of those
+       * over whatever a reader is doing would interrupt them to say nothing has gone wrong.
        */
       const typeCalloutHtml = (callout) => `
         <div class="alert alert-${callout.severity === 'warning' ? 'warning' : 'info'} py-2 small" role="${
