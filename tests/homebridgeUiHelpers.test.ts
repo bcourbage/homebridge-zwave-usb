@@ -2771,12 +2771,12 @@ describe('management page integration', () => {
     expect(declaration('formFocusMark')).toContain("if (active.id === 'typeSelect') return '#typeSelect';");
 
     // Read before the control is replaced, put back after: the other order has nothing to ask.
+    const redraw = render.slice(render.indexOf('formHost.innerHTML = typeFormHtml('));
+
     expect(render.indexOf('const mark = formFocusMark();')).toBeLessThan(
       render.indexOf('formHost.innerHTML = typeFormHtml('),
     );
-    expect(render.indexOf('formHost.innerHTML = typeFormHtml(')).toBeLessThan(
-      render.indexOf('restoreFormFocus(mark);'),
-    );
+    expect(redraw).toContain('restoreFormFocus(mark);');
   });
 
   it('draws what the plugin reports apart from what is being decided', () => {
@@ -2827,6 +2827,26 @@ describe('management page integration', () => {
 
     // Read from the markup rather than written out again, so the two cannot drift apart.
     expect(lastScript()).toContain('const SECTION_SKELETON = new Map(');
+  });
+
+  it('does not drop the keyboard, or keep talking, when the form goes', () => {
+    /**
+     * A reading that fails removes the control the keyboard is on just as surely as a redraw
+     * replaces it, and the sentence under the select goes with the select. Reading the mark
+     * only in the branch that redraws left the reader on the document body with the region
+     * still carrying a sentence about a form that was no longer there.
+     */
+    const render = declaration('renderTypeSection');
+    const mark = render.indexOf('const mark = formFocusMark();');
+    const branch = render.indexOf('if (!state.payload || state.error) {');
+
+    expect(mark).toBeGreaterThan(-1);
+    expect(mark).toBeLessThan(branch);
+
+    const errorBranch = render.slice(branch, render.indexOf('} else {', branch));
+    expect(errorBranch).toContain("formHost.innerHTML = '';");
+    expect(errorBranch).toContain('clearTypeAnnounce();');
+    expect(errorBranch).toContain('restoreFormFocus(mark);');
   });
 
   it('takes the form away with a reading that failed', () => {

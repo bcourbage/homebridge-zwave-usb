@@ -1120,9 +1120,8 @@
       const typeDrafts = new Map();
 
       /**
-       * A choice belongs to the hardware it was made against. Z-Wave reuses node numbers, and
-       * a fingerprint can change under a node that is being re-interviewed, so a choice held
-       * only by node number could be applied to a different device that happens to accept it.
+       * Empties the live region and forgets what it said, so the next sentence drawn is
+       * remembered rather than announced and no node inherits what was said about another.
        */
       const clearTypeAnnounce = () => {
         const region = document.getElementById('typeAnnounce');
@@ -1130,6 +1129,11 @@
         typeNoteSaid = null;
       };
 
+      /**
+       * A choice belongs to the hardware it was made against. Z-Wave reuses node numbers, and
+       * a fingerprint can change under a node that is being re-interviewed, so a choice held
+       * only by node number could be applied to a different device that happens to accept it.
+       */
       const draftFor = (nodeId, payload) => {
         const held = typeDrafts.get(String(nodeId));
         if (!held) return null;
@@ -1289,11 +1293,26 @@
         if (formSignature !== typeFormDrawn) {
           typeFormDrawn = formSignature;
 
+          /**
+           * Read before either branch, because both take the control the keyboard is on away:
+           * one replaces it, the other removes it along with the rest of the form.
+           */
+          const mark = formFocusMark();
+
           if (!state.payload || state.error) {
             formHost.innerHTML = '';
+            /**
+             * The sentence under the select went with the select, so the region must not go on
+             * carrying it. Forgetting it also means the form, when it returns, is drawn fresh
+             * and its first sentence is remembered rather than announced.
+             */
+            clearTypeAnnounce();
+
+            if (mark) {
+              restoreFormFocus(mark);
+            }
           } else {
             const form = uiHelpers.describeTypeForm(state.payload, draft);
-            const mark = formFocusMark();
             formHost.innerHTML = typeFormHtml(detailNodeId, form);
 
             if (mark) {
