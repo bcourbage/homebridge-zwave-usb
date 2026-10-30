@@ -681,24 +681,49 @@
       /** Never equal to a description, which is JSON and always begins with a brace. */
       const DETAIL_GONE = 'gone';
 
+      /**
+       * Set when the node this page was opened on leaves the network, and cleared only by
+       * opening a node again.
+       *
+       * Z-Wave gives a node number away again, so a later list carrying this number is not
+       * necessarily this device coming back. Without this the page would quietly redraw itself
+       * around whatever now answers to the number, in front of a reader who was last told the
+       * node had gone.
+       */
+      let detailGone = false;
+
       const renderNodeDetail = () => {
         const node = lastNodes.find((n) => String(n.nodeId) === String(detailNodeId));
         const host = document.getElementById('nodeDetailHeader');
-        if (!host) return;
+        if (!host || detailGone) return;
 
         if (!node) {
           // A node that leaves the network while its page is open says so here rather than
           // leaving the page describing something that is gone.
-          if (detailDrawn === DETAIL_GONE) return;
           detailDrawn = DETAIL_GONE;
+          detailGone = true;
+
+          /**
+           * Read before anything is rewritten, because by the time the controls are gone the
+           * keyboard is already on the document body and there is nothing left to ask.
+           */
+          const detail = document.getElementById('nodeDetail');
+          const hadFocus = detail.contains(document.activeElement);
+
+          // Announced rather than only drawn: a reader who was in the controls is being told
+          // why they have just been taken away.
           host.innerHTML =
-            '<p class="small text-muted">This node is no longer in the network.</p>';
+            '<p class="small text-muted" role="status">This node is no longer in the network.</p>';
           /**
            * The sections go with it. Emptied rather than only hidden, because Z-Wave gives a
            * node number away again, and controls that move a motor must not be sitting in the
            * page waiting for whatever device takes this number next.
            */
           showNodeSections(false);
+
+          if (hadFocus) {
+            document.getElementById('backToNodes').focus({ preventScroll: true });
+          }
           return;
         }
 
@@ -753,6 +778,7 @@
         window.pageYOffset || (document.documentElement || {}).scrollTop || 0;
 
       const openNodeDetail = (nodeId) => {
+        detailGone = false;
         /**
          * Only the way in from the list is the list's own position. A node reached from another
          * node's page leaves what is remembered alone, since back returns to the list from
@@ -849,6 +875,7 @@
           tab.setAttribute('aria-selected', chosen ? 'true' : 'false');
           tab.tabIndex = chosen ? 0 : -1;
           panel.style.display = chosen ? '' : 'none';
+          settlePanelFocus(panel);
 
           if (chosen && focusTab) {
             tab.focus();
@@ -921,7 +948,7 @@
          * A node that has gone has had its sections emptied, and drawing here again would put
          * the panel back. What it is showing is the header's sentence and nothing else.
          */
-        if (!lastNodes.some((node) => String(node.nodeId) === String(detailNodeId))) return;
+        if (detailGone) return;
 
         const view = uiHelpers.describeDiagnosticsSection(
           diagnosticsState.get(String(detailNodeId)),

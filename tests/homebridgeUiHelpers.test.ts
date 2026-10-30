@@ -1876,9 +1876,39 @@ describe('management page integration', () => {
     expect(away).toContain("panel.innerHTML = '';");
     expect(away).toContain("strip.style.display = present ? '' : 'none';");
     expect(declaration('renderNodeDetail')).toContain('showNodeSections(false);');
-    expect(declaration('renderDiagnosticsSection')).toContain(
-      'if (!lastNodes.some((node) => String(node.nodeId) === String(detailNodeId))) return;',
-    );
+  });
+
+  it('treats a node that has gone as gone until the reader opens one again', () => {
+    /**
+     * Z-Wave gives a node number away again, so a later list carrying it is not necessarily
+     * this device coming back. Redrawing the page around whatever now answers would put a
+     * reader who was last told the node had gone in front of different hardware.
+     */
+    const render = declaration('renderNodeDetail');
+
+    expect(render).toContain('if (!host || detailGone) return;');
+    expect(render).toContain('detailGone = true;');
+    expect(declaration('openNodeDetail')).toContain('detailGone = false;');
+    expect(declaration('renderDiagnosticsSection')).toContain('if (detailGone) return;');
+  });
+
+  it('carries the keyboard off the controls it is about to remove', () => {
+    /**
+     * Read before anything is rewritten: once the controls are gone the keyboard is already on
+     * the document body and there is nothing left to ask. The sentence is announced as well,
+     * so a reader who was in the controls is told why they have been taken away.
+     */
+    const render = declaration('renderNodeDetail');
+
+    expect(render).toContain('const hadFocus = detail.contains(document.activeElement);');
+    expect(render).toContain("document.getElementById('backToNodes').focus({ preventScroll: true });");
+    expect(render).toContain('role="status"');
+    expect(render.indexOf('const hadFocus')).toBeLessThan(render.indexOf('host.innerHTML ='));
+  });
+
+  it('settles every section it opens, including one with nothing in it yet', () => {
+    // The section shown first is reachable from the strip whether or not it has content.
+    expect(declaration('selectNodeSection')).toContain('settlePanelFocus(panel);');
   });
 
   it('counts only a control someone could actually reach', () => {
