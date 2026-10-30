@@ -750,9 +750,15 @@
         rows.push({ label: 'Source', value: 'Detected automatically from the device', detail: null });
       }
 
-      if (data.label) {
-        rows.push({ label: 'Device label', value: data.label, detail: null });
-      }
+    }
+
+    if (data.fingerprint) {
+      /**
+       * The label describes the hardware, not the type, so it is a row for every device that
+       * has reported a fingerprint. Dropping it when the device had not sent one took a row
+       * away without saying anything had been left out.
+       */
+      rows.push({ label: 'Device label', value: data.label || 'Not reported', detail: null });
     }
 
     rows.push(
@@ -773,6 +779,15 @@
       notices.push({
         severity: 'info',
         body: "Available once the device's interview has finished.",
+      });
+    } else if (!published && !data.multiEndpoint) {
+      /**
+       * An endpoint whose only function is its battery publishes no type, so there is nothing
+       * here to change and nothing to name in the rows above.
+       */
+      notices.push({
+        severity: 'info',
+        body: 'This device has no HomeKit device type that can be changed.',
       });
     } else if (data.multiEndpoint) {
       notices.push({

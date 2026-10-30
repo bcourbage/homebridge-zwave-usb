@@ -1049,8 +1049,14 @@
           </div>`;
       };
 
+      /**
+       * A warning interrupts; the informational states do not. They are polite, so a reader is
+       * told when an interview finishes under them without being talked over when it has not.
+       */
       const typeCalloutHtml = (callout) => `
-        <div class="alert alert-${callout.severity === 'warning' ? 'warning' : 'info'} py-2 small" role="alert">
+        <div class="alert alert-${callout.severity === 'warning' ? 'warning' : 'info'} py-2 small" role="${
+          callout.severity === 'warning' ? 'alert' : 'status'
+        }">
           ${callout.heading ? `<strong>${uiHelpers.escapeHtml(callout.heading)}</strong><br>` : ''}
           ${uiHelpers.escapeHtml(callout.body)}
         </div>`;
@@ -1155,6 +1161,20 @@
           lastNodes = nodes;
           showNodeError('');
           rerenderNodes();
+
+          /**
+           * The type payload describes what the plugin holds now, not a measurement taken
+           * once, so the refresh keeps it current the way it keeps the header current. A node
+           * that finished interviewing, a rebuild that recovered, or a write made in another
+           * window would otherwise sit unreported for as long as the section stayed open.
+           *
+           * The diagnostics report is deliberately not read here: it is a point-in-time
+           * reading of the radio, and asking for one every five seconds would be a different
+           * thing from keeping a view current.
+           */
+          if (detailNodeId !== null && !detailGone && nodeSection === 'type') {
+            loadTypeSection();
+          }
         } catch (err) {
           const tbody = document.getElementById('nodeTableBody');
           if (tbody) {

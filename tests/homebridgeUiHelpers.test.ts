@@ -1462,6 +1462,29 @@ describe('the Device type section', () => {
     });
   });
 
+  it('keeps the Device label row whether or not the device sent one', () => {
+    /**
+     * The label describes the hardware, not the type, so dropping it when the device had sent
+     * none took a row away without saying anything had been left out.
+     */
+    expect(rowFor('Device label')).toMatchObject({ value: '[SAMPLE SHADE]' });
+    expect(rowFor('Device label', { label: null })).toMatchObject({ value: 'Not reported' });
+  });
+
+  it('says so when a device publishes no type at all', () => {
+    /**
+     * An endpoint whose only function is its battery publishes nothing that can be changed, so
+     * there is no type to name and no source to credit, and the section says why.
+     */
+    const { rows, notices } = describeTypePanel(payload({ primaryKind: null, label: 'ZW-BATT' }));
+
+    expect(rows.map((row: any) => row.label)).toEqual(['Device label', 'Hardware fingerprint']);
+    expect(notices).toContainEqual({
+      severity: 'info',
+      body: 'This device has no HomeKit device type that can be changed.',
+    });
+  });
+
   it('shows only the fingerprint row before a device has reported one', () => {
     /**
      * Nothing is said about what HomeKit publishes: a node waiting for metadata and an
@@ -2175,5 +2198,33 @@ describe('management page integration', () => {
     ['row.label', 'row.value', 'row.chip', 'under', 'callout.heading', 'callout.body'].forEach(
       (written) => expect(script).toContain(`uiHelpers.escapeHtml(${written})`),
     );
+  });
+
+  it('keeps the device type current while the section is open', () => {
+    /**
+     * The payload describes what the plugin holds now, not a measurement taken once, so a node
+     * that finished interviewing, a rebuild that recovered, or a write made in another window
+     * would otherwise sit unreported for as long as the section stayed open.
+     */
+    const load = declaration('loadNodes');
+
+    expect(load).toContain(
+      "if (detailNodeId !== null && !detailGone && nodeSection === 'type') {",
+    );
+    expect(load).toContain('loadTypeSection();');
+
+    // The radio report is a reading, not a view of current state, so it is not asked for here.
+    expect(load).not.toContain('loadDiagnosticsSection();');
+  });
+
+  it('reserves the interrupting role for a warning', () => {
+    /**
+     * Waiting for an interview and having several endpoints are ordinary facts about a device.
+     * Read over whatever the reader is doing, they would be an interruption saying nothing has
+     * gone wrong.
+     */
+    const script = lastScript();
+
+    expect(script).toContain("callout.severity === 'warning' ? 'alert' : 'status'");
   });
 });
