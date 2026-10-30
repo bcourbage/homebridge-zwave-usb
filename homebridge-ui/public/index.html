@@ -591,15 +591,28 @@
         return `<div class="node-action-cell">${actionButtonHtml(nodeId, actions.open)}</div>`;
       };
 
+      /**
+       * One bar, drawn the same way wherever it appears. Movement is drawn from whether the
+       * update is still running, so one that has finished or failed stops rather than going on
+       * reporting itself as in progress, and the bar carries what it is and where it has got
+       * to for a reader who cannot see it.
+       */
+      const progressBarHtml = (progress, height) => `
+        <div class="progress mt-1" style="height: ${height}px;">
+          <div class="progress-bar progress-bar-striped${
+            progress.active ? ' progress-bar-animated' : ''
+          }${
+            progress.failed ? ' bg-danger' : ''
+          }" role="progressbar" aria-label="${uiHelpers.escapeHtml(
+            progress.label,
+          )}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${
+            progress.percent
+          }" style="width: ${progress.percent}%">${progress.percent}%</div>
+        </div>`;
+
       const firmwareCellHtml = (cell) => `
         ${uiHelpers.escapeHtml(cell.version)}${
-          cell.progress
-            ? `<div class="progress mt-1" style="height: 14px;"><div class="progress-bar progress-bar-striped progress-bar-animated${
-                cell.progress.failed ? ' bg-danger' : ''
-              }" role="progressbar" style="width: ${cell.progress.percent}%">${
-                cell.progress.percent
-              }%</div></div>`
-            : ''
+          cell.progress ? progressBarHtml(cell.progress, 14) : ''
         }`;
 
       const batteryHtml = (battery) => {
@@ -787,11 +800,7 @@
           </div>
           ${
             detail.progress
-              ? `<div class="progress mt-3" style="height: 20px;"><div class="progress-bar progress-bar-striped progress-bar-animated${
-                  detail.progress.failed ? ' bg-danger' : ''
-                }" role="progressbar" style="width: ${detail.progress.percent}%">${
-                  detail.progress.percent
-                }%</div></div>`
+              ? progressBarHtml(detail.progress, 20)
               : `<div class="node-detail-actions">${detail.controls
                   .map((button) => detailButtonHtml(node.nodeId, button))
                   .join('')}</div>`

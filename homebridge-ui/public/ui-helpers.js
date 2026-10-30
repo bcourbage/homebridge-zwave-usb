@@ -247,7 +247,6 @@
     open: '<path d="M6 3l5 5-5 5"/>',
     rename: '<path d="M11 2.5l2.5 2.5L6 12.5H3.5V10z"/><path d="M9.5 4l2.5 2.5"/>',
     refresh: '<path d="M13.5 8A5.5 5.5 0 1 1 11.9 4.1"/><path d="M13.5 2v3h-3"/>',
-    diagnostics: '<path d="M3 13V10M6.3 13V7.5M9.7 13V5M13 13V2.5"/>',
     update: '<path d="M8 2v8M5 7l3 3 3-3"/><path d="M2.5 11v2.5h11V11"/>',
     battery: '<rect x="1" y="4" width="12" height="8" rx="1.6"/><path d="M14.3 6.6v2.8"/>',
     remove: '<path d="M2.5 4h11M6 4V2.5h4V4"/><path d="M4 4l.7 9.5h6.6L12 4"/>',
@@ -453,6 +452,33 @@
    * What the action cell holds for one node: the controller badge, a progress bar, or the
    * group of icon buttons. The page renders this and decides nothing for itself.
    */
+  /**
+   * How far a firmware update has got, or null while none is running.
+   *
+   * `active` is what the page draws movement from. A bar that goes on animating after an
+   * update has finished or failed says it is still running, which is the one thing it is
+   * there to report. The label is the same sentence the row notice carries, so the bar and
+   * the notice beside it cannot say different things.
+   */
+  function firmwareProgressOf(firmwareState) {
+    const state = firmwareState || { name: 'idle' };
+    const terminal = state.name === 'completed' || state.name === 'failed';
+
+    if (state.name !== 'updating' && !terminal) {
+      return null;
+    }
+
+    const reported = Math.round(Number(state.percent));
+    const notice = lookup(FIRMWARE_NOTICES, state.name);
+
+    return {
+      percent: Number.isFinite(reported) ? Math.min(100, Math.max(0, reported)) : 0,
+      failed: state.name === 'failed',
+      active: state.name === 'updating',
+      label: notice ? notice.text : '',
+    };
+  }
+
   function describeNodeActions(node, firmwareState) {
     const state = firmwareState || { name: 'idle' };
 
@@ -475,14 +501,9 @@
       spinner: false,
     };
 
-    if (state.name === 'updating' || state.name === 'completed' || state.name === 'failed') {
-      const reported = Math.round(Number(state.percent));
-      return {
-        kind: 'progress',
-        percent: Number.isFinite(reported) ? Math.min(100, Math.max(0, reported)) : 0,
-        failed: state.name === 'failed',
-        open,
-      };
+    const progress = firmwareProgressOf(state);
+    if (progress) {
+      return { kind: 'progress', ...progress, open };
     }
 
     const buttons = NODE_BUTTONS.map((button) => {
@@ -524,19 +545,9 @@
    * reader scanning the list for which device is updating is looking at the firmware.
    */
   function describeFirmwareCell(node, firmwareState) {
-    const state = firmwareState || { name: 'idle' };
-    const running =
-      state.name === 'updating' || state.name === 'completed' || state.name === 'failed';
-    const reported = Math.round(Number(state.percent));
-
     return {
       version: (node && node.firmwareVersion) || 'Unknown',
-      progress: running
-        ? {
-            percent: Number.isFinite(reported) ? Math.min(100, Math.max(0, reported)) : 0,
-            failed: state.name === 'failed',
-          }
-        : null,
+      progress: firmwareProgressOf(firmwareState),
     };
   }
 
@@ -624,8 +635,11 @@
       header: describeNodeHeader(node),
       rename: buttons.find((button) => button.action === 'rename-node') || null,
       controls: buttons.filter((button) => DETAIL_CONTROLS.indexOf(button.action) !== -1),
-      progress:
-        actions.kind === 'progress' ? { percent: actions.percent, failed: actions.failed } : null,
+      /**
+       * Carried whole rather than picked apart, so the bar on the node's page is drawn from
+       * the same description as the one in the list and cannot come to differ from it.
+       */
+      progress: actions.kind === 'progress' ? firmwareProgressOf(firmwareState) : null,
     };
   }
 
@@ -1540,6 +1554,7 @@
     nextFirmwareRecord,
     describeNodeActions,
     describeFirmwareCell,
+    firmwareProgressOf,
     describeNodeNotices,
     withoutFirmwareProgress,
     describeBattery,

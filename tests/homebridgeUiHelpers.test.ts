@@ -13,6 +13,7 @@ const { describeHealStart, healIsRunning,
   nextFirmwareRecord,
   describeNodeActions,
   describeFirmwareCell,
+  firmwareProgressOf,
   describeNodeNotices,
   typeName,
   withoutFirmwareProgress,
@@ -864,7 +865,7 @@ describe('node action cell', () => {
 
   it('a running, finished or failed update replaces the group with a progress bar', () => {
     const bar = (progress: Record<string, unknown>) => {
-      const { open, ...rest } = describeNodeActions(
+      const { open, active, label, ...rest } = describeNodeActions(
         node(),
         firmwareStateOf(node({ firmwareProgress: progress }), null),
       ) as any;
@@ -1229,7 +1230,7 @@ describe('a node page description', () => {
   it('replaces the controls with progress while an update runs', () => {
     const detail = describeNodeDetail(node, { name: 'updating', percent: 40 });
 
-    expect(detail.progress).toEqual({ percent: 40, failed: false });
+    expect(detail.progress).toMatchObject({ percent: 40, failed: false });
     expect(detail.controls).toEqual([]);
     expect(detail.rename).toBeNull();
     expect(describeNodeDetail(node, { name: 'failed', percent: 70 }).progress.failed).toBe(true);
@@ -2170,18 +2171,41 @@ describe('the Firmware column', () => {
   });
 
   it('carries the progress of an update that is running, finished or failed', () => {
-    expect(describeFirmwareCell({}, { name: 'updating', percent: 40 }).progress).toEqual({
+    expect(describeFirmwareCell({}, { name: 'updating', percent: 40 }).progress).toMatchObject({
       percent: 40,
       failed: false,
     });
-    expect(describeFirmwareCell({}, { name: 'completed', percent: 100 }).progress).toEqual({
+    expect(describeFirmwareCell({}, { name: 'completed', percent: 100 }).progress).toMatchObject({
       percent: 100,
       failed: false,
     });
-    expect(describeFirmwareCell({}, { name: 'failed', percent: 70 }).progress).toEqual({
+    expect(describeFirmwareCell({}, { name: 'failed', percent: 70 }).progress).toMatchObject({
       percent: 70,
       failed: true,
     });
+  });
+
+  it('says an update is still moving only while it is', () => {
+    /**
+     * A bar that goes on animating once an update has finished or failed reports it as still
+     * running, which is the one thing the bar is there to say.
+     */
+    expect(firmwareProgressOf({ name: 'updating', percent: 40 })!.active).toBe(true);
+    expect(firmwareProgressOf({ name: 'completed', percent: 100 })!.active).toBe(false);
+    expect(firmwareProgressOf({ name: 'failed', percent: 70 })!.active).toBe(false);
+  });
+
+  it('names the bar with the same sentence the notice beside it carries', () => {
+    expect(firmwareProgressOf({ name: 'updating' })!.label).toBe('Updating firmware');
+    expect(firmwareProgressOf({ name: 'completed' })!.label).toBe('Firmware update completed');
+    expect(firmwareProgressOf({ name: 'failed' })!.label).toBe('Firmware update failed');
+  });
+
+  it('describes the node page bar the same way it describes the row one', () => {
+    const state = { name: 'failed', percent: 70 };
+
+    expect(describeNodeDetail({ nodeId: 5 }, state).progress).toEqual(firmwareProgressOf(state));
+    expect(describeNodeActions({ nodeId: 5 }, state)).toMatchObject(firmwareProgressOf(state)!);
   });
 
   it('brings a percentage the driver did not give back into range', () => {
@@ -3176,5 +3200,32 @@ describe('management page integration', () => {
   it('draws no warning in a dialog that has none', () => {
     expect(declaration('openTypeWriteDialog')).toContain('dialog.warning');
     expect(declaration('openTypeWriteDialog')).toContain("? `<p class=\"mb-1 mt-2\">");
+  });
+
+  it('draws one bar, and draws its movement from whether anything is moving', () => {
+    const bar = declaration('progressBarHtml');
+
+    expect(bar).toContain("progress.active ? ' progress-bar-animated' : ''");
+    expect(bar).toContain("progress.failed ? ' bg-danger' : ''");
+    expect(bar).toContain('aria-valuemin="0"');
+    expect(bar).toContain('aria-valuemax="100"');
+    expect(bar).toContain('aria-valuenow="${\n            progress.percent\n          }"');
+    expect(bar).toContain('aria-label="${uiHelpers.escapeHtml(');
+
+    // Both places that show one use it, so neither can drift from the other.
+    const script = lastScript();
+    expect(script).toContain('progressBarHtml(cell.progress, 14)');
+    expect(script).toContain('progressBarHtml(detail.progress, 20)');
+    expect(script.match(/progress-bar-animated/g)).toHaveLength(1);
+  });
+
+  it('keeps no icon for a control the page no longer has', () => {
+    /**
+     * The route is still how the Diagnostics section reads a report. What went with the dialog
+     * is the button that used to open it, and the icon drawn on that button.
+     */
+    expect(NODE_ICONS.diagnostics).toBeUndefined();
+    expect(lastScript()).not.toContain("classList.contains('node-diagnostics')");
+    expect(readPage()).toContain("request('node-diagnostics', nodeId)");
   });
 });
