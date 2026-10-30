@@ -647,7 +647,10 @@
        */
       const rerenderNodes = () => {
         renderNodes(lastNodes);
-        if (detailNodeId !== null) renderNodeDetail();
+        if (detailNodeId === null) return;
+
+        renderNodeDetail();
+        renderDiagnosticsSection();
       };
 
       /**
@@ -690,8 +693,16 @@
           detailDrawn = DETAIL_GONE;
           host.innerHTML =
             '<p class="small text-muted">This node is no longer in the network.</p>';
+          /**
+           * The sections go with it. Emptied rather than only hidden, because Z-Wave gives a
+           * node number away again, and controls that move a motor must not be sitting in the
+           * page waiting for whatever device takes this number next.
+           */
+          showNodeSections(false);
           return;
         }
+
+        showNodeSections(true);
 
         const detail = uiHelpers.describeNodeDetail(
           node,
@@ -799,6 +810,30 @@
       let nodeSection = 'type';
 
       /**
+       * Whether the node still exists decides whether its sections are offered at all. Taking
+       * them away empties them, so nothing that acts on a node outlives the node.
+       */
+      const showNodeSections = (present) => {
+        const strip = document.getElementById('nodeSections');
+        if (!strip) return;
+
+        strip.style.display = present ? '' : 'none';
+
+        NODE_SECTIONS.forEach((section) => {
+          const panel = document.getElementById(section.panel);
+          if (present) return;
+
+          panel.style.display = 'none';
+          panel.innerHTML = '';
+          panel.tabIndex = -1;
+        });
+
+        if (!present) {
+          diagnosticsDrawn = null;
+        }
+      };
+
+      /**
        * Shows one section and hides the other, and moves the strip's single tab stop with it,
        * so tabbing into the strip reaches the open section rather than every tab in turn.
        */
@@ -841,6 +876,20 @@
         return diagnosticsState.get(key);
       };
 
+      /**
+       * A panel with nothing focusable inside it takes the keyboard itself, so a reader tabbing
+       * out of the strip reaches what it says; one with controls does not, since that would be
+       * a stop announcing nothing ahead of the controls. A disabled control is not focusable,
+       * so a panel whose only controls are disabled, which is every covering with an operation
+       * running and every Device type state that cannot be edited, still takes it.
+       */
+      const PANEL_FOCUSABLE =
+        'a[href], button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled])';
+
+      const settlePanelFocus = (panel) => {
+        panel.tabIndex = panel.querySelector(PANEL_FOCUSABLE) ? -1 : 0;
+      };
+
       const coveringControlsHtml = (nodeId, controls) => {
         const disabled = controls.disabled ? ' disabled' : '';
 
@@ -857,6 +906,7 @@
               <button type="button" class="btn btn-outline-warning section-stop-covering" data-nodeid="${nodeId}"${disabled}>Stop</button>
             </div>
             <div class="small text-muted mt-1" id="sectionTestResult">${uiHelpers.escapeHtml(controls.text)}</div>
+            <div class="small text-muted mt-1">To test Stop, start the covering from another controller or its remote, then select Stop while it is moving.</div>
           </div>`;
       };
 
@@ -867,6 +917,12 @@
         const host = document.getElementById('nodeSectionDiagnostics');
         if (!host || detailNodeId === null) return;
 
+        /**
+         * A node that has gone has had its sections emptied, and drawing here again would put
+         * the panel back. What it is showing is the header's sentence and nothing else.
+         */
+        if (!lastNodes.some((node) => String(node.nodeId) === String(detailNodeId))) return;
+
         const view = uiHelpers.describeDiagnosticsSection(
           diagnosticsState.get(String(detailNodeId)),
         );
@@ -875,7 +931,8 @@
         diagnosticsDrawn = signature;
 
         if (view.kind === 'loading') {
-          host.innerHTML = '<p class="small text-muted">Reading the radio and routes...</p>';
+          host.innerHTML =
+            '<p class="small text-muted">Loading radio and route diagnostics...</p>';
         } else if (view.kind === 'error') {
           host.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(view.text)}</p>`;
         } else {
@@ -884,18 +941,17 @@
           }`;
         }
 
-        /**
-         * A panel with nothing to focus inside it takes the keyboard itself, so a reader
-         * tabbing out of the strip reaches what it says. One with controls does not, because
-         * that would be a stop announcing nothing before the controls themselves.
-         */
-        host.tabIndex = host.querySelector('button, a[href], select, input, textarea') ? -1 : 0;
+        settlePanelFocus(host);
       };
 
       /**
-       * Fetches the report once per node. A second selection while the first request is still
-       * running waits for it rather than asking again, and a report already read is shown as
-       * it was: this is a point-in-time reading, not something the refresh keeps current.
+       * Reads the report each time the reader comes to the section, which is the only thing
+       * that asks for one: a rebuild, an interview or a repair changes what it would say, and
+       * a request that failed once has to be allowed to succeed. Nothing polls it.
+       *
+       * Only a request already running is not repeated. A report already read stays on screen
+       * while the next one is fetched, so returning to the section does not blank what it said
+       * a moment ago, and an error is cleared only once something has replaced it.
        */
       const loadDiagnosticsSection = async () => {
         if (detailNodeId === null) return;
@@ -903,16 +959,15 @@
         const nodeId = detailNodeId;
         const state = diagnosticsFor(nodeId);
 
-        if (state.report || state.error || state.loading) {
-          renderDiagnosticsSection();
-          return;
-        }
+        if (state.loading) return;
 
         state.loading = true;
         renderDiagnosticsSection();
 
         try {
-          state.report = await window.homebridge.request('node-diagnostics', nodeId);
+          const report = await window.homebridge.request('node-diagnostics', nodeId);
+          state.report = report;
+          state.error = null;
         } catch (err) {
           state.error = err.message;
         } finally {

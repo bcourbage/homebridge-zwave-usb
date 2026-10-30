@@ -1851,16 +1851,56 @@ describe('management page integration', () => {
     expect(declaration('openNodeDetail')).toContain("selectNodeSection('type');");
   });
 
-  it('reads the diagnostics for a node once', () => {
+  it('reads the diagnostics again each time the reader comes to the section', () => {
     /**
-     * This is a point-in-time reading rather than something the refresh keeps current, so
-     * returning to the section shows what was read, and a second selection while the first
-     * request is still running waits for it instead of asking again.
+     * A rebuild, an interview or a repair changes what the report would say, and a request
+     * that failed once has to be allowed to succeed, so a report read earlier is not the
+     * answer for ever. Only a request already running is not repeated, and nothing polls.
      */
     const load = declaration('loadDiagnosticsSection');
 
-    expect(load).toContain('if (state.report || state.error || state.loading) {');
-    expect(load).toContain('state.loading = true;');
+    expect(load).toContain('if (state.loading) return;');
+    expect(load).not.toContain('if (state.report || state.error || state.loading) {');
+    expect(load).toContain('state.error = null;');
+    expect(declaration('selectNodeSection')).toContain('loadDiagnosticsSection();');
+  });
+
+  it('takes the sections away with a node that has left', () => {
+    /**
+     * Z-Wave gives a node number away again, so controls that move a motor must not sit in the
+     * page waiting for whatever device takes this number next. Requirement 7 asks for the
+     * sentence, the back link and no controls, which is what emptying them leaves.
+     */
+    const away = declaration('showNodeSections');
+
+    expect(away).toContain("panel.innerHTML = '';");
+    expect(away).toContain("strip.style.display = present ? '' : 'none';");
+    expect(declaration('renderNodeDetail')).toContain('showNodeSections(false);');
+    expect(declaration('renderDiagnosticsSection')).toContain(
+      'if (!lastNodes.some((node) => String(node.nodeId) === String(detailNodeId))) return;',
+    );
+  });
+
+  it('counts only a control someone could actually reach', () => {
+    /**
+     * A panel takes the keyboard when nothing in it can. Counting disabled controls would make
+     * a dead end of every covering with an operation running, and of every Device type state
+     * that cannot be edited, which is exactly where the panel has to be reachable.
+     */
+    const script = lastScript();
+
+    expect(script).toContain('button:not([disabled])');
+    expect(script).toContain('select:not([disabled])');
+    expect(declaration('settlePanelFocus')).toContain(
+      'panel.tabIndex = panel.querySelector(PANEL_FOCUSABLE) ? -1 : 0;',
+    );
+  });
+
+  it('says how Stop is meant to be tested', () => {
+    // It answers movement started elsewhere; it does not cancel a test this page started.
+    expect(readPage()).toContain(
+      'To test Stop, start the covering from another controller or its remote, then select Stop while it is moving.',
+    );
   });
 
   it('keeps the covering generation per node, away from the dialog counter', () => {
