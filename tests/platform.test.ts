@@ -2800,6 +2800,45 @@ describe('ZWaveUsbPlatform', () => {
       expect((await driveRoute(platform, '/nodes/10/type', 'GET')).body.matterActive).toBe(true);
     });
 
+    it('still reports Matter after a rebuild that failed and took the wrapper with it', async () => {
+      /**
+       * A failed rebuild leaves the node with no wrapper, while Matter goes on publishing the
+       * endpoint it already has. Reading the identity only from the wrapper reported the node
+       * as absent from Matter, so the next type change would have been confirmed without the
+       * restart that published endpoint needs, and stayed on the old type in Alexa.
+       */
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      const cached = {
+        UUID: 'uuid-10',
+        context: { nodeId: 10, homeId: platform.zwaveController.homeId },
+      };
+      platform.accessories.push(cached as never);
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      jest.spyOn(platform.matterAccessories, 'publishes').mockReturnValue(true);
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'setNodeType')
+        .mockResolvedValue({ rebuild: [10] });
+      jest.spyOn(AccessoryFactory, 'create').mockImplementation(() => {
+        throw new Error('HAP refused the service change');
+      });
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(platform.zwaveAccessories.get(10)).toBeUndefined();
+
+      // The reader now picks a third type. The endpoint Matter holds is still the old one.
+      const { body } = await driveRoute(platform, '/nodes/10/type', 'GET');
+
+      expect(body.matterActive).toBe(true);
+      expect(body.cohort.find((member: { nodeId: number }) => member.nodeId === 10).matterActive)
+        .toBe(true);
+    });
+
     it('tells the node table which devices a decision reaches', async () => {
       saved([
         { fingerprint: FINGERPRINT, primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },

@@ -802,10 +802,35 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   }
 
   /** Whether a live Matter endpoint is publishing this node, which only a restart replaces. */
-  private matterPublishes(nodeId: number): boolean {
-    const accessory = this.zwaveAccessories.get(nodeId);
+  /**
+   * The HomeKit accessory a node has, whether or not the plugin currently holds a wrapper for
+   * it.
+   *
+   * A rebuild that failed leaves the node with no wrapper while Matter goes on publishing the
+   * endpoint it already has. Reading the identity only from the wrapper would then report the
+   * node as absent from Matter, and the next type change would be confirmed without the
+   * restart the published endpoint needs. The cached accessory is found by the node and
+   * network it records, which is the identity the accessory is adopted by when one is built.
+   */
+  private platformAccessoryFor(nodeId: number): PlatformAccessory | undefined {
+    const live = this.zwaveAccessories.get(nodeId)?.platformAccessory;
+    if (live) {
+      return live;
+    }
 
-    return accessory ? this.matterAccessories.publishes(accessory.platformAccessory.UUID) : false;
+    const homeId = this.zwaveController?.homeId;
+
+    return this.accessories.find((accessory) => {
+      const context = accessory.context as { nodeId?: number; homeId?: number } | undefined;
+
+      return context?.nodeId === nodeId && context?.homeId === homeId;
+    });
+  }
+
+  private matterPublishes(nodeId: number): boolean {
+    const accessory = this.platformAccessoryFor(nodeId);
+
+    return accessory ? this.matterAccessories.publishes(accessory.UUID) : false;
   }
 
   /** This node's hardware as the records name it, or none when it has not reported any. */
