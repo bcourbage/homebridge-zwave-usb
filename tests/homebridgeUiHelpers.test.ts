@@ -20,6 +20,8 @@ const { describeHealStart, healIsRunning,
   describeNodeHeader,
   describeNodeDetail,
   nodeIdFromReviewLink,
+  nextSectionTab,
+  describeDiagnosticsSection,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1278,6 +1280,75 @@ describe('a review link', () => {
   });
 });
 
+describe('the node page section strip', () => {
+  const sections = ['type', 'diagnostics'];
+
+  it('moves along the strip and wraps at both ends', () => {
+    expect(nextSectionTab(sections, 'type', 'ArrowRight')).toBe('diagnostics');
+    expect(nextSectionTab(sections, 'diagnostics', 'ArrowRight')).toBe('type');
+    expect(nextSectionTab(sections, 'type', 'ArrowLeft')).toBe('diagnostics');
+    expect(nextSectionTab(sections, 'diagnostics', 'ArrowLeft')).toBe('type');
+  });
+
+  it('answers Home and End', () => {
+    expect(nextSectionTab(sections, 'diagnostics', 'Home')).toBe('type');
+    expect(nextSectionTab(sections, 'type', 'End')).toBe('diagnostics');
+  });
+
+  it('leaves every other key to the page', () => {
+    // Tab, Enter and typing have to reach what they normally reach.
+    ['Tab', 'Enter', ' ', 'a', 'ArrowUp', 'Escape'].forEach((key) =>
+      expect(nextSectionTab(sections, 'type', key)).toBeNull(),
+    );
+  });
+
+  it('answers nothing for a section it does not carry', () => {
+    expect(nextSectionTab(sections, 'parameters', 'ArrowRight')).toBeNull();
+  });
+});
+
+describe('the Diagnostics section', () => {
+  it('says it is reading until a report has arrived', () => {
+    expect(describeDiagnosticsSection(undefined)).toEqual({ kind: 'loading' });
+    expect(describeDiagnosticsSection({ loading: true })).toEqual({ kind: 'loading' });
+  });
+
+  it('reports a failure in place of the report rather than beside it', () => {
+    expect(describeDiagnosticsSection({ error: 'The plugin did not answer.' })).toEqual({
+      kind: 'error',
+      text: 'The plugin did not answer.',
+    });
+  });
+
+  it('offers the covering controls only for a covering', () => {
+    expect(describeDiagnosticsSection({ report: { isWindowCovering: false } }).controls).toBeNull();
+    expect(describeDiagnosticsSection({ report: { isWindowCovering: true } }).controls).toEqual({
+      disabled: false,
+      text: '',
+    });
+  });
+
+  it('holds the controls while an operation is running', () => {
+    /**
+     * The section is drawn from this rather than from what is on screen, which is what lets an
+     * operation keep running while the reader changes section or leaves the node and returns.
+     */
+    const running = describeDiagnosticsSection({
+      report: { isWindowCovering: true },
+      covering: { running: true, text: 'Moving to 25%...' },
+    });
+
+    expect(running.controls).toEqual({ disabled: true, text: 'Moving to 25%...' });
+
+    const finished = describeDiagnosticsSection({
+      report: { isWindowCovering: true },
+      covering: { running: false, text: 'Commanded 25% from 0%, now 25%. The covering moved there.' },
+    });
+
+    expect(finished.controls!.disabled).toBe(false);
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -1759,5 +1830,56 @@ describe('management page integration', () => {
 
     expect(script).toContain('const named = lastNodes.find');
     expect(script).not.toContain('node-name-${nodeId}');
+  });
+
+  it('gives the section strip the semantics of a strip of tabs', () => {
+    const html = readPage();
+
+    expect(html).toMatch(/id="nodeSections"[^>]*role="tablist"/);
+    ['nodeSectionType', 'nodeSectionDiagnostics'].forEach((panel) => {
+      expect(html).toMatch(new RegExp(`id="${panel}Tab"[\\s\\S]{0,120}aria-controls="${panel}"`));
+      expect(html).toMatch(new RegExp(`id="${panel}"[\\s\\S]{0,120}aria-labelledby="${panel}Tab"`));
+    });
+
+    // One stop for the strip, which moves with the selection, rather than one stop per tab.
+    const select = declaration('selectNodeSection');
+    expect(select).toContain("tab.setAttribute('aria-selected', chosen ? 'true' : 'false');");
+    expect(select).toContain('tab.tabIndex = chosen ? 0 : -1;');
+  });
+
+  it('opens a node on Device type, whichever section was last read', () => {
+    expect(declaration('openNodeDetail')).toContain("selectNodeSection('type');");
+  });
+
+  it('reads the diagnostics for a node once', () => {
+    /**
+     * This is a point-in-time reading rather than something the refresh keeps current, so
+     * returning to the section shows what was read, and a second selection while the first
+     * request is still running waits for it instead of asking again.
+     */
+    const load = declaration('loadDiagnosticsSection');
+
+    expect(load).toContain('if (state.report || state.error || state.loading) {');
+    expect(load).toContain('state.loading = true;');
+  });
+
+  it('keeps the covering generation per node, away from the dialog counter', () => {
+    /**
+     * `hideModals` bumps the shared counter, so sharing it would drop the result of a move
+     * started on the node page the moment the reader opened and cancelled Rename, leaving the
+     * controls disabled with nothing coming to enable them.
+     */
+    const script = lastScript();
+
+    expect(script).toContain('const generation = (state.coveringRun || 0) + 1;');
+    expect(script).toContain('if (generation !== state.coveringRun) return;');
+  });
+
+  it('keeps the dialog and the row icon until the section replaces both', () => {
+    // They go together, once the section is doing the work, and not before.
+    const html = readPage();
+
+    expect(html.match(/id="diagnosticsModal"/g)).toHaveLength(1);
+    expect(html).toContain('node-diagnostics');
   });
 });

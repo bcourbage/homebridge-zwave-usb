@@ -612,6 +612,64 @@
   }
 
   /**
+   * The tab an arrow key moves to, or null for a key the strip does not answer, so the page
+   * leaves every other key alone. Both ends wrap, which is what a tab strip does.
+   */
+  function nextSectionTab(names, current, key) {
+    const at = names.indexOf(current);
+    if (at === -1) {
+      return null;
+    }
+
+    if (key === 'ArrowRight') {
+      return names[(at + 1) % names.length];
+    }
+    if (key === 'ArrowLeft') {
+      return names[(at - 1 + names.length) % names.length];
+    }
+    if (key === 'Home') {
+      return names[0];
+    }
+    if (key === 'End') {
+      return names[names.length - 1];
+    }
+
+    return null;
+  }
+
+  /**
+   * What the Diagnostics section draws for a node.
+   *
+   * A failure is reported in place of a stale report rather than beside it. The covering
+   * controls are offered only for a covering, and they are disabled while an operation is
+   * running, which is how one stays running across a change of tab: the section is drawn from
+   * this rather than from what is on screen.
+   */
+  function describeDiagnosticsSection(state) {
+    const current = state || {};
+
+    if (current.error) {
+      return { kind: 'error', text: current.error };
+    }
+    if (!current.report) {
+      return { kind: 'loading' };
+    }
+
+    const covering = current.covering || {};
+
+    return {
+      kind: 'report',
+      report: current.report,
+      controls: current.report.isWindowCovering
+        ? {
+            disabled: covering.running === true,
+            text: typeof covering.text === 'string' ? covering.text : '',
+          }
+        : null,
+    };
+  }
+
+  /**
    * The node a review link points at, or null for any other link. A notice sends a reader to
    * the node it is about, and parsing the target here keeps the page from treating a link it
    * gains later as one of them.
@@ -828,6 +886,8 @@
     describeNodeHeader,
     describeNodeDetail,
     nodeIdFromReviewLink,
+    nextSectionTab,
+    describeDiagnosticsSection,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

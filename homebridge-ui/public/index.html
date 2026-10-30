@@ -154,6 +154,8 @@
     .node-detail-facts { display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
       margin-top: 6px; font-size: 85%; }
     .node-detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 14px 0 4px; }
+    #nodeSections { margin-top: 16px; }
+    .node-section:focus { outline: none; }
     .node-detail-actions .ico { margin-right: 5px; vertical-align: -2px; }
 
     /* The gap the paired buttons in this page's dialogs already sit at. */
@@ -364,6 +366,21 @@
           <a href="#" class="node-detail-back" id="backToNodes"><span aria-hidden="true">&lsaquo;</span> All nodes</a>
           <div id="nodeDetailError"></div>
           <div id="nodeDetailHeader"></div>
+          <ul class="nav nav-tabs" id="nodeSections" role="tablist">
+            <li class="nav-item" role="presentation">
+              <a class="nav-link active" href="#nodeSectionType" id="nodeSectionTypeTab" role="tab"
+                aria-controls="nodeSectionType" aria-selected="true" tabindex="0">Device type</a>
+            </li>
+            <li class="nav-item" role="presentation">
+              <a class="nav-link" href="#nodeSectionDiagnostics" id="nodeSectionDiagnosticsTab"
+                role="tab" aria-controls="nodeSectionDiagnostics" aria-selected="false"
+                tabindex="-1">Diagnostics</a>
+            </li>
+          </ul>
+          <div class="node-section mt-3" id="nodeSectionType" role="tabpanel"
+            aria-labelledby="nodeSectionTypeTab"></div>
+          <div class="node-section mt-3" id="nodeSectionDiagnostics" role="tabpanel"
+            aria-labelledby="nodeSectionDiagnosticsTab" style="display: none;"></div>
         </div>
       </div>
     </div>
@@ -738,6 +755,8 @@
         document.getElementById('nodeList').style.display = 'none';
         detail.style.display = '';
         renderNodeDetail();
+        selectNodeSection('type');
+        renderDiagnosticsSection();
         /**
          * The control that was clicked is inside the list that has just been put away, so the
          * keyboard would be left on the document body. The back link takes it: it is the first
@@ -769,6 +788,137 @@
         );
 
         (wayIn || document.getElementById('nodeListTitle')).focus({ preventScroll: true });
+      };
+
+      /** The sections a node's page carries, in the order the strip draws them. */
+      const NODE_SECTIONS = [
+        { name: 'type', tab: 'nodeSectionTypeTab', panel: 'nodeSectionType' },
+        { name: 'diagnostics', tab: 'nodeSectionDiagnosticsTab', panel: 'nodeSectionDiagnostics' },
+      ];
+
+      let nodeSection = 'type';
+
+      /**
+       * Shows one section and hides the other, and moves the strip's single tab stop with it,
+       * so tabbing into the strip reaches the open section rather than every tab in turn.
+       */
+      const selectNodeSection = (name, focusTab) => {
+        nodeSection = name;
+
+        NODE_SECTIONS.forEach((section) => {
+          const chosen = section.name === name;
+          const tab = document.getElementById(section.tab);
+          const panel = document.getElementById(section.panel);
+
+          tab.classList.toggle('active', chosen);
+          tab.setAttribute('aria-selected', chosen ? 'true' : 'false');
+          tab.tabIndex = chosen ? 0 : -1;
+          panel.style.display = chosen ? '' : 'none';
+
+          if (chosen && focusTab) {
+            tab.focus();
+          }
+        });
+
+        if (name === 'diagnostics') {
+          loadDiagnosticsSection();
+        }
+      };
+
+      /**
+       * What the Diagnostics section knows about each node: the report it fetched or the
+       * failure instead, whether a fetch is running, and any covering operation on that node.
+       * Kept here rather than in the panel, so an operation survives a change of section, the
+       * five-second refresh, and the reader going back to the list and returning.
+       */
+      const diagnosticsState = new Map();
+
+      const diagnosticsFor = (nodeId) => {
+        const key = String(nodeId);
+        if (!diagnosticsState.has(key)) {
+          diagnosticsState.set(key, {});
+        }
+        return diagnosticsState.get(key);
+      };
+
+      const coveringControlsHtml = (nodeId, controls) => {
+        const disabled = controls.disabled ? ' disabled' : '';
+
+        return `
+          <div class="mt-3">
+            <div class="small font-weight-bold">Move the covering and report where it stops</div>
+            <div class="btn-group btn-group-sm mt-1">
+              ${[0, 25, 75, 100]
+                .map(
+                  (position) =>
+                    `<button type="button" class="btn btn-outline-secondary section-test-position" data-nodeid="${nodeId}" data-position="${position}"${disabled}>${position}%</button>`,
+                )
+                .join('')}
+              <button type="button" class="btn btn-outline-warning section-stop-covering" data-nodeid="${nodeId}"${disabled}>Stop</button>
+            </div>
+            <div class="small text-muted mt-1" id="sectionTestResult">${uiHelpers.escapeHtml(controls.text)}</div>
+          </div>`;
+      };
+
+      /** What the Diagnostics panel is showing, so a redraw that would change nothing is not made. */
+      let diagnosticsDrawn = null;
+
+      const renderDiagnosticsSection = () => {
+        const host = document.getElementById('nodeSectionDiagnostics');
+        if (!host || detailNodeId === null) return;
+
+        const view = uiHelpers.describeDiagnosticsSection(
+          diagnosticsState.get(String(detailNodeId)),
+        );
+        const signature = `${detailNodeId}:${JSON.stringify(view)}`;
+        if (signature === diagnosticsDrawn) return;
+        diagnosticsDrawn = signature;
+
+        if (view.kind === 'loading') {
+          host.innerHTML = '<p class="small text-muted">Reading the radio and routes...</p>';
+        } else if (view.kind === 'error') {
+          host.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(view.text)}</p>`;
+        } else {
+          host.innerHTML = `<div class="small">${uiHelpers.renderDiagnostics(view.report).html}</div>${
+            view.controls ? coveringControlsHtml(detailNodeId, view.controls) : ''
+          }`;
+        }
+
+        /**
+         * A panel with nothing to focus inside it takes the keyboard itself, so a reader
+         * tabbing out of the strip reaches what it says. One with controls does not, because
+         * that would be a stop announcing nothing before the controls themselves.
+         */
+        host.tabIndex = host.querySelector('button, a[href], select, input, textarea') ? -1 : 0;
+      };
+
+      /**
+       * Fetches the report once per node. A second selection while the first request is still
+       * running waits for it rather than asking again, and a report already read is shown as
+       * it was: this is a point-in-time reading, not something the refresh keeps current.
+       */
+      const loadDiagnosticsSection = async () => {
+        if (detailNodeId === null) return;
+
+        const nodeId = detailNodeId;
+        const state = diagnosticsFor(nodeId);
+
+        if (state.report || state.error || state.loading) {
+          renderDiagnosticsSection();
+          return;
+        }
+
+        state.loading = true;
+        renderDiagnosticsSection();
+
+        try {
+          state.report = await window.homebridge.request('node-diagnostics', nodeId);
+        } catch (err) {
+          state.error = err.message;
+        } finally {
+          state.loading = false;
+          renderDiagnosticsSection();
+        }
       };
 
       /**
@@ -803,6 +953,9 @@
           const present = new Set(nodes.map((node) => String(node.nodeId)));
           firmwareRecords.forEach((record, key) => {
             if (!present.has(key)) firmwareRecords.delete(key);
+          });
+          diagnosticsState.forEach((state, key) => {
+            if (!present.has(key)) diagnosticsState.delete(key);
           });
           nodes.forEach((node) => {
             if (node.firmwareProgress) firmwareRecords.delete(String(node.nodeId));
@@ -991,6 +1144,79 @@
 
       document.getElementById('nodeTableBody').addEventListener('click', handleReviewLink);
       document.getElementById('nodeDetail').addEventListener('click', handleReviewLink);
+
+      const nodeSectionStrip = document.getElementById('nodeSections');
+
+      nodeSectionStrip.addEventListener('click', (e) => {
+        const tab = e.target.closest('[role="tab"]');
+        if (!tab) return;
+
+        e.preventDefault();
+        const section = NODE_SECTIONS.find((candidate) => candidate.tab === tab.id);
+        if (section) selectNodeSection(section.name);
+      });
+
+      /**
+       * Arrow keys move along the strip and open what they land on. With two sections and
+       * nothing expensive behind either, there is nothing for a separate confirming key to
+       * save, and following focus is what makes the strip readable while moving through it.
+       */
+      nodeSectionStrip.addEventListener('keydown', (e) => {
+        const next = uiHelpers.nextSectionTab(
+          NODE_SECTIONS.map((section) => section.name),
+          nodeSection,
+          e.key,
+        );
+        if (next === null) return;
+
+        e.preventDefault();
+        selectNodeSection(next, true);
+      });
+
+      /**
+       * The covering controls on the node's page. The generation is kept per node rather than
+       * shared with the dialog's counter, which a closing dialog bumps: that would drop the
+       * result of a move started here the moment the reader opened and cancelled Rename, and
+       * leave the controls disabled with nothing coming to enable them.
+       *
+       * It is also not bumped when the reader leaves the node, so a move started here is still
+       * reported on their return rather than quietly dropped.
+       */
+      document.getElementById('nodeSectionDiagnostics').addEventListener('click', async (e) => {
+        const button = e.target.closest('.section-test-position, .section-stop-covering');
+        if (!button) return;
+
+        const nodeId = button.getAttribute('data-nodeid');
+        const stopping = button.classList.contains('section-stop-covering');
+        const position = Number(button.getAttribute('data-position'));
+        const state = diagnosticsFor(nodeId);
+        const generation = (state.coveringRun || 0) + 1;
+        state.coveringRun = generation;
+
+        state.covering = {
+          running: true,
+          text: stopping ? 'Stopping...' : `Moving to ${position}%...`,
+        };
+        renderDiagnosticsSection();
+
+        let text;
+        try {
+          text = stopping
+            ? uiHelpers.describeCoveringStopResult(
+                await window.homebridge.request('stop-covering', nodeId),
+              )
+            : uiHelpers.describeCoveringTestResult(
+                await window.homebridge.request('test-covering-position', { nodeId, position }),
+              );
+        } catch (err) {
+          text = err.message;
+        }
+
+        if (generation !== state.coveringRun) return;
+
+        state.covering = { running: false, text };
+        renderDiagnosticsSection();
+      });
 
       /**
        * Everything that happens once the firmware warning is accepted.
