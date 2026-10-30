@@ -1957,26 +1957,52 @@ describe('what a type write did', () => {
   ];
 
   it('counts what it rebuilt', () => {
-    expect(describeWriteOutcome({ rebuilt: [10], failed: [] }, 'window-covering', cohort)).toEqual({
-      type: 'success',
-      text: 'Device type changed on 1 node.',
-    });
     expect(
-      describeWriteOutcome({ rebuilt: [10, 11], failed: [] }, 'window-covering', cohort).text,
+      describeWriteOutcome({ rebuilt: [10], failed: [] }, 'window-covering', cohort, 'apply'),
+    ).toEqual({ type: 'success', lines: ['Device type changed on 1 node.'] });
+    expect(
+      describeWriteOutcome({ rebuilt: [10, 11], failed: [] }, 'window-covering', cohort, 'apply')
+        .lines[0],
     ).toBe('Device type changed on 2 nodes.');
   });
 
-  it('names the nodes HomeKit would not take, the way the dialog named them', () => {
+  it('gives each node HomeKit would not take its own line and its own reason', () => {
+    /**
+     * Two nodes failing for different reasons is two things to know, and the nodes are named
+     * the way the dialog that asked about them named them.
+     */
     const outcome = describeWriteOutcome(
-      { rebuilt: [10], failed: [{ nodeId: 11, error: 'HAP refused' }] },
+      {
+        rebuilt: [],
+        failed: [
+          { nodeId: 11, error: 'HAP refused' },
+          { nodeId: 10, error: 'timed out' },
+        ],
+      },
       'window-covering',
       cohort,
+      'apply',
     );
 
     expect(outcome.type).toBe('error');
-    expect(outcome.text).toBe(
+    expect(outcome.lines).toEqual([
+      'Window Covering was saved for this hardware, but HomeKit could not update Node 10 Hallway Shade: timed out. Restart Homebridge to try again.',
       'Window Covering was saved for this hardware, but HomeKit could not update Node 11 Office Shade: HAP refused. Restart Homebridge to try again.',
+    ]);
+  });
+
+  it('says what a revert did, rather than what an apply would have', () => {
+    // Nothing was saved by a revert: the override was removed.
+    const outcome = describeWriteOutcome(
+      { rebuilt: [], failed: [{ nodeId: 11, error: 'HAP refused' }] },
+      'multilevel-switch',
+      cohort,
+      'revert',
     );
+
+    expect(outcome.lines).toEqual([
+      'The override was removed, but HomeKit could not restore the default type on Node 11 Office Shade: HAP refused. Restart Homebridge to try again.',
+    ]);
   });
 
   it('still names a node the cohort no longer knows', () => {
@@ -1984,9 +2010,10 @@ describe('what a type write did', () => {
       { rebuilt: [], failed: [{ nodeId: 12, error: 'boom' }] },
       'window-covering',
       cohort,
+      'apply',
     );
 
-    expect(outcome.text).toContain('could not update Node 12: boom');
+    expect(outcome.lines[0]).toContain('could not update Node 12: boom');
   });
 });
 
@@ -2709,5 +2736,80 @@ describe('management page integration', () => {
   it('forgets a choice once it has been written, and on the way into a node', () => {
     expect(declaration('runTypeWrite')).toContain('typeDrafts.delete(String(nodeId));');
     expect(declaration('openNodeDetail')).toContain('typeDrafts.delete(String(nodeId));');
+  });
+
+  it('ties a choice to the hardware it was made against', () => {
+    /**
+     * Z-Wave reuses node numbers, and a fingerprint can change under a node being
+     * re-interviewed, so a choice held by node number alone could be applied to a different
+     * device that happens to accept it.
+     */
+    const held = declaration('draftFor');
+
+    expect(held).toContain(
+      "if (held.fingerprint !== uiHelpers.fingerprintKey(payload && payload.fingerprint)) {",
+    );
+    expect(held).toContain('typeDrafts.delete(String(nodeId));');
+    expect(lastScript()).toContain('fingerprint: uiHelpers.fingerprintKey(');
+  });
+
+  it('forgets the choice after a refusal as well as after a write', () => {
+    // A refused write was composed against something that has since moved.
+    const write = declaration('runTypeWrite');
+    const refusalAt = write.indexOf('outcome.refusal');
+
+    expect(write.indexOf('typeDrafts.delete(String(nodeId));')).toBeLessThan(refusalAt);
+  });
+
+  it('puts the keyboard back on the control that replaced the one it was on', () => {
+    const render = declaration('renderTypeSection');
+
+    expect(render).toContain('const mark = formFocusMark();');
+    expect(render).toContain('if (mark) {');
+    expect(render).toContain('replacement.focus({ preventScroll: true });');
+    expect(declaration('formFocusMark')).toContain("if (active.id === 'typeSelect') return '#typeSelect';");
+
+    // Read before the control is replaced, put back after: the other order has nothing to ask.
+    expect(render.indexOf('const mark = formFocusMark();')).toBeLessThan(
+      render.indexOf('formHost.innerHTML = typeFormHtml('),
+    );
+    expect(render.indexOf('formHost.innerHTML = typeFormHtml(')).toBeLessThan(
+      render.indexOf('replacement.focus('),
+    );
+  });
+
+  it('draws what the plugin reports apart from what is being decided', () => {
+    /**
+     * One host for both meant that changing the selection rewrote the plugin's own callouts,
+     * recreating their live regions and announcing again what had not changed.
+     */
+    const html = readPage();
+
+    expect(html).toContain('<div id="typePanelRows"></div>');
+    expect(html).toContain('<div id="typeFormHost"></div>');
+
+    const render = declaration('renderTypeSection');
+    expect(render).toContain('if (panelSignature !== typePanelDrawn) {');
+    expect(render).toContain('if (formSignature !== typeFormDrawn) {');
+  });
+
+  it("keeps the form callouts out of the live regions", () => {
+    // The cohort callout and the rebuild warning explain the form; they do not report events.
+    const form = declaration('typeFormHtml');
+
+    expect(form).not.toContain('role="status"');
+    expect(form).not.toContain('role="alert"');
+  });
+
+  it('remembers the first sentence without saying it', () => {
+    /**
+     * A selection that was already unavailable when the page opened is read from the select's
+     * own description. Only one that becomes unavailable under the reader is announced.
+     */
+    const render = declaration('renderTypeSection');
+
+    expect(render).toContain('if (typeNoteSaid === null) {');
+    expect(render).toContain('} else if (note !== typeNoteSaid) {');
+    expect(declaration('openNodeDetail')).toContain('typeNoteSaid = null;');
   });
 });

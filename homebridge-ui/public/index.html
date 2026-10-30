@@ -394,7 +394,10 @@
             </li>
           </ul>
           <div class="node-section mt-3" id="nodeSectionType" role="tabpanel"
-            aria-labelledby="nodeSectionTypeTab"></div>
+            aria-labelledby="nodeSectionTypeTab">
+            <div id="typePanelRows"></div>
+            <div id="typeFormHost"></div>
+          </div>
           <div class="node-section mt-3" id="nodeSectionDiagnostics" role="tabpanel"
             aria-labelledby="nodeSectionDiagnosticsTab" style="display: none;"></div>
           <!--
@@ -828,7 +831,9 @@
         document.getElementById('nodeList').style.display = 'none';
         detail.style.display = '';
         renderNodeDetail();
-        typeDrawn = null;
+        typePanelDrawn = null;
+        typeFormDrawn = null;
+        typeNoteSaid = null;
         typeDrafts.delete(String(nodeId));
         selectNodeSection('type');
         renderDiagnosticsSection();
@@ -894,7 +899,8 @@
 
         if (!present) {
           diagnosticsDrawn = null;
-          typeDrawn = null;
+          typePanelDrawn = null;
+          typeFormDrawn = null;
         }
       };
 
@@ -1098,8 +1104,30 @@
        */
       const typeDrafts = new Map();
 
-      /** The sentence the live region last said, so it speaks only when that changes. */
-      let typeNoteSaid = '';
+      /**
+       * A choice belongs to the hardware it was made against. Z-Wave reuses node numbers, and
+       * a fingerprint can change under a node that is being re-interviewed, so a choice held
+       * only by node number could be applied to a different device that happens to accept it.
+       */
+      const draftFor = (nodeId, payload) => {
+        const held = typeDrafts.get(String(nodeId));
+        if (!held) return null;
+
+        if (held.fingerprint !== uiHelpers.fingerprintKey(payload && payload.fingerprint)) {
+          typeDrafts.delete(String(nodeId));
+          return null;
+        }
+
+        return held.kind;
+      };
+
+      /**
+       * The sentence the live region last said, or null before a node's first payload has been
+       * drawn. The first one is remembered without being said: a selection that was already
+       * unavailable when the page opened is read from the select's own description, and only a
+       * selection that becomes unavailable under the reader is announced.
+       */
+      let typeNoteSaid = null;
 
       /** Set while a write is in flight, which disables both buttons until it answers. */
       let typeWriteRunning = false;
@@ -1112,7 +1140,7 @@
       const typeFormHtml = (nodeId, form) => `
         ${
           form.cohort
-            ? `<div class="alert alert-info py-2 small" role="status">
+            ? `<div class="alert alert-info py-2 small">
                  <strong>${uiHelpers.escapeHtml(form.cohort.heading)}</strong>
                  <div class="mt-1">${uiHelpers.escapeHtml(form.cohort.count)}</div>
                  <div class="mt-1">${form.cohort.chips.map(cohortChipHtml).join('')}</div>
@@ -1148,9 +1176,7 @@
             : ''
         }
         ${form.hint ? `<div class="small text-muted mb-2">${uiHelpers.escapeHtml(form.hint)}</div>` : ''}
-        <div class="alert alert-warning py-2 small" role="alert">${uiHelpers.escapeHtml(
-          form.warning,
-        )}</div>
+        <div class="alert alert-warning py-2 small">${uiHelpers.escapeHtml(form.warning)}</div>
         <div class="type-actions">
           <span>${
             form.revert
@@ -1164,45 +1190,84 @@
           }>${uiHelpers.escapeHtml(form.apply.label)}</button>
         </div>`;
 
-      /** What the Device type panel is showing, so a redraw that would change nothing is not made. */
-      let typeDrawn = null;
+      /** What each half of the Device type panel is showing, so neither is redrawn for nothing. */
+      let typePanelDrawn = null;
+      let typeFormDrawn = null;
+
+      /**
+       * Where the keyboard was inside the form, so it can be put back on the control that
+       * replaces the one it was on. Both the selection and the five-second refresh redraw this,
+       * and without it a reader choosing from the list is dropped out of it on every change.
+       */
+      const formFocusMark = () => {
+        const active = document.activeElement;
+        const host = document.getElementById('typeFormHost');
+        if (!host || !active || !host.contains(active)) return null;
+
+        if (active.id === 'typeSelect') return '#typeSelect';
+        if (active.classList.contains('type-apply')) return '.type-apply';
+        if (active.classList.contains('type-revert')) return '.type-revert';
+        return null;
+      };
 
       const renderTypeSection = () => {
         const host = document.getElementById('nodeSectionType');
-        if (!host || detailNodeId === null || detailGone) return;
+        const rows = document.getElementById('typePanelRows');
+        const formHost = document.getElementById('typeFormHost');
+        if (!host || !rows || !formHost || detailNodeId === null || detailGone) return;
 
         const state = typeState.get(String(detailNodeId)) || {};
-        const draft = typeDrafts.get(String(detailNodeId)) || null;
-        const signature = `${detailNodeId}:${state.error || ''}:${draft}:${typeWriteRunning}:${JSON.stringify(
+        const draft = draftFor(detailNodeId, state.payload);
+        const panelSignature = `${detailNodeId}:${state.error || ''}:${JSON.stringify(
           state.payload || null,
         )}`;
-        if (signature === typeDrawn) return;
-        typeDrawn = signature;
 
-        if (state.error) {
-          host.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(state.error)}</p>`;
-        } else if (!state.payload) {
-          host.innerHTML = '<p class="small text-muted">Loading device type...</p>';
-        } else {
-          const panel = uiHelpers.describeTypePanel(state.payload);
-          const form = uiHelpers.describeTypeForm(state.payload, draft);
-          host.innerHTML = `${panel.panels.map(typeCalloutHtml).join('')}${panel.rows
-            .map(typeRowHtml)
-            .join('')}${panel.notices.map(typeCalloutHtml).join('')}${typeFormHtml(
-            detailNodeId,
-            form,
-          )}`;
+        if (panelSignature !== typePanelDrawn) {
+          typePanelDrawn = panelSignature;
 
-          /**
-           * The sentence under the select is read when the select is focused, through
-           * aria-describedby. The live region carries it only when it has just appeared, so a
-           * choice that was already unavailable when the page was drawn is not announced at
-           * nobody in particular, while one that a refresh invalidated is.
-           */
-          const note = form.select.note || '';
-          if (note !== typeNoteSaid) {
-            document.getElementById('typeAnnounce').textContent = note;
-            typeNoteSaid = note;
+          if (state.error) {
+            rows.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(state.error)}</p>`;
+          } else if (!state.payload) {
+            rows.innerHTML = '<p class="small text-muted">Loading device type...</p>';
+          } else {
+            const panel = uiHelpers.describeTypePanel(state.payload);
+            rows.innerHTML = `${panel.panels.map(typeCalloutHtml).join('')}${panel.rows
+              .map(typeRowHtml)
+              .join('')}${panel.notices.map(typeCalloutHtml).join('')}`;
+          }
+        }
+
+        const formSignature = `${detailNodeId}:${draft}:${typeWriteRunning}:${JSON.stringify(
+          state.payload || null,
+        )}`;
+
+        if (formSignature !== typeFormDrawn) {
+          typeFormDrawn = formSignature;
+
+          if (!state.payload || state.error) {
+            formHost.innerHTML = '';
+          } else {
+            const form = uiHelpers.describeTypeForm(state.payload, draft);
+            const mark = formFocusMark();
+            formHost.innerHTML = typeFormHtml(detailNodeId, form);
+
+            if (mark) {
+              const replacement = formHost.querySelector(mark);
+              if (replacement) replacement.focus({ preventScroll: true });
+            }
+
+            /**
+             * The sentence under the select is read when the select is focused, through
+             * aria-describedby. The live region carries it only when it has changed since the
+             * last draw, and the first draw for a node is remembered rather than said.
+             */
+            const note = form.select.note || '';
+            if (typeNoteSaid === null) {
+              typeNoteSaid = note;
+            } else if (note !== typeNoteSaid) {
+              document.getElementById('typeAnnounce').textContent = note;
+              typeNoteSaid = note;
+            }
           }
         }
 
@@ -1489,7 +1554,7 @@
         const state = typeState.get(String(nodeId));
         if (!state || !state.payload) return;
 
-        const draft = typeDrafts.get(String(nodeId)) || state.payload.primaryKind;
+        const draft = draftFor(nodeId, state.payload) || state.payload.primaryKind;
         const dialog = uiHelpers.describeTypeWrite(state.payload, draft, action);
 
         pendingTypeWrite = { nodeId, action, draft, payload: state.payload };
@@ -1546,6 +1611,13 @@
             state.error = null;
           }
 
+          /**
+           * The choice goes either way. A write that happened has been answered, and a write
+           * that was refused was composed against something that has since moved, so holding
+           * the choice would offer it again against hardware or a cohort it was not made for.
+           */
+          typeDrafts.delete(String(nodeId));
+
           if (outcome && outcome.refusal) {
             const refusal = uiHelpers.describeWriteRefusal(outcome.refusal);
             window.homebridge.toast.error(refusal.text);
@@ -1553,13 +1625,14 @@
               markNodeGone();
             }
           } else {
-            typeDrafts.delete(String(nodeId));
             const result = uiHelpers.describeWriteOutcome(
               outcome,
-              action === 'revert' ? payload.defaultKind : draft,
+              draft,
               payload.cohort,
+              action,
             );
-            window.homebridge.toast[result.type](result.text);
+            // One for each node that failed, so no node's reason is dropped for another's.
+            result.lines.forEach((line) => window.homebridge.toast[result.type](line));
           }
         } catch (err) {
           window.homebridge.toast.error(err.message);
@@ -1573,7 +1646,13 @@
         const select = e.target.closest('#typeSelect');
         if (!select) return;
 
-        typeDrafts.set(String(select.getAttribute('data-nodeid')), select.value);
+        const nodeId = String(select.getAttribute('data-nodeid'));
+        const state = typeState.get(nodeId);
+
+        typeDrafts.set(nodeId, {
+          kind: select.value,
+          fingerprint: uiHelpers.fingerprintKey(state && state.payload && state.payload.fingerprint),
+        });
         renderTypeSection();
       });
 

@@ -636,6 +636,18 @@
       'The saved overrides file holds something this plugin cannot use, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
   };
 
+  /**
+   * One string for one piece of hardware, so a choice made against a device can be told apart
+   * from the same choice made against whatever reports the same node number later.
+   */
+  function fingerprintKey(fingerprint) {
+    if (!fingerprint) {
+      return '';
+    }
+
+    return `${fingerprint.manufacturerId}:${fingerprint.productType}:${fingerprint.productId}`;
+  }
+
   /** Four uppercase hex digits behind 0x, which is how a fingerprint is written throughout. */
   function hexWord(value) {
     return `0x${Number(value).toString(16).toUpperCase().padStart(4, '0')}`;
@@ -1068,33 +1080,47 @@
   /**
    * What a write that was accepted, in whole or in part, tells the reader.
    *
-   * The failed nodes are named the way the dialogs name them, which means reading their names
-   * out of the cohort the write was composed against. One error is quoted for all of them: it
-   * is one rebuild failing across nodes that share a decision, and the log keeps each.
+   * Each node that HomeKit would not take gets a line of its own carrying its own error, in
+   * node order, because two nodes failing for different reasons is two things to know. The
+   * nodes are named the way the dialogs name them, which means reading the names out of the
+   * cohort the write was composed against.
+   *
+   * A revert says what a revert did. Nothing was saved by one, so the sentence written for an
+   * apply would report a type as saved that had just been cleared.
    */
-  function describeWriteOutcome(outcome, kind, cohort) {
+  function describeWriteOutcome(outcome, kind, cohort, action) {
     const result = outcome || {};
     const failed = Array.isArray(result.failed) ? result.failed : [];
     const rebuilt = Array.isArray(result.rebuilt) ? result.rebuilt : [];
     const members = Array.isArray(cohort) ? cohort : [];
 
     if (failed.length > 0) {
-      const named = failed.map((entry) => {
-        const member = members.find((candidate) => candidate.nodeId === entry.nodeId);
-        return { nodeId: entry.nodeId, name: member ? member.name : '' };
-      });
+      const nameOf = (nodeId) => {
+        const member = members.find((candidate) => candidate.nodeId === nodeId);
+        return member && member.name ? `Node ${nodeId} ${member.name}` : `Node ${nodeId}`;
+      };
 
       return {
         type: 'error',
-        text: `${typeName(kind)} was saved for this hardware, but HomeKit could not update ${listCohortNodes(
-          named,
-        ).replace(/\s+(?=[,.]|$)/g, '')}: ${failed[0].error}. Restart Homebridge to try again.`,
+        lines: [...failed]
+          .sort((left, right) => left.nodeId - right.nodeId)
+          .map((entry) =>
+            action === 'revert'
+              ? `The override was removed, but HomeKit could not restore the default type on ${nameOf(
+                  entry.nodeId,
+                )}: ${entry.error}. Restart Homebridge to try again.`
+              : `${typeName(kind)} was saved for this hardware, but HomeKit could not update ${nameOf(
+                  entry.nodeId,
+                )}: ${entry.error}. Restart Homebridge to try again.`,
+          ),
       };
     }
 
     return {
       type: 'success',
-      text: `Device type changed on ${rebuilt.length} ${rebuilt.length === 1 ? 'node' : 'nodes'}.`,
+      lines: [
+        `Device type changed on ${rebuilt.length} ${rebuilt.length === 1 ? 'node' : 'nodes'}.`,
+      ],
     };
   }
 
@@ -1378,6 +1404,7 @@
     describeTypePanel,
     describeTypeForm,
     describeWriteRefusal,
+    fingerprintKey,
     describeTypeWrite,
     describeWriteOutcome,
     TYPE_NAMES,
