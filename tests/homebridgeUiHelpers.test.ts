@@ -1701,7 +1701,13 @@ describe('management page integration', () => {
      */
     const html = readPage();
 
-    expect(html).toContain('<a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>');
+    /**
+     * The chevron is decoration. Left in the name, it reads as "left single quotation mark, All
+     * nodes", and it is the one of the three names the page writes rather than reuses.
+     */
+    expect(html).toContain(
+      '<a href="#" class="node-detail-back" id="backToNodes"><span aria-hidden="true">&lsaquo;</span> All nodes</a>',
+    );
     expect(html).toContain('<h5 id="nodeListTitle" tabindex="-1">Z-Wave Node Maintenance</h5>');
     expect(html).toMatch(/id="nodeDetail"(?![^>]*tabindex)/);
     expect(html).toMatch(/id="nodeList"(?![^>]*tabindex)/);
