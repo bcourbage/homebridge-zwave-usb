@@ -1682,20 +1682,35 @@ describe('management page integration', () => {
     /**
      * The control that was clicked goes away with the surface it sits on, so without this the
      * keyboard is left on the document body at the top of the page, both on the way in and on
-     * the way back. The page takes it on the way in, since a redraw replaces everything inside
-     * it, and the row's own way-in button takes it on the way back.
+     * the way back.
      */
-    const html = readPage();
-
-    expect(html).toContain('id="nodeList" tabindex="-1"');
-    expect(html).toMatch(/id="nodeDetail"[^>]*tabindex="-1"/);
-    expect(html).toMatch(/#nodeList:focus,\s*#nodeDetail:focus\s*\{\s*outline:\s*none/);
-
-    expect(declaration('openNodeDetail')).toContain('detail.focus({ preventScroll: true });');
+    expect(declaration('openNodeDetail')).toContain(
+      "document.getElementById('backToNodes').focus({ preventScroll: true });",
+    );
 
     const close = declaration('closeNodeDetail');
     expect(close).toContain("button.getAttribute('data-nodeid') === String(leaving)");
-    expect(close).toContain("(wayIn || document.getElementById('nodeList')).focus(");
+    expect(close).toContain("(wayIn || document.getElementById('nodeListTitle')).focus(");
+  });
+
+  it('lands the keyboard on something that says where it is', () => {
+    /**
+     * Each of the three places focus is sent carries a name of its own: the back link and the
+     * list heading their own text, and the way-in button the label the row already gives it.
+     * None of them is a container, and none is redrawn, so a refresh cannot take focus off one.
+     */
+    const html = readPage();
+
+    expect(html).toContain('<a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>');
+    expect(html).toContain('<h5 id="nodeListTitle" tabindex="-1">Z-Wave Node Maintenance</h5>');
+    expect(html).toMatch(/id="nodeDetail"(?![^>]*tabindex)/);
+    expect(html).toMatch(/id="nodeList"(?![^>]*tabindex)/);
+
+    // The way-in button's name is the one the row renders for it.
+    expect(describeNodeActions(node({ nodeId: 5 }), { name: 'idle' }).open).toMatchObject({
+      action: 'open-node',
+      label: 'Open node 5',
+    });
   });
 
   it('says on the node page that a refresh did not answer', () => {

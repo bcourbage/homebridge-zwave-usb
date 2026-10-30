@@ -148,7 +148,6 @@
     #nodeTable th.col-actions, #nodeTable td.node-actions { text-align: right; }
 
     /* A node's own page, which replaces the table rather than sitting beside it. */
-    #nodeList:focus, #nodeDetail:focus { outline: none; }
     .node-detail-back { display: inline-block; margin-bottom: 12px; }
     .node-detail-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
     .node-detail-head h5 { margin: 0; }
@@ -316,8 +315,8 @@
 
       <!-- Maintenance Tab -->
       <div class="tab-pane fade" id="maintenance" role="tabpanel">
-        <div class="card card-body" id="nodeList" tabindex="-1">
-          <h5>Z-Wave Node Maintenance</h5>
+        <div class="card card-body" id="nodeList">
+          <h5 id="nodeListTitle" tabindex="-1">Z-Wave Node Maintenance</h5>
           <p class="text-muted small">
             View and manage your Z-Wave nodes. Check for official firmware updates via Z-Wave JS Service.
           </p>
@@ -361,7 +360,7 @@
           </div>
         </div>
 
-        <div class="card card-body" id="nodeDetail" style="display: none;" title="" tabindex="-1">
+        <div class="card card-body" id="nodeDetail" style="display: none;" title="">
           <a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>
           <div id="nodeDetailError"></div>
           <div id="nodeDetailHeader"></div>
@@ -741,10 +740,11 @@
         renderNodeDetail();
         /**
          * The control that was clicked is inside the list that has just been put away, so the
-         * keyboard would be left on the document body. It comes to the page instead, which is
-         * drawn once and stays, rather than to anything inside it that a redraw replaces.
+         * keyboard would be left on the document body. The back link takes it: it is the first
+         * thing on the page, it says what it does, and it is written once rather than redrawn,
+         * so a refresh cannot take the keyboard off it. The node's name is the next thing read.
          */
-        detail.focus({ preventScroll: true });
+        document.getElementById('backToNodes').focus({ preventScroll: true });
         // The page that has just replaced the list starts at its own top, wherever the reader
         // happened to be in the list when they left it.
         window.scrollTo(0, 0);
@@ -760,14 +760,15 @@
 
         /**
          * Back to the control the reader came in by, found by node number rather than held as
-         * an element, because every refresh replaces the row it sits in. A node that has left
-         * the network since has no row, and the list itself takes the keyboard.
+         * an element, because every refresh replaces the row it sits in. It is labeled "Open
+         * node {n}", so arriving on it says which node. A node that has left the network since
+         * has no row, and the list's own heading takes the keyboard instead.
          */
         const wayIn = [...document.querySelectorAll('#nodeTableBody button.open-node')].find(
           (button) => button.getAttribute('data-nodeid') === String(leaving),
         );
 
-        (wayIn || document.getElementById('nodeList')).focus({ preventScroll: true });
+        (wayIn || document.getElementById('nodeListTitle')).focus({ preventScroll: true });
       };
 
       /**
