@@ -12,6 +12,7 @@ const { describeHealStart, healIsRunning,
   firmwareStateOf,
   nextFirmwareRecord,
   describeNodeActions,
+  describeFirmwareCell,
   describeNodeNotices,
   typeName,
   withoutFirmwareProgress,
@@ -771,19 +772,18 @@ describe('node action cell', () => {
   const actionsFor = (phase: string | null, version?: string, over = {}) =>
     describeNodeActions(node(over), firmwareStateOf(node(over), phase === null ? null : { phase, version }));
 
-  it('idle shows the five actions as icons, keeping the classes the page delegates on', () => {
+  it('idle shows the actions a node page offers, keeping the classes the page delegates on', () => {
+    // Diagnostics is a section of the node's page rather than a button, so it is not here.
     const result = actionsFor(null);
 
     expect(result.kind).toBe('buttons');
     expect(result.buttons.map((b: any) => b.action)).toEqual([
       'rename-node',
       'refresh-node-info',
-      'node-diagnostics',
       'check-update',
       'remove-node',
     ]);
     expect(result.buttons.map((b: any) => b.variant)).toEqual([
-      'outline-secondary',
       'outline-secondary',
       'outline-secondary',
       'outline-primary',
@@ -843,7 +843,7 @@ describe('node action cell', () => {
       expect(slot.spinner).toBe(true);
       expect(slot.disabled).toBe(true);
       expect(result.buttons.filter((b: any) => b.disabled)).toHaveLength(1);
-      expect(result.buttons).toHaveLength(5);
+      expect(result.buttons).toHaveLength(4);
     }
   });
 
@@ -859,7 +859,7 @@ describe('node action cell', () => {
       disabled: false,
       spinner: false,
     });
-    expect(result.buttons).toHaveLength(5);
+    expect(result.buttons).toHaveLength(4);
   });
 
   it('a running, finished or failed update replaces the group with a progress bar', () => {
@@ -2160,6 +2160,44 @@ describe('an override that no longer fits', () => {
   });
 });
 
+describe('the Firmware column', () => {
+  it('reports the version, and says so when there is none', () => {
+    expect(describeFirmwareCell({ firmwareVersion: '11.2' }, { name: 'idle' })).toEqual({
+      version: '11.2',
+      progress: null,
+    });
+    expect(describeFirmwareCell({}, { name: 'idle' }).version).toBe('Unknown');
+  });
+
+  it('carries the progress of an update that is running, finished or failed', () => {
+    expect(describeFirmwareCell({}, { name: 'updating', percent: 40 }).progress).toEqual({
+      percent: 40,
+      failed: false,
+    });
+    expect(describeFirmwareCell({}, { name: 'completed', percent: 100 }).progress).toEqual({
+      percent: 100,
+      failed: false,
+    });
+    expect(describeFirmwareCell({}, { name: 'failed', percent: 70 }).progress).toEqual({
+      percent: 70,
+      failed: true,
+    });
+  });
+
+  it('brings a percentage the driver did not give back into range', () => {
+    expect(describeFirmwareCell({}, { name: 'updating', percent: 140 }).progress!.percent).toBe(100);
+    expect(describeFirmwareCell({}, { name: 'updating', percent: -5 }).progress!.percent).toBe(0);
+    expect(describeFirmwareCell({}, { name: 'updating' }).progress!.percent).toBe(0);
+  });
+
+  it('says nothing about progress while nothing is happening', () => {
+    ['idle', 'checking', 'available', 'starting'].forEach((name) =>
+      expect(describeFirmwareCell({}, { name }).progress).toBeNull(),
+    );
+    expect(describeFirmwareCell({}, null).progress).toBeNull();
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -2168,7 +2206,7 @@ describe('management page integration', () => {
     const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)];
     expect(scripts.length).toBeGreaterThan(0);
     for (const match of scripts) expect(() => new Function(match[1])).not.toThrow();
-    for (const id of ['diagnosticsModal', 'removeNodeModal', 'renameModal', 'confirmModal']) {
+    for (const id of ['typeWriteModal', 'removeNodeModal', 'renameModal', 'confirmModal']) {
       expect(html.match(new RegExp(`id="${id}"`, 'g'))).toHaveLength(1);
     }
   });
@@ -2323,11 +2361,12 @@ describe('management page integration', () => {
     });
   });
 
-  it('heads the action column "Actions" and leaves the status cell to the badge', () => {
+  it('heads the last column "Details" and leaves the status cell to the badge', () => {
+    // The column is a way into each node now, not a row of things to do to it.
     const html = readPage();
 
-    expect(html).toMatch(/<th[^>]*>Actions<\/th>/);
-    expect(html).not.toMatch(/<th[^>]*>Action<\/th>/);
+    expect(html).toMatch(/<th[^>]*>Details<\/th>/);
+    expect(html).not.toMatch(/<th[^>]*>Actions?<\/th>/);
     // The status texts live in the notice line now, so their lookup tables are gone from here.
     expect(html).not.toContain('refreshStateMap');
     expect(html).not.toContain('homeKitStateMap');
@@ -2456,7 +2495,7 @@ describe('management page integration', () => {
      */
     const html = readPage();
 
-    expect(html.match(/<div class="modal-actions">/g)).toHaveLength(5);
+    expect(html.match(/<div class="modal-actions">/g)).toHaveLength(4);
     expect(html).not.toContain('text-right');
   });
 
@@ -2504,7 +2543,7 @@ describe('management page integration', () => {
   it('escapes every node-supplied value it writes into the row', () => {
     const script = [...readPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)![1] as string;
 
-    for (const written of ['notice.text', 'button.label', 'nodeName', "node.firmwareVersion || 'Unknown'"]) {
+    for (const written of ['notice.text', 'button.label', 'nodeName', 'cell.version']) {
       expect(script).toContain(`uiHelpers.escapeHtml(${written})`);
     }
   });
@@ -2755,12 +2794,31 @@ describe('management page integration', () => {
     expect(script).toContain('if (generation !== state.coveringRun) return;');
   });
 
-  it('keeps the dialog and the row icon until the section replaces both', () => {
-    // They go together, once the section is doing the work, and not before.
+  it('leaves nothing of the dialog the Diagnostics section replaced', () => {
+    /**
+     * The dialog and the row icon that opened it went together, once the section was doing the
+     * work. What drove the covering from inside the dialog went with them.
+     */
     const html = readPage();
 
-    expect(html.match(/id="diagnosticsModal"/g)).toHaveLength(1);
-    expect(html).toContain('node-diagnostics');
+    ['diagnosticsModal', 'diagnosticsBody', 'closeDiagnostics', 'positionTestRow'].forEach((id) =>
+      expect(html).not.toContain(id),
+    );
+    expect(html).not.toContain('runCoveringControl');
+  });
+
+  it('offers nothing in the row but the way into the node', () => {
+    /**
+     * Every control that acts on a node is on the node's own page, so none is offered twice
+     * and the list reads as an overview. A node mid-update shows how far it has got beside
+     * its firmware version, where a reader scanning for it is already looking.
+     */
+    const cell = declaration('actionCellHtml');
+
+    expect(cell).toContain('actionButtonHtml(nodeId, actions.open)');
+    expect(cell).not.toContain('actions.buttons');
+    expect(cell).not.toContain("actions.kind === 'progress'");
+    expect(lastScript()).toContain('uiHelpers.describeFirmwareCell(node, firmwareState)');
   });
 
   it('reads the device type when the reader comes to the section', () => {

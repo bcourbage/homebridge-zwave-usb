@@ -445,12 +445,6 @@
       variant: 'outline-secondary',
       icon: 'refresh',
     },
-    {
-      action: 'node-diagnostics',
-      label: 'Diagnostics',
-      variant: 'outline-secondary',
-      icon: 'diagnostics',
-    },
     { action: 'check-update', label: 'Check Update', variant: 'outline-primary', icon: 'update' },
     { action: 'remove-node', label: 'Remove', variant: 'outline-danger', icon: 'remove' },
   ];
@@ -520,6 +514,30 @@
     });
 
     return { kind: 'buttons', buttons, open };
+  }
+
+  /**
+   * What the list's Firmware column says: the version the node reports, and the progress of an
+   * update when one is running, finished or failed.
+   *
+   * The progress used to replace the row's group of buttons. The row no longer has one, and a
+   * reader scanning the list for which device is updating is looking at the firmware.
+   */
+  function describeFirmwareCell(node, firmwareState) {
+    const state = firmwareState || { name: 'idle' };
+    const running =
+      state.name === 'updating' || state.name === 'completed' || state.name === 'failed';
+    const reported = Math.round(Number(state.percent));
+
+    return {
+      version: (node && node.firmwareVersion) || 'Unknown',
+      progress: running
+        ? {
+            percent: Number.isFinite(reported) ? Math.min(100, Math.max(0, reported)) : 0,
+            failed: state.name === 'failed',
+          }
+        : null,
+    };
   }
 
   /** Most serious first, so a failure is never read after the routine news below it. */
@@ -1521,6 +1539,7 @@
     firmwareStateOf,
     nextFirmwareRecord,
     describeNodeActions,
+    describeFirmwareCell,
     describeNodeNotices,
     withoutFirmwareProgress,
     describeBattery,

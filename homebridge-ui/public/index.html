@@ -369,7 +369,7 @@
                   <th>Name</th>
                   <th>Status</th>
                   <th>Firmware</th>
-                  <th class="col-actions">Actions</th>
+                  <th class="col-actions">Details</th>
                 </tr>
               </thead>
               <tbody id="nodeTableBody">
@@ -443,14 +443,6 @@
     <div class="modal-actions">
       <button class="btn btn-sm btn-secondary" id="cancelConfirm">Cancel</button>
       <button class="btn btn-sm btn-primary" id="executeConfirm">OK</button>
-    </div>
-  </div>
-
-  <div id="diagnosticsModal" class="custom-modal" title="">
-    <h6 id="diagnosticsTitle">Radio and Route Diagnostics</h6>
-    <div id="diagnosticsBody" class="small"></div>
-    <div class="modal-actions">
-      <button class="btn btn-sm btn-secondary" id="closeDiagnostics">Close</button>
     </div>
   </div>
 
@@ -586,29 +578,29 @@
         } title="" data-tip="${label}" aria-label="${label}">${body}</button>`;
       };
 
+      /**
+       * The list offers the way into a node and nothing else. Everything that acts on a node is
+       * on the node's own page, so no control is offered in two places and the list reads as an
+       * overview rather than a control panel.
+       */
       const actionCellHtml = (nodeId, actions) => {
         if (actions.kind === 'controller') {
           return '<span class="badge badge-light">Controller</span>';
         }
 
-        if (actions.kind === 'progress') {
-          return `
-                <div class="node-action-cell">
-                  <div class="progress" style="height: 20px; flex: 1;">
-                    <div class="progress-bar progress-bar-striped progress-bar-animated${
-                      actions.failed ? ' bg-danger' : ''
-                    }" role="progressbar" style="width: ${actions.percent}%">${
-                      actions.percent
-                    }%</div>
-                  </div>${actionButtonHtml(nodeId, actions.open)}
-                </div>
-              `;
-        }
-
-        return `<div class="node-action-cell"><div class="btn-group">${actions.buttons
-          .map((button) => actionButtonHtml(nodeId, button))
-          .join('')}</div>${actionButtonHtml(nodeId, actions.open)}</div>`;
+        return `<div class="node-action-cell">${actionButtonHtml(nodeId, actions.open)}</div>`;
       };
+
+      const firmwareCellHtml = (cell) => `
+        ${uiHelpers.escapeHtml(cell.version)}${
+          cell.progress
+            ? `<div class="progress mt-1" style="height: 14px;"><div class="progress-bar progress-bar-striped progress-bar-animated${
+                cell.progress.failed ? ' bg-danger' : ''
+              }" role="progressbar" style="width: ${cell.progress.percent}%">${
+                cell.progress.percent
+              }%</div></div>`
+            : ''
+        }`;
 
       const batteryHtml = (battery) => {
         if (!battery) return '';
@@ -659,7 +651,7 @@
 	              <td>
 	                <span class="badge badge-${status.tone}">${status.text}</span>
 	              </td>
-	              <td>${uiHelpers.escapeHtml(node.firmwareVersion || 'Unknown')}</td>
+	              <td>${firmwareCellHtml(uiHelpers.describeFirmwareCell(node, firmwareState))}</td>
 	              <td class="node-actions" id="node-action-${node.nodeId}">${actionCellHtml(node.nodeId, actions)}</td>
 	            `;
           tbody.appendChild(tr);
@@ -1539,11 +1531,9 @@
       };
 
       const hideModals = () => {
-        coveringRun++;
         document.getElementById('modalBackdrop').style.display = 'none';
         document.getElementById('renameModal').style.display = 'none';
         document.getElementById('confirmModal').style.display = 'none';
-        document.getElementById('diagnosticsModal').style.display = 'none';
         document.getElementById('removeNodeModal').style.display = 'none';
         document.getElementById('typeWriteModal').style.display = 'none';
         isPromptOpen = false;
@@ -1591,38 +1581,6 @@
             ? 'This resets the node interview state and requests fresh metadata. Keep the device awake while the refresh runs so it can answer interview commands.'
             : 'This resets the node interview state and requests fresh metadata from the node. Continue?';
           showModal('confirmModal');
-          return;
-        }
-
-        if (target.classList.contains('node-diagnostics')) {
-          target.disabled = true;
-          try {
-            const d = await window.homebridge.request('node-diagnostics', nodeId);
-            const { title, html } = uiHelpers.renderDiagnostics(d);
-            document.getElementById('diagnosticsTitle').textContent = title;
-            document.getElementById('diagnosticsBody').innerHTML = `
-              ${html}
-              <div class="mt-2" id="positionTestRow" style="display:none;">
-                <div class="small font-weight-bold">Move the covering and report where it stops</div>
-                <div class="btn-group btn-group-sm mt-1">
-                  <button class="btn btn-outline-secondary test-position" data-position="0">0%</button>
-                  <button class="btn btn-outline-secondary test-position" data-position="25">25%</button>
-                  <button class="btn btn-outline-secondary test-position" data-position="75">75%</button>
-                  <button class="btn btn-outline-secondary test-position" data-position="100">100%</button>
-                  <button class="btn btn-outline-warning stop-covering">Stop</button>
-                </div>
-                <div class="small text-muted mt-1" id="positionTestResult"></div>
-              </div>
-            `;
-            activeNodeId = nodeId;
-            document.getElementById('positionTestRow').style.display =
-              d.isWindowCovering ? 'block' : 'none';
-            showModal('diagnosticsModal');
-          } catch (err) {
-            window.homebridge.toast.error(err.message);
-          } finally {
-            target.disabled = false;
-          }
           return;
         }
 
@@ -2054,72 +2012,6 @@
           loadNodes();
 	        }
 	      });
-
-	      /**
-	       * One covering operation at a time. A move runs for tens of seconds, so leaving the
-	       * controls live would let a second click drive the same motor while the first is still
-	       * going and make both readings meaningless. The generation counter means a result that
-	       * arrives after the panel has moved on cannot overwrite what is on screen.
-	       */
-	      let coveringRun = 0;
-
-	      const runCoveringControl = async (pending, waitingText) => {
-	        const generation = ++coveringRun;
-	        const resultEl = document.getElementById('positionTestResult');
-	        const controls = document.querySelectorAll('#positionTestRow button');
-	        controls.forEach((control) => {
-	          control.disabled = true;
-	        });
-	        resultEl.textContent = waitingText;
-
-	        try {
-	          const text = await pending();
-	          if (generation === coveringRun) {
-	            resultEl.textContent = text;
-	          }
-	        } catch (err) {
-	          if (generation === coveringRun) {
-	            resultEl.textContent = err.message;
-	          }
-	        } finally {
-	          if (generation === coveringRun) {
-	            controls.forEach((control) => {
-	              control.disabled = false;
-	            });
-	          }
-	        }
-	      };
-
-	      document.getElementById('diagnosticsBody').addEventListener('click', async (e) => {
-	        const stopButton = e.target.closest('.stop-covering');
-	        if (stopButton) {
-	          await runCoveringControl(
-	            async () =>
-	              uiHelpers.describeCoveringStopResult(
-	                await window.homebridge.request('stop-covering', activeNodeId),
-	              ),
-	            'Stopping...',
-	          );
-	          return;
-	        }
-
-	        const target = e.target.closest('.test-position');
-	        if (!target) return;
-
-	        const position = Number(target.getAttribute('data-position'));
-	        await runCoveringControl(
-	          async () =>
-	            uiHelpers.describeCoveringTestResult(
-	              await window.homebridge.request('test-covering-position', {
-	                nodeId: activeNodeId,
-	                position,
-	              }),
-	            ),
-	          `Moving to ${position}%...`,
-	        );
-	      });
-
-	      document.getElementById('closeDiagnostics').addEventListener('click', hideModals);
 
 	      document.getElementById('cancelRemoveNode').addEventListener('click', hideModals);
 	      document.getElementById('confirmRemoveNode').addEventListener('click', async () => {
