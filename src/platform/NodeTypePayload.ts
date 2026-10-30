@@ -18,6 +18,8 @@ export interface EndpointType {
 export interface CohortMember {
   nodeId: number;
   name: string;
+  /** Whether Matter publishes this node, which decides whether a change to it needs a restart. */
+  matterActive: boolean;
   primaryKind: PrimaryKind | null;
   defaultKind: PrimaryKind | null;
   /** Whether the saved override is in effect here, and null while the hardware has none. */
@@ -78,7 +80,12 @@ export interface NodeTypePayload {
 
 /** What the plugin knows about a node that the resolver does not decide. */
 export interface PayloadContext {
-  matterActive: boolean;
+  /**
+   * Whether Matter publishes a given node, asked per node rather than once for the one whose
+   * page is open. A decision reaches every node sharing the fingerprint, and the restart it
+   * needs is disclosed for whichever of them Matter is publishing.
+   */
+  matterPublishes: (nodeId: number) => boolean;
   /** The error from the last rebuild of this node, until one succeeds or the plugin restarts. */
   rebuildFailure: string | null;
 }
@@ -176,6 +183,7 @@ export function buildNodeTypePayload(
     cohort: cohort.map((member) => ({
       nodeId: member.nodeId,
       name: nameOf(member),
+      matterActive: context.matterPublishes(member.nodeId),
       primaryKind: resolver.primaryKindFor(member) ?? null,
       defaultKind: TypeOverrideResolver.defaultTypeFor(member).kind ?? null,
       takesOverride: override ? resolver.appliedOverrideFor(member) !== undefined : null,
@@ -195,7 +203,7 @@ export function buildNodeTypePayload(
       error: resolver.store.readOnlyCode ? { code: resolver.store.readOnlyCode } : null,
     },
     rebuildFailure: context.rebuildFailure ? { error: context.rebuildFailure } : null,
-    matterActive: context.matterActive,
+    matterActive: context.matterPublishes(node.nodeId),
   };
 }
 

@@ -845,7 +845,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     return buildNodeTypePayload(resolver, node, {
-      matterActive: this.matterPublishes(nodeId),
+      matterPublishes: (member) => this.matterPublishes(member),
       rebuildFailure: this.rebuildFailureFor(node),
     });
   }
@@ -1006,6 +1006,33 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   }
 
   /**
+   * Puts a freshly built accessory in place of the one a node has.
+   *
+   * The old one is stopped first, because two accessories bound to one node would both answer
+   * it. It is also taken out of the map first, and that is the part that matters: if the
+   * replacement cannot be built, a stopped accessory left in the map answers nothing while its
+   * stored signature still says the node is up to date. The next pass, or a revert, would then
+   * find the signature it expects, settle the warning, skip the rebuild, and leave HomeKit
+   * bound to a thing that does nothing until Homebridge is restarted. With no entry there, the
+   * next pass has a node with no accessory and builds one.
+   */
+  private replaceAccessory(
+    node: IZWaveNode,
+    homeId: number,
+    plans: readonly EndpointPlan[],
+    options: { removeSupersededServices?: boolean; pruneUnmanagedServices?: boolean },
+  ): void {
+    this.zwaveAccessories.get(node.nodeId)?.stop();
+    this.zwaveAccessories.delete(node.nodeId);
+
+    const replacement = AccessoryFactory.create(this, node, homeId, plans);
+    this.zwaveAccessories.set(node.nodeId, replacement);
+    replacement.initialize(options);
+    this.settleRebuildWarning(node.nodeId);
+    this.offerToMatter(replacement, node.nodeId);
+  }
+
+  /**
    * A node publishing the plan made for this pass is no longer behind the type saved for it,
    * whatever brought it up to date.
    *
@@ -1092,12 +1119,9 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
            * Building the graph again replaces the stored signature, which is why the reconcile
            * has to be requested here rather than inferred from a later comparison.
            */
-          existing.stop();
-          const hydratedAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
-          this.zwaveAccessories.set(node.nodeId, hydratedAccessory);
-          hydratedAccessory.initialize({ removeSupersededServices: true });
-          this.settleRebuildWarning(node.nodeId);
-          this.offerToMatter(hydratedAccessory, node.nodeId);
+          this.replaceAccessory(node, homeId, featurePlans(), {
+            removeSupersededServices: true,
+          });
           return;
         }
 
@@ -1110,12 +1134,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           this.log.info(
             `Rebuilding accessory graph for Node ${node.nodeId} after capability change was detected.`,
           );
-          existing.stop();
-          const reconciledAccessory = AccessoryFactory.create(this, node, homeId, featurePlans());
-          this.zwaveAccessories.set(node.nodeId, reconciledAccessory);
-          reconciledAccessory.initialize({ pruneUnmanagedServices: true });
-          this.settleRebuildWarning(node.nodeId);
-          this.offerToMatter(reconciledAccessory, node.nodeId);
+          this.replaceAccessory(node, homeId, featurePlans(), { pruneUnmanagedServices: true });
           return;
         }
 

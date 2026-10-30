@@ -1076,6 +1076,19 @@
        */
       const typeState = new Map();
 
+      /**
+       * Bumped each time a write answers for a node. A read started before that answer is
+       * discarded when it arrives: it was composed against the state the write has replaced,
+       * and the five-second refresh means one is often in flight when a write lands, so the
+       * panel would go back to showing what the reader had just changed.
+       */
+      const typeGenerations = new Map();
+
+      const typeGenerationOf = (nodeId) => typeGenerations.get(String(nodeId)) || 0;
+
+      const supersedeTypeReads = (nodeId) =>
+        typeGenerations.set(String(nodeId), typeGenerationOf(nodeId) + 1);
+
       const typeFor = (nodeId) => {
         const key = String(nodeId);
         if (!typeState.has(key)) {
@@ -1448,12 +1461,20 @@
         state.loading = true;
         renderTypeSection();
 
+        const generation = typeGenerationOf(nodeId);
+
         try {
           const payload = await window.homebridge.request('get-node-type', nodeId);
-          state.payload = payload;
-          state.error = null;
+          // A write has answered for this node since the read was asked for, and what it
+          // returned describes the node after it rather than before.
+          if (generation === typeGenerationOf(nodeId)) {
+            state.payload = payload;
+            state.error = null;
+          }
         } catch (err) {
-          state.error = err.message;
+          if (generation === typeGenerationOf(nodeId)) {
+            state.error = err.message;
+          }
         } finally {
           state.loading = false;
           renderTypeSection();
@@ -1501,6 +1522,9 @@
           });
           typeDrafts.forEach((kind, key) => {
             if (!present.has(key)) typeDrafts.delete(key);
+          });
+          typeGenerations.forEach((generation, key) => {
+            if (!present.has(key)) typeGenerations.delete(key);
           });
           nodes.forEach((node) => {
             if (node.firmwareProgress) firmwareRecords.delete(String(node.nodeId));
@@ -1764,6 +1788,7 @@
            * measured against rather than the one the request was composed from.
            */
           const state = typeFor(nodeId);
+          supersedeTypeReads(nodeId);
           if (outcome && outcome.payload) {
             state.payload = outcome.payload;
             state.error = null;

@@ -1219,7 +1219,13 @@
       title: reverting ? 'Revert to the default type?' : 'Change the device type for this hardware?',
       lines,
       warning: changing.length === 1 ? REBUILD_WARNING_ONE : REBUILD_WARNING_MANY,
-      matter: data.matterActive ? MATTER_RESTART_LINE : null,
+      /**
+       * Asked of the nodes this write would actually rebuild, not of the one whose page is
+       * open. A decision reaches every node sharing the fingerprint, so a reader looking at a
+       * node Matter does not publish can still be changing one it does, and that device stays
+       * as it was in Alexa until Homebridge restarts.
+       */
+      matter: changing.some((member) => member.matterActive) ? MATTER_RESTART_LINE : null,
       confirmLabel: reverting ? 'Revert' : 'Apply',
       nodeCount: changing.length,
     };

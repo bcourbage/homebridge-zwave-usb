@@ -65,9 +65,14 @@ describe('node type payload', () => {
   const payloadFor = (
     target: IZWaveNode,
     built = resolver(),
-    matterActive = true,
+    matterActive: boolean | ((nodeId: number) => boolean) = true,
     rebuildFailure: string | null = null,
-  ) => buildNodeTypePayload(built, target, { matterActive, rebuildFailure });
+  ) =>
+    buildNodeTypePayload(built, target, {
+      matterPublishes:
+        typeof matterActive === 'function' ? matterActive : () => matterActive,
+      rebuildFailure,
+    });
 
   beforeEach(() => {
     directory = fs.mkdtempSync(path.join(os.tmpdir(), 'zwave-payload-'));
@@ -140,6 +145,24 @@ describe('node type payload', () => {
 
       expect(payloadFor(nodes[0], resolver(), false).matterActive).toBe(false);
     });
+
+    it('says which of the nodes sharing the hardware Matter publishes', () => {
+      /**
+       * A decision reaches every node with this fingerprint, so the restart Matter needs is a
+       * question about each of them. Asking it only of the node whose page is open leaves a
+       * reader changing a device that stays as it was in Alexa with nothing said about it.
+       */
+      nodes = [shade({ nodeId: 10, name: 'Hallway' }), shade({ nodeId: 11, name: 'Office' })];
+
+      const payload = payloadFor(nodes[0], undefined, (nodeId: number) => nodeId === 11);
+
+      expect(payload.matterActive).toBe(false);
+      expect(payload.cohort.map((member) => [member.nodeId, member.matterActive])).toEqual([
+        [10, false],
+        [11, true],
+      ]);
+    });
+
   });
 
   describe('the hardware a decision reaches', () => {
@@ -150,6 +173,7 @@ describe('node type payload', () => {
         {
           nodeId: 10,
           name: 'Hallway',
+          matterActive: true,
           primaryKind: 'multilevel-switch',
           defaultKind: 'multilevel-switch',
           takesOverride: null,
@@ -157,6 +181,7 @@ describe('node type payload', () => {
         {
           nodeId: 11,
           name: 'Office',
+          matterActive: true,
           primaryKind: 'multilevel-switch',
           defaultKind: 'multilevel-switch',
           takesOverride: null,
@@ -348,7 +373,7 @@ describe('node type payload', () => {
       const payload = buildNodeTypePayload(
         new TypeOverrideResolver(store, () => nodes, log),
         nodes[0],
-        { matterActive: true, rebuildFailure: null },
+        { matterPublishes: () => true, rebuildFailure: null },
       );
 
       expect(payload.store.readable).toBe(false);

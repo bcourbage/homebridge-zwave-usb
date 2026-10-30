@@ -2567,6 +2567,153 @@ describe('ZWaveUsbPlatform', () => {
       expect(body.rebuilt).toEqual([]);
     });
 
+    /**
+     * An accessory whose stop() has an effect. Once stopped it answers nothing, which is what a
+     * torn-down covering controller does: a stub whose stop() changes nothing cannot show the
+     * defect these two cover, because using the stopped accessory would look like success.
+     */
+    const stoppable = (nodeId: number, signature: string) => {
+      const refuseWhenStopped = (what: string) =>
+        jest.fn(() => {
+          if (accessory.stopped) {
+            throw new Error(`${what} reached a stopped accessory for Node ${nodeId}`);
+          }
+        });
+
+      const accessory = {
+        platformAccessory: { UUID: `uuid-${nodeId}` },
+        stopped: false,
+        initialize: jest.fn(),
+        isInitialized: () => true,
+        getGraphSignature: () => signature,
+        stop: jest.fn(() => {
+          accessory.stopped = true;
+        }),
+        refresh: refuseWhenStopped('refresh'),
+        updateNode: refuseWhenStopped('updateNode'),
+      };
+
+      return accessory;
+    };
+
+    it('keeps no accessory it stopped when the replacement cannot be built', async () => {
+      /**
+       * The old accessory is stopped before the new one is built. Left in place after a failed
+       * build it answers nothing, while the signature it still reports says the node is up to
+       * date, so the next pass settles the warning, skips the rebuild, and leaves HomeKit bound
+       * to it until Homebridge restarts.
+       */
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      const original = stoppable(10, 'before');
+      platform.zwaveAccessories = new Map([[10, original]]);
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'setNodeType')
+        .mockResolvedValue({ rebuild: [10] });
+      jest.spyOn(AccessoryFactory, 'create').mockImplementation(() => {
+        throw new Error('HAP refused the service change');
+      });
+
+      const { body } = await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(original.stopped).toBe(true);
+      expect(body.failed).toEqual([
+        { nodeId: 10, error: expect.stringContaining('HAP refused the service change') },
+      ]);
+      expect(platform.zwaveAccessories.get(10)).toBeUndefined();
+    });
+
+    it('rebuilds after a failed rebuild rather than settling against what it stopped', async () => {
+      /**
+       * The sequence that made the first finding matter: an apply fails, and the revert that
+       * follows finds the signature it expects on the accessory the failure stopped. With that
+       * accessory gone, there is nothing to match and the node is built again.
+       */
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, stoppable(10, 'before')]]);
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'setNodeType')
+        .mockResolvedValue({ rebuild: [10] });
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'clearNodeType')
+        .mockResolvedValue({ rebuild: [10] });
+
+      const create = jest.spyOn(AccessoryFactory, 'create').mockImplementation(() => {
+        throw new Error('HAP refused the service change');
+      });
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      const rebuilt = {
+        platformAccessory: { UUID: 'uuid-10' },
+        initialize: jest.fn(),
+        isInitialized: () => true,
+        getGraphSignature: () => 'after',
+        stop: jest.fn(),
+        refresh: jest.fn(),
+        updateNode: jest.fn(),
+      };
+      create.mockReturnValue(rebuilt as never);
+
+      const { body } = await driveRoute(platform, '/nodes/10/type/clear', 'POST', {
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(body.rebuilt).toEqual([10]);
+      expect(platform.zwaveAccessories.get(10)).toBe(rebuilt);
+    });
+
+    it('refuses a type saved for the controller, however the request arrives', async () => {
+      /**
+       * The sync never builds a generic accessory for Node 1, so a decision saved for it would
+       * be kept and applied to nothing. The UI does not offer it, and that is not the same as
+       * refusing it: this route can be called directly, with a node that otherwise qualifies.
+       */
+      saved();
+      const controller = shadeNode(1);
+      const platform = newPlatform(new Map([[1, controller]]));
+      platform.zwaveAccessories = new Map();
+
+      const { status, body } = await driveRoute(platform, '/nodes/1/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(status).toBe(200);
+      expect(body.refusal).toBe('not-overridable');
+      expect(body.rebuilt).toEqual([]);
+      expect(JSON.parse(fs.readFileSync(path.join(storagePath, OVERRIDES_FILE), 'utf8')).overrides)
+        .toEqual([]);
+    });
+
+    it('keeps the controller out of a cohort that shares its hardware', async () => {
+      // The cohort answers the same question the write does, so it cannot hold a node a write
+      // would refuse and then count it among those a decision would reach.
+      saved();
+      const platform = newPlatform(
+        new Map([
+          [1, shadeNode(1)],
+          [10, shadeNode(10)],
+        ]),
+      );
+      platform.zwaveAccessories = new Map();
+
+      const { body } = await driveRoute(platform, '/nodes/10/type', 'GET');
+
+      expect(body.cohort.map((member: { nodeId: number }) => member.nodeId)).toEqual([10]);
+    });
+
     it('writes the refusal code to the log and not to the reader', async () => {
       /**
        * The panel says the write did not happen and sends the reader to what it now reports,

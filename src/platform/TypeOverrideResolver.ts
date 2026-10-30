@@ -150,9 +150,14 @@ export class TypeOverrideResolver {
    * be choosing which endpoint the node is. A device that has not reported all three identifiers
    * cannot be told apart from another model, and a decision made for it would reach whatever
    * else arrived without them.
+   *
+   * Node 1 is the controller, which the sync never builds a generic accessory for. A decision
+   * saved for it would be kept and applied to nothing, and a request for it has to be refused
+   * here rather than only left out of the UI: the route can be called directly.
    */
   public static isOverridable(node: IZWaveNode): boolean {
     return (
+      Number(node.nodeId) !== 1 &&
       TypeOverrideResolver.fingerprintOf(node) !== undefined &&
       node.getAllEndpoints().length === 1
     );
@@ -269,11 +274,12 @@ export class TypeOverrideResolver {
     return this.listNodes().filter((node) => {
       const theirs = TypeOverrideResolver.fingerprintOf(node);
 
+      // The same question the write asks, so the cohort cannot hold a node a write would refuse.
       return (
         node.ready &&
         theirs !== undefined &&
         fingerprintKey(theirs) === key &&
-        node.getAllEndpoints().length === 1
+        TypeOverrideResolver.isOverridable(node)
       );
     })
       .sort((one, other) => one.nodeId - other.nodeId);

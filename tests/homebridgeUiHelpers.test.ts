@@ -1861,6 +1861,7 @@ describe('confirming a type write', () => {
   const member = (nodeId: number, name: string, over: Record<string, unknown> = {}) => ({
     nodeId,
     name,
+    matterActive: false,
     primaryKind: 'multilevel-switch',
     defaultKind: 'multilevel-switch',
     takesOverride: true,
@@ -1870,7 +1871,6 @@ describe('confirming a type write', () => {
   const payload = (over: Record<string, unknown> = {}) => ({
     nodeId: 10,
     cohort: [member(10, 'Hallway Shade'), member(11, 'Office Shade')],
-    matterActive: false,
     ...over,
   });
 
@@ -1931,11 +1931,34 @@ describe('confirming a type write', () => {
     ]);
   });
 
-  it('discloses the restart only where Matter is publishing', () => {
+  it('discloses the restart for whichever node the write would rebuild', () => {
+    /**
+     * A decision reaches every node sharing the fingerprint. Asking only about the node whose
+     * page is open leaves a reader changing a device that Matter publishes, and that stays as
+     * it was in Alexa until Homebridge restarts, with nothing said about it.
+     */
     expect(describeTypeWrite(payload(), 'window-covering', 'apply').matter).toBeNull();
-    expect(describeTypeWrite(payload({ matterActive: true }), 'window-covering', 'apply').matter).toBe(
+
+    const elsewhere = payload({
+      cohort: [member(10, 'Hallway Shade'), member(11, 'Office Shade', { matterActive: true })],
+    });
+
+    expect(describeTypeWrite(elsewhere, 'window-covering', 'apply').matter).toBe(
       'Matter controllers, including Alexa, show the new type after Homebridge restarts.',
     );
+  });
+
+  it('says nothing about a restart for a node the write would not touch', () => {
+    // A cohort node already publishing the chosen type is not rebuilt, so nothing about it
+    // changes in Matter either.
+    const settled = payload({
+      cohort: [
+        member(10, 'Hallway Shade'),
+        member(11, 'Office Shade', { matterActive: true, primaryKind: 'window-covering' }),
+      ],
+    });
+
+    expect(describeTypeWrite(settled, 'window-covering', 'apply').matter).toBeNull();
   });
 
   it('counts the accessories the write would rebuild', () => {
@@ -2875,6 +2898,29 @@ describe('management page integration', () => {
     ['row.label', 'row.value', 'row.chip', 'under', 'callout.heading', 'callout.body'].forEach(
       (written) => expect(script).toContain(`uiHelpers.escapeHtml(${written})`),
     );
+  });
+
+  it('discards a reading a write has already answered for', () => {
+    /**
+     * The five-second refresh means a read is often in flight when a write lands. One started
+     * before the write describes the node as it was, so applying it when it arrives puts back
+     * what the reader has just changed.
+     */
+    const load = declaration('loadTypeSection');
+    const write = declaration('runTypeWrite');
+
+    expect(load).toContain('const generation = typeGenerationOf(nodeId);');
+    expect(load).toContain('if (generation === typeGenerationOf(nodeId)) {');
+    expect(write).toContain('supersedeTypeReads(nodeId);');
+
+    // Read before the request, not after it, or every read would look current.
+    expect(load.indexOf('const generation = typeGenerationOf(nodeId);')).toBeLessThan(
+      load.indexOf("await window.homebridge.request('get-node-type', nodeId)"),
+    );
+
+    // A failure that a write has answered for is dropped the same way a payload is.
+    expect(load).toContain('state.error = err.message;');
+    expect(load.split('if (generation === typeGenerationOf(nodeId)) {').length - 1).toBe(2);
   });
 
   it('keeps the device type current while the section is open', () => {
