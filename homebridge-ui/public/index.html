@@ -159,6 +159,11 @@
     .type-row-label { flex: 0 0 150px; }
     .type-row-value { flex: 1 1 auto; min-width: 0; }
     .type-chip { font-weight: 500; margin-left: 8px; vertical-align: 1px; }
+    .cohort-chip { display: inline-block; margin: 2px 6px 2px 0; padding: 2px 8px; border-radius: 4px;
+                   border: 1px solid rgba(127, 127, 127, 0.35); }
+    .cohort-chip .cohort-note { opacity: 0.75; }
+    .type-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between;
+                    margin-top: 12px; }
     /* Bootstrap colors <code> pink, which reads as something being wrong with the value. */
     .type-hex { margin-right: 6px; padding: 2px 6px; border-radius: 3px; color: inherit;
                 background: rgba(127, 127, 127, 0.16); }
@@ -392,6 +397,12 @@
             aria-labelledby="nodeSectionTypeTab"></div>
           <div class="node-section mt-3" id="nodeSectionDiagnostics" role="tabpanel"
             aria-labelledby="nodeSectionDiagnosticsTab" style="display: none;"></div>
+          <!--
+            Written once and kept, so it speaks when its contents change and stays quiet when a
+            redraw puts back what was already there. A region recreated on every render would
+            announce a sentence that had not changed.
+          -->
+          <div id="typeAnnounce" class="sr-only" role="status" aria-live="polite"></div>
         </div>
       </div>
     </div>
@@ -408,6 +419,15 @@
     <div class="modal-actions">
       <button class="btn btn-sm btn-secondary" id="cancelRename">Cancel</button>
       <button class="btn btn-sm btn-primary" id="confirmRename">Save</button>
+    </div>
+  </div>
+
+  <div id="typeWriteModal" class="custom-modal" title="">
+    <h6 id="typeWriteTitle"></h6>
+    <div id="typeWriteBody" class="small"></div>
+    <div class="modal-actions">
+      <button class="btn btn-sm btn-secondary" id="cancelTypeWrite">Cancel</button>
+      <button class="btn btn-sm btn-primary" id="confirmTypeWrite"></button>
     </div>
   </div>
 
@@ -700,37 +720,46 @@
        */
       let detailGone = false;
 
+      /**
+       * A node that leaves the network while its page is open says so, and takes its sections
+       * with it.
+       */
+      const markNodeGone = () => {
+        const host = document.getElementById('nodeDetailHeader');
+        if (!host || detailGone) return;
+
+        detailGone = true;
+
+        /**
+         * Read before anything is rewritten, because by the time the controls are gone the
+         * keyboard is already on the document body and there is nothing left to ask.
+         */
+        const detail = document.getElementById('nodeDetail');
+        const hadFocus = detail.contains(document.activeElement);
+
+        // Announced rather than only drawn: a reader who was in the controls is being told
+        // why they have just been taken away.
+        host.innerHTML =
+          '<p class="small text-muted" role="status">This node is no longer in the network.</p>';
+        /**
+         * The sections go with it. Emptied rather than only hidden, because Z-Wave gives a
+         * node number away again, and controls that move a motor must not be sitting in the
+         * page waiting for whatever device takes this number next.
+         */
+        showNodeSections(false);
+
+        if (hadFocus) {
+          document.getElementById('backToNodes').focus({ preventScroll: true });
+        }
+      };
+
       const renderNodeDetail = () => {
         const node = lastNodes.find((n) => String(n.nodeId) === String(detailNodeId));
         const host = document.getElementById('nodeDetailHeader');
         if (!host || detailGone) return;
 
         if (!node) {
-          // A node that leaves the network while its page is open says so here rather than
-          // leaving the page describing something that is gone.
-          detailGone = true;
-
-          /**
-           * Read before anything is rewritten, because by the time the controls are gone the
-           * keyboard is already on the document body and there is nothing left to ask.
-           */
-          const detail = document.getElementById('nodeDetail');
-          const hadFocus = detail.contains(document.activeElement);
-
-          // Announced rather than only drawn: a reader who was in the controls is being told
-          // why they have just been taken away.
-          host.innerHTML =
-            '<p class="small text-muted" role="status">This node is no longer in the network.</p>';
-          /**
-           * The sections go with it. Emptied rather than only hidden, because Z-Wave gives a
-           * node number away again, and controls that move a motor must not be sitting in the
-           * page waiting for whatever device takes this number next.
-           */
-          showNodeSections(false);
-
-          if (hadFocus) {
-            document.getElementById('backToNodes').focus({ preventScroll: true });
-          }
+          markNodeGone();
           return;
         }
 
@@ -800,6 +829,7 @@
         detail.style.display = '';
         renderNodeDetail();
         typeDrawn = null;
+        typeDrafts.delete(String(nodeId));
         selectNodeSection('type');
         renderDiagnosticsSection();
         /**
@@ -1062,6 +1092,78 @@
           ${uiHelpers.escapeHtml(callout.body)}
         </div>`;
 
+      /**
+       * The type each node's reader has chosen and not yet applied, kept here rather than in
+       * the payload, which is replaced every five seconds.
+       */
+      const typeDrafts = new Map();
+
+      /** The sentence the live region last said, so it speaks only when that changes. */
+      let typeNoteSaid = '';
+
+      /** Set while a write is in flight, which disables both buttons until it answers. */
+      let typeWriteRunning = false;
+
+      const cohortChipHtml = (chip) => `
+        <span class="cohort-chip"><strong>${chip.nodeId}</strong> ${uiHelpers.escapeHtml(chip.name)}${
+          chip.thisNode ? ' <span class="cohort-note">(this node)</span>' : ''
+        }${chip.note ? ` <span class="cohort-note">${uiHelpers.escapeHtml(chip.note)}</span>` : ''}</span>`;
+
+      const typeFormHtml = (nodeId, form) => `
+        ${
+          form.cohort
+            ? `<div class="alert alert-info py-2 small" role="status">
+                 <strong>${uiHelpers.escapeHtml(form.cohort.heading)}</strong>
+                 <div class="mt-1">${uiHelpers.escapeHtml(form.cohort.count)}</div>
+                 <div class="mt-1">${form.cohort.chips.map(cohortChipHtml).join('')}</div>
+               </div>`
+            : ''
+        }
+        <div class="mb-2">
+          <label class="small font-weight-bold mb-1" for="typeSelect">${uiHelpers.escapeHtml(
+            form.select.label,
+          )}</label>
+          <select class="form-control form-control-sm" id="typeSelect" data-nodeid="${nodeId}"
+            aria-describedby="typeSelectNote"${form.select.disabled || typeWriteRunning ? ' disabled' : ''}>
+            ${
+              form.select.disabled
+                ? `<option>${uiHelpers.escapeHtml(form.select.placeholder)}</option>`
+                : form.select.options
+                    .map(
+                      (option) =>
+                        `<option value="${uiHelpers.escapeHtml(option.kind)}"${
+                          option.kind === form.select.value ? ' selected' : ''
+                        }${option.available ? '' : ' disabled'}>${uiHelpers.escapeHtml(option.label)}</option>`,
+                    )
+                    .join('')
+            }
+          </select>
+          <div class="small text-muted mt-1" id="typeSelectNote">${
+            form.select.note ? uiHelpers.escapeHtml(form.select.note) : ''
+          }</div>
+        </div>
+        ${
+          form.apply.hint
+            ? `<div class="small text-muted mb-2">${uiHelpers.escapeHtml(form.apply.hint)}</div>`
+            : ''
+        }
+        ${form.hint ? `<div class="small text-muted mb-2">${uiHelpers.escapeHtml(form.hint)}</div>` : ''}
+        <div class="alert alert-warning py-2 small" role="alert">${uiHelpers.escapeHtml(
+          form.warning,
+        )}</div>
+        <div class="type-actions">
+          <span>${
+            form.revert
+              ? `<button type="button" class="btn btn-sm btn-outline-secondary type-revert" data-nodeid="${nodeId}"${
+                  form.revert.disabled || typeWriteRunning ? ' disabled' : ''
+                }>${uiHelpers.escapeHtml(form.revert.label)}</button>`
+              : ''
+          }</span>
+          <button type="button" class="btn btn-sm btn-primary type-apply" data-nodeid="${nodeId}"${
+            form.apply.disabled || typeWriteRunning ? ' disabled' : ''
+          }>${uiHelpers.escapeHtml(form.apply.label)}</button>
+        </div>`;
+
       /** What the Device type panel is showing, so a redraw that would change nothing is not made. */
       let typeDrawn = null;
 
@@ -1070,7 +1172,10 @@
         if (!host || detailNodeId === null || detailGone) return;
 
         const state = typeState.get(String(detailNodeId)) || {};
-        const signature = `${detailNodeId}:${state.error || ''}:${JSON.stringify(state.payload || null)}`;
+        const draft = typeDrafts.get(String(detailNodeId)) || null;
+        const signature = `${detailNodeId}:${state.error || ''}:${draft}:${typeWriteRunning}:${JSON.stringify(
+          state.payload || null,
+        )}`;
         if (signature === typeDrawn) return;
         typeDrawn = signature;
 
@@ -1080,9 +1185,25 @@
           host.innerHTML = '<p class="small text-muted">Loading device type...</p>';
         } else {
           const panel = uiHelpers.describeTypePanel(state.payload);
+          const form = uiHelpers.describeTypeForm(state.payload, draft);
           host.innerHTML = `${panel.panels.map(typeCalloutHtml).join('')}${panel.rows
             .map(typeRowHtml)
-            .join('')}${panel.notices.map(typeCalloutHtml).join('')}`;
+            .join('')}${panel.notices.map(typeCalloutHtml).join('')}${typeFormHtml(
+            detailNodeId,
+            form,
+          )}`;
+
+          /**
+           * The sentence under the select is read when the select is focused, through
+           * aria-describedby. The live region carries it only when it has just appeared, so a
+           * choice that was already unavailable when the page was drawn is not announced at
+           * nobody in particular, while one that a refresh invalidated is.
+           */
+          const note = form.select.note || '';
+          if (note !== typeNoteSaid) {
+            document.getElementById('typeAnnounce').textContent = note;
+            typeNoteSaid = note;
+          }
         }
 
         settlePanelFocus(host);
@@ -1155,6 +1276,9 @@
           typeState.forEach((state, key) => {
             if (!present.has(key)) typeState.delete(key);
           });
+          typeDrafts.forEach((kind, key) => {
+            if (!present.has(key)) typeDrafts.delete(key);
+          });
           nodes.forEach((node) => {
             if (node.firmwareProgress) firmwareRecords.delete(String(node.nodeId));
           });
@@ -1199,6 +1323,7 @@
         document.getElementById('confirmModal').style.display = 'none';
         document.getElementById('diagnosticsModal').style.display = 'none';
         document.getElementById('removeNodeModal').style.display = 'none';
+        document.getElementById('typeWriteModal').style.display = 'none';
         isPromptOpen = false;
         activeNodeId = null;
         activeMaintenanceAction = null;
@@ -1356,6 +1481,118 @@
 
       document.getElementById('nodeTableBody').addEventListener('click', handleReviewLink);
       document.getElementById('nodeDetail').addEventListener('click', handleReviewLink);
+
+      /** The write a confirmation is waiting on, held between opening the dialog and Confirm. */
+      let pendingTypeWrite = null;
+
+      const openTypeWriteDialog = (nodeId, action) => {
+        const state = typeState.get(String(nodeId));
+        if (!state || !state.payload) return;
+
+        const draft = typeDrafts.get(String(nodeId)) || state.payload.primaryKind;
+        const dialog = uiHelpers.describeTypeWrite(state.payload, draft, action);
+
+        pendingTypeWrite = { nodeId, action, draft, payload: state.payload };
+        document.getElementById('typeWriteTitle').textContent = dialog.title;
+        document.getElementById('typeWriteBody').innerHTML = `
+          ${dialog.lines
+            .map((line) => `<p class="mb-1">${uiHelpers.escapeHtml(line)}</p>`)
+            .join('')}
+          <p class="mb-1 mt-2">${uiHelpers.escapeHtml(dialog.warning)}</p>
+          ${dialog.matter ? `<p class="mb-0">${uiHelpers.escapeHtml(dialog.matter)}</p>` : ''}`;
+        document.getElementById('confirmTypeWrite').textContent = dialog.confirmLabel;
+        showModal('typeWriteModal');
+      };
+
+      /**
+       * Sends the decision the dialog described, against the state it was composed from. The
+       * plugin recomputes everything from its own state and refuses the write if either the
+       * fingerprint or the cohort has moved since, so a stale page cannot act on what it shows.
+       */
+      const runTypeWrite = async () => {
+        const write = pendingTypeWrite;
+        if (!write) return;
+
+        const { nodeId, action, draft, payload } = write;
+        pendingTypeWrite = null;
+        hideModals();
+
+        typeWriteRunning = true;
+        renderTypeSection();
+
+        try {
+          const outcome =
+            action === 'revert'
+              ? await window.homebridge.request('clear-node-type', {
+                  nodeId,
+                  expectedFingerprint: payload.fingerprint,
+                  expectedRevision: payload.cohortRevision,
+                })
+              : await window.homebridge.request('set-node-type', {
+                  nodeId,
+                  primaryKind: draft,
+                  expectedFingerprint: payload.fingerprint,
+                  expectedRevision: payload.cohortRevision,
+                });
+
+          /**
+           * The payload that comes back describes the network after the write, whether it was
+           * accepted or refused, so the section is redrawn from the state a refusal was
+           * measured against rather than the one the request was composed from.
+           */
+          const state = typeFor(nodeId);
+          if (outcome && outcome.payload) {
+            state.payload = outcome.payload;
+            state.error = null;
+          }
+
+          if (outcome && outcome.refusal) {
+            const refusal = uiHelpers.describeWriteRefusal(outcome.refusal);
+            window.homebridge.toast.error(refusal.text);
+            if (refusal.gone && String(detailNodeId) === String(nodeId)) {
+              markNodeGone();
+            }
+          } else {
+            typeDrafts.delete(String(nodeId));
+            const result = uiHelpers.describeWriteOutcome(
+              outcome,
+              action === 'revert' ? payload.defaultKind : draft,
+              payload.cohort,
+            );
+            window.homebridge.toast[result.type](result.text);
+          }
+        } catch (err) {
+          window.homebridge.toast.error(err.message);
+        } finally {
+          typeWriteRunning = false;
+          renderTypeSection();
+        }
+      };
+
+      document.getElementById('nodeSectionType').addEventListener('change', (e) => {
+        const select = e.target.closest('#typeSelect');
+        if (!select) return;
+
+        typeDrafts.set(String(select.getAttribute('data-nodeid')), select.value);
+        renderTypeSection();
+      });
+
+      document.getElementById('nodeSectionType').addEventListener('click', (e) => {
+        const button = e.target.closest('.type-apply, .type-revert');
+        if (!button) return;
+
+        openTypeWriteDialog(
+          button.getAttribute('data-nodeid'),
+          button.classList.contains('type-revert') ? 'revert' : 'apply',
+        );
+      });
+
+      document.getElementById('cancelTypeWrite').addEventListener('click', () => {
+        pendingTypeWrite = null;
+        hideModals();
+      });
+
+      document.getElementById('confirmTypeWrite').addEventListener('click', runTypeWrite);
 
       const nodeSectionStrip = document.getElementById('nodeSections');
 

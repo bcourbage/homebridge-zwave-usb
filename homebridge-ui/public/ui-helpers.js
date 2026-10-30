@@ -1012,6 +1012,92 @@
     };
   }
 
+  const MATTER_RESTART_LINE =
+    'Matter controllers, including Alexa, show the new type after Homebridge restarts.';
+
+  /** "Node 10 Hallway Shade and Node 11 Office Shade", as the dialogs name a set of nodes. */
+  function listCohortNodes(members) {
+    const named = members.map((member) => `Node ${member.nodeId} ${member.name}`);
+
+    if (named.length <= 1) {
+      return named.join('');
+    }
+
+    return `${named.slice(0, -1).join(', ')} and ${named[named.length - 1]}`;
+  }
+
+  /**
+   * What a confirmation dialog says before a type is written.
+   *
+   * Only the nodes that would change are named: a cohort node already publishing the chosen
+   * type is not affected by the write and listing it would overstate what is about to happen.
+   */
+  function describeTypeWrite(payload, draft, action) {
+    const data = payload || {};
+    const members = Array.isArray(data.cohort) ? data.cohort : [];
+    const reverting = action === 'revert';
+
+    const changing = reverting
+      ? members.filter((member) => member.defaultKind && member.primaryKind !== member.defaultKind)
+      : members.filter((member) => member.primaryKind !== draft);
+
+    const toKind = (member) => (reverting ? member.defaultKind : draft);
+    const sameFrom = new Set(changing.map((member) => member.primaryKind));
+    const sameTo = new Set(changing.map(toKind));
+
+    const lines =
+      changing.length > 0 && sameFrom.size === 1 && sameTo.size === 1
+        ? [
+            `${typeName([...sameFrom][0])} becomes ${typeName([...sameTo][0])} on ${listCohortNodes(changing)}.`,
+          ]
+        : changing.map(
+            (member) =>
+              `Node ${member.nodeId} ${member.name}: ${typeName(member.primaryKind)} becomes ${typeName(toKind(member))}`,
+          );
+
+    return {
+      title: reverting ? 'Revert to the default type?' : 'Change the device type for this hardware?',
+      lines,
+      warning: changing.length === 1 ? REBUILD_WARNING_ONE : REBUILD_WARNING_MANY,
+      matter: data.matterActive ? MATTER_RESTART_LINE : null,
+      confirmLabel: reverting ? 'Revert' : 'Apply',
+      nodeCount: changing.length,
+    };
+  }
+
+  /**
+   * What a write that was accepted, in whole or in part, tells the reader.
+   *
+   * The failed nodes are named the way the dialogs name them, which means reading their names
+   * out of the cohort the write was composed against. One error is quoted for all of them: it
+   * is one rebuild failing across nodes that share a decision, and the log keeps each.
+   */
+  function describeWriteOutcome(outcome, kind, cohort) {
+    const result = outcome || {};
+    const failed = Array.isArray(result.failed) ? result.failed : [];
+    const rebuilt = Array.isArray(result.rebuilt) ? result.rebuilt : [];
+    const members = Array.isArray(cohort) ? cohort : [];
+
+    if (failed.length > 0) {
+      const named = failed.map((entry) => {
+        const member = members.find((candidate) => candidate.nodeId === entry.nodeId);
+        return { nodeId: entry.nodeId, name: member ? member.name : '' };
+      });
+
+      return {
+        type: 'error',
+        text: `${typeName(kind)} was saved for this hardware, but HomeKit could not update ${listCohortNodes(
+          named,
+        ).replace(/\s+(?=[,.]|$)/g, '')}: ${failed[0].error}. Restart Homebridge to try again.`,
+      };
+    }
+
+    return {
+      type: 'success',
+      text: `Device type changed on ${rebuilt.length} ${rebuilt.length === 1 ? 'node' : 'nodes'}.`,
+    };
+  }
+
   /**
    * The tab an arrow key moves to, or null for a key the strip does not answer, so the page
    * leaves every other key alone. Both ends wrap, which is what a tab strip does.
@@ -1292,6 +1378,8 @@
     describeTypePanel,
     describeTypeForm,
     describeWriteRefusal,
+    describeTypeWrite,
+    describeWriteOutcome,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

@@ -25,6 +25,8 @@ const { describeHealStart, healIsRunning,
   describeTypePanel,
   describeTypeForm,
   describeWriteRefusal,
+  describeTypeWrite,
+  describeWriteOutcome,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1853,6 +1855,141 @@ describe('a refused type write', () => {
   });
 });
 
+describe('confirming a type write', () => {
+  const member = (nodeId: number, name: string, over: Record<string, unknown> = {}) => ({
+    nodeId,
+    name,
+    primaryKind: 'multilevel-switch',
+    defaultKind: 'multilevel-switch',
+    takesOverride: true,
+    ...over,
+  });
+
+  const payload = (over: Record<string, unknown> = {}) => ({
+    nodeId: 10,
+    cohort: [member(10, 'Hallway Shade'), member(11, 'Office Shade')],
+    matterActive: false,
+    ...over,
+  });
+
+  it('says it once when every node changes the same way', () => {
+    const dialog = describeTypeWrite(payload(), 'window-covering', 'apply');
+
+    expect(dialog.title).toBe('Change the device type for this hardware?');
+    expect(dialog.lines).toEqual([
+      'Multilevel Switch becomes Window Covering on Node 10 Hallway Shade and Node 11 Office Shade.',
+    ]);
+    expect(dialog.confirmLabel).toBe('Apply');
+  });
+
+  it('takes a line each when they do not', () => {
+    const dialog = describeTypeWrite(
+      payload({ cohort: [member(10, 'Hallway Shade'), member(11, 'Office Shade', { primaryKind: 'binary-switch' })] }),
+      'window-covering',
+      'apply',
+    );
+
+    expect(dialog.lines).toEqual([
+      'Node 10 Hallway Shade: Multilevel Switch becomes Window Covering',
+      'Node 11 Office Shade: Binary Switch becomes Window Covering',
+    ]);
+  });
+
+  it('names no node that would not change', () => {
+    // A cohort node already publishing the chosen type is not touched by the write.
+    const dialog = describeTypeWrite(
+      payload({
+        cohort: [member(10, 'Hallway Shade'), member(11, 'Office Shade', { primaryKind: 'window-covering' })],
+      }),
+      'window-covering',
+      'apply',
+    );
+
+    expect(dialog.lines[0]).toContain('Node 10 Hallway Shade');
+    expect(dialog.lines[0]).not.toContain('Office Shade');
+    expect(dialog.nodeCount).toBe(1);
+  });
+
+  it('asks a different question for a revert', () => {
+    const dialog = describeTypeWrite(
+      payload({
+        cohort: [
+          member(10, 'Hallway Shade', { primaryKind: 'window-covering' }),
+          member(11, 'Office Shade', { primaryKind: 'window-covering' }),
+        ],
+      }),
+      null,
+      'revert',
+    );
+
+    expect(dialog.title).toBe('Revert to the default type?');
+    expect(dialog.confirmLabel).toBe('Revert');
+    expect(dialog.lines).toEqual([
+      'Window Covering becomes Multilevel Switch on Node 10 Hallway Shade and Node 11 Office Shade.',
+    ]);
+  });
+
+  it('discloses the restart only where Matter is publishing', () => {
+    expect(describeTypeWrite(payload(), 'window-covering', 'apply').matter).toBeNull();
+    expect(describeTypeWrite(payload({ matterActive: true }), 'window-covering', 'apply').matter).toBe(
+      'Matter controllers, including Alexa, show the new type after Homebridge restarts.',
+    );
+  });
+
+  it('counts the accessories the write would rebuild', () => {
+    const one = describeTypeWrite(
+      payload({ cohort: [member(10, 'Hallway Shade')] }),
+      'window-covering',
+      'apply',
+    );
+
+    expect(one.warning).toContain('on this accessory');
+    expect(describeTypeWrite(payload(), 'window-covering', 'apply').warning).toContain(
+      'on each affected accessory',
+    );
+  });
+});
+
+describe('what a type write did', () => {
+  const cohort = [
+    { nodeId: 10, name: 'Hallway Shade' },
+    { nodeId: 11, name: 'Office Shade' },
+  ];
+
+  it('counts what it rebuilt', () => {
+    expect(describeWriteOutcome({ rebuilt: [10], failed: [] }, 'window-covering', cohort)).toEqual({
+      type: 'success',
+      text: 'Device type changed on 1 node.',
+    });
+    expect(
+      describeWriteOutcome({ rebuilt: [10, 11], failed: [] }, 'window-covering', cohort).text,
+    ).toBe('Device type changed on 2 nodes.');
+  });
+
+  it('names the nodes HomeKit would not take, the way the dialog named them', () => {
+    const outcome = describeWriteOutcome(
+      { rebuilt: [10], failed: [{ nodeId: 11, error: 'HAP refused' }] },
+      'window-covering',
+      cohort,
+    );
+
+    expect(outcome.type).toBe('error');
+    expect(outcome.text).toBe(
+      'Window Covering was saved for this hardware, but HomeKit could not update Node 11 Office Shade: HAP refused. Restart Homebridge to try again.',
+    );
+  });
+
+  it('still names a node the cohort no longer knows', () => {
+    const outcome = describeWriteOutcome(
+      { rebuilt: [], failed: [{ nodeId: 12, error: 'boom' }] },
+      'window-covering',
+      cohort,
+    );
+
+    expect(outcome.text).toContain('could not update Node 12: boom');
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -2149,7 +2286,7 @@ describe('management page integration', () => {
      */
     const html = readPage();
 
-    expect(html.match(/<div class="modal-actions">/g)).toHaveLength(4);
+    expect(html.match(/<div class="modal-actions">/g)).toHaveLength(5);
     expect(html).not.toContain('text-right');
   });
 
@@ -2379,7 +2516,7 @@ describe('management page integration', () => {
 
     expect(away).toContain("panel.innerHTML = '';");
     expect(away).toContain("strip.style.display = present ? '' : 'none';");
-    expect(declaration('renderNodeDetail')).toContain('showNodeSections(false);');
+    expect(declaration('markNodeGone')).toContain('showNodeSections(false);');
   });
 
   it('treats a node that has gone as gone until the reader opens one again', () => {
@@ -2388,10 +2525,8 @@ describe('management page integration', () => {
      * this device coming back. Redrawing the page around whatever now answers would put a
      * reader who was last told the node had gone in front of different hardware.
      */
-    const render = declaration('renderNodeDetail');
-
-    expect(render).toContain('if (!host || detailGone) return;');
-    expect(render).toContain('detailGone = true;');
+    expect(declaration('renderNodeDetail')).toContain('if (!host || detailGone) return;');
+    expect(declaration('markNodeGone')).toContain('detailGone = true;');
     expect(declaration('openNodeDetail')).toContain('detailGone = false;');
     expect(declaration('renderDiagnosticsSection')).toContain('if (detailGone) return;');
   });
@@ -2402,12 +2537,12 @@ describe('management page integration', () => {
      * the document body and there is nothing left to ask. The sentence is announced as well,
      * so a reader who was in the controls is told why they have been taken away.
      */
-    const render = declaration('renderNodeDetail');
+    const gone = declaration('markNodeGone');
 
-    expect(render).toContain('const hadFocus = detail.contains(document.activeElement);');
-    expect(render).toContain("document.getElementById('backToNodes').focus({ preventScroll: true });");
-    expect(render).toContain('role="status"');
-    expect(render.indexOf('const hadFocus')).toBeLessThan(render.indexOf('host.innerHTML ='));
+    expect(gone).toContain('const hadFocus = detail.contains(document.activeElement);');
+    expect(gone).toContain("document.getElementById('backToNodes').focus({ preventScroll: true });");
+    expect(gone).toContain('role="status"');
+    expect(gone.indexOf('const hadFocus')).toBeLessThan(gone.indexOf('host.innerHTML ='));
   });
 
   it('settles every section it opens, including one with nothing in it yet', () => {
@@ -2512,5 +2647,67 @@ describe('management page integration', () => {
     const script = lastScript();
 
     expect(script).toContain("callout.severity === 'warning' ? 'alert' : 'status'");
+  });
+
+  it('keeps the live region out of the panel it redraws', () => {
+    /**
+     * A region recreated on every render announces a sentence that has not changed. This one
+     * is written once in the markup and its text is set only when the sentence differs from
+     * the one it is already carrying, so a choice invalidated by a refresh is announced and a
+     * choice that was unavailable when the page was drawn is not.
+     */
+    const html = readPage();
+
+    expect(html).toMatch(/id="typeAnnounce"[^>]*role="status"[^>]*aria-live="polite"/);
+    expect(html).not.toMatch(/nodeSectionType[^>]*>\s*<div id="typeAnnounce"/);
+
+    const render = declaration('renderTypeSection');
+    expect(render).toContain('if (note !== typeNoteSaid) {');
+    expect(render).toContain("document.getElementById('typeAnnounce').textContent = note;");
+  });
+
+  it('reads the sentence to anyone who focuses the select', () => {
+    expect(readPage()).toContain('aria-describedby="typeSelectNote"');
+  });
+
+  it('cannot offer a type the cohort will not take', () => {
+    // The option stays visible so the choice is still the one on screen, but not selectable.
+    expect(readPage()).toContain("${option.available ? '' : ' disabled'}");
+  });
+
+  it('writes against the state the dialog was composed from', () => {
+    /**
+     * The plugin recomputes everything from its own state and refuses the write if either the
+     * fingerprint or the cohort has moved, so a page that has gone stale cannot act on what it
+     * is still showing.
+     */
+    const write = declaration('runTypeWrite');
+
+    expect(write).toContain('expectedFingerprint: payload.fingerprint');
+    expect(write).toContain('expectedRevision: payload.cohortRevision');
+    expect(write).toContain("await window.homebridge.request('clear-node-type'");
+    expect(write).toContain("await window.homebridge.request('set-node-type'");
+  });
+
+  it('holds both buttons and the list while a write is running', () => {
+    const script = lastScript();
+
+    expect(script).toContain('typeWriteRunning = true;');
+    expect(script).toContain("form.apply.disabled || typeWriteRunning ? ' disabled' : ''");
+    expect(script).toContain("form.revert.disabled || typeWriteRunning ? ' disabled' : ''");
+    expect(script).toContain("form.select.disabled || typeWriteRunning ? ' disabled' : ''");
+  });
+
+  it('takes a reader to the node-gone state when the write says the node has left', () => {
+    const write = declaration('runTypeWrite');
+
+    expect(write).toContain('uiHelpers.describeWriteRefusal(outcome.refusal)');
+    expect(write).toContain('if (refusal.gone && String(detailNodeId) === String(nodeId)) {');
+    expect(write).toContain('markNodeGone();');
+  });
+
+  it('forgets a choice once it has been written, and on the way into a node', () => {
+    expect(declaration('runTypeWrite')).toContain('typeDrafts.delete(String(nodeId));');
+    expect(declaration('openNodeDetail')).toContain('typeDrafts.delete(String(nodeId));');
   });
 });
