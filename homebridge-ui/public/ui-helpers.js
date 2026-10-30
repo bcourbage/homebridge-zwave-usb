@@ -887,7 +887,22 @@
     const cohortMembers = Array.isArray(data.cohort) ? data.cohort : [];
     const override = data.override || null;
     const storeError = data.store && data.store.error ? data.store.error.code : null;
-    const editable = Boolean(data.fingerprint) && !data.multiEndpoint && !storeError && Boolean(data.primaryKind);
+    /**
+     * An override this device cannot take, which is still applied elsewhere, is managed from
+     * the node that has it. Offering the list here would write for a cohort this node is not
+     * publishing with.
+     */
+    const managedElsewhere = Boolean(
+      data.invalid &&
+        (data.invalid.appliedTo || []).some((node) => node.nodeId !== data.nodeId),
+    );
+
+    const editable =
+      Boolean(data.fingerprint) &&
+      !data.multiEndpoint &&
+      !storeError &&
+      !managedElsewhere &&
+      Boolean(data.primaryKind);
 
     if (!editable) {
       return {
@@ -1024,6 +1039,77 @@
     };
   }
 
+  /**
+   * The panels that appear above the rows when something about this node's saved override no
+   * longer holds. Each describes a state the reader did not ask for and offers the one thing
+   * that resolves it.
+   */
+  function describeTypeExceptions(payload) {
+    const data = payload || {};
+    const invalid = data.invalid || null;
+    const appliedTo = invalid && Array.isArray(invalid.appliedTo) ? invalid.appliedTo : [];
+    const elsewhere = appliedTo.filter((node) => node.nodeId !== data.nodeId);
+
+    return {
+      invalid: invalid
+        ? {
+            heading: 'Your saved override cannot be applied to this device',
+            /**
+             * The closing sentence introduces the list of nodes it is applied to, so it is not
+             * said when there is no list: an override applied to nothing is removed, not read
+             * about somewhere else.
+             */
+            body: `This device reports the same hardware fingerprint, but it cannot take ${typeName(
+              invalid.primaryKind,
+            )}, so it uses its own type.${
+              elsewhere.length > 0 ? ' The override is still applied to:' : ''
+            }`,
+            chips: elsewhere.map((node) => ({ nodeId: node.nodeId, name: node.name })),
+            manage:
+              elsewhere.length > 0
+                ? {
+                    nodeId: elsewhere[0].nodeId,
+                    text: `Manage it from Node ${elsewhere[0].nodeId} ${elsewhere[0].name}`,
+                  }
+                : null,
+            remove:
+              elsewhere.length === 0
+                ? { label: 'Remove saved override', primaryKind: invalid.primaryKind }
+                : null,
+          }
+        : null,
+      orphans: (Array.isArray(data.orphans) ? data.orphans : []).map((orphan) => ({
+        observationId: orphan.observationId,
+        heading: 'A saved override no longer matches this node',
+        body: `Node ${data.nodeId} now reports different hardware from the device this override was applied to. Z-Wave reuses node numbers after a device is removed, so this is probably a different device. The override is kept for the earlier hardware and does not apply to this node.`,
+        savedFor: {
+          title: 'Override saved for',
+          hex: orphan.fingerprint
+            ? [
+                hexWord(orphan.fingerprint.manufacturerId),
+                hexWord(orphan.fingerprint.productType),
+                hexWord(orphan.fingerprint.productId),
+              ]
+            : null,
+          type: orphan.primaryKind ? typeName(orphan.primaryKind) : null,
+          applied: savedOnText(orphan.appliedAt),
+        },
+        nowReports: {
+          title: `Node ${data.nodeId} now reports`,
+          hex: data.fingerprint
+            ? [
+                hexWord(data.fingerprint.manufacturerId),
+                hexWord(data.fingerprint.productType),
+                hexWord(data.fingerprint.productId),
+              ]
+            : null,
+          type: data.primaryKind ? typeName(data.primaryKind) : null,
+        },
+        acknowledge: 'Acknowledge hardware change',
+      })),
+    };
+  }
+
   const MATTER_RESTART_LINE =
     'Matter controllers, including Alexa, show the new type after Homebridge restarts.';
 
@@ -1047,6 +1133,24 @@
   function describeTypeWrite(payload, draft, action) {
     const data = payload || {};
     const members = Array.isArray(data.cohort) ? data.cohort : [];
+
+    if (action === 'remove') {
+      /**
+       * Nothing in HomeKit moves: this is an override no device is publishing, which is the
+       * only state the plugin allows it to be removed from.
+       */
+      return {
+        title: 'Remove this saved override?',
+        lines: [
+          `${typeName(draft)} is no longer applied to any device, so removing it changes nothing in HomeKit.`,
+        ],
+        warning: null,
+        matter: null,
+        confirmLabel: 'Remove',
+        nodeCount: 0,
+      };
+    }
+
     const reverting = action === 'revert';
 
     const changing = reverting
@@ -1403,6 +1507,7 @@
     describeDiagnosticsSection,
     describeTypePanel,
     describeTypeForm,
+    describeTypeExceptions,
     describeWriteRefusal,
     fingerprintKey,
     describeTypeWrite,

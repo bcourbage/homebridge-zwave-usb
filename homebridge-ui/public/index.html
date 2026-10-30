@@ -164,6 +164,9 @@
     .cohort-chip .cohort-note { opacity: 0.75; }
     .type-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; justify-content: space-between;
                     margin-top: 12px; }
+    .orphan-cards { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+    .orphan-card { flex: 1 1 200px; padding: 8px; border-radius: 4px;
+                   border: 1px solid rgba(127, 127, 127, 0.35); }
     /* Bootstrap colors <code> pink, which reads as something being wrong with the value. */
     .type-hex { margin-right: 6px; padding: 2px 6px; border-radius: 3px; color: inherit;
                 background: rgba(127, 127, 127, 0.16); }
@@ -1105,6 +1108,78 @@
        * having several endpoints are ordinary facts about a device, and reading one of those
        * over whatever a reader is doing would interrupt them to say nothing has gone wrong.
        */
+      const exceptionChipHtml = (chip) => `
+        <span class="cohort-chip"><strong>${chip.nodeId}</strong> ${uiHelpers.escapeHtml(
+          chip.name,
+        )}</span>`;
+
+      const orphanCardHtml = (card) => `
+        <div class="orphan-card">
+          <div class="small font-weight-bold">${uiHelpers.escapeHtml(card.title)}</div>
+          ${
+            card.hex
+              ? `<div class="mt-1">${card.hex
+                  .map((word) => `<code class="type-hex">${uiHelpers.escapeHtml(word)}</code>`)
+                  .join('')}</div>`
+              : ''
+          }
+          ${card.type ? `<div class="mt-1">${uiHelpers.escapeHtml(card.type)}</div>` : ''}
+          ${
+            card.applied
+              ? `<div class="small text-muted">${uiHelpers.escapeHtml(card.applied)}</div>`
+              : ''
+          }
+        </div>`;
+
+      const typeExceptionsHtml = (nodeId, exceptions) => `
+        ${
+          exceptions.invalid
+            ? `<div class="alert alert-warning py-2 small" role="alert">
+                 <strong>${uiHelpers.escapeHtml(exceptions.invalid.heading)}</strong>
+                 <div class="mt-1">${uiHelpers.escapeHtml(exceptions.invalid.body)}</div>
+                 ${
+                   exceptions.invalid.chips.length > 0
+                     ? `<div class="mt-1">${exceptions.invalid.chips
+                         .map(exceptionChipHtml)
+                         .join('')}</div>`
+                     : ''
+                 }
+                 ${
+                   exceptions.invalid.manage
+                     ? `<div class="mt-1"><a href="#node-${
+                         exceptions.invalid.manage.nodeId
+                       }" data-focus-key="manage">${uiHelpers.escapeHtml(
+                         exceptions.invalid.manage.text,
+                       )}</a></div>`
+                     : ''
+                 }
+                 ${
+                   exceptions.invalid.remove
+                     ? `<div class="mt-2"><button type="button" class="btn btn-sm btn-outline-danger type-remove-override" data-nodeid="${nodeId}" data-focus-key="remove-override">${uiHelpers.escapeHtml(
+                         exceptions.invalid.remove.label,
+                       )}</button></div>`
+                     : ''
+                 }
+               </div>`
+            : ''
+        }
+        ${exceptions.orphans
+          .map(
+            (orphan) => `<div class="alert alert-warning py-2 small" role="alert">
+                 <strong>${uiHelpers.escapeHtml(orphan.heading)}</strong>
+                 <div class="mt-1">${uiHelpers.escapeHtml(orphan.body)}</div>
+                 <div class="orphan-cards">${orphanCardHtml(orphan.savedFor)}${orphanCardHtml(
+                   orphan.nowReports,
+                 )}</div>
+                 <div class="mt-2"><button type="button" class="btn btn-sm btn-outline-secondary type-acknowledge" data-nodeid="${nodeId}" data-observation="${uiHelpers.escapeHtml(
+                   orphan.observationId,
+                 )}" data-focus-key="ack:${uiHelpers.escapeHtml(
+                   orphan.observationId,
+                 )}">${uiHelpers.escapeHtml(orphan.acknowledge)}</button></div>
+               </div>`,
+          )
+          .join('')}`;
+
       const typeCalloutHtml = (callout) => `
         <div class="alert alert-${callout.severity === 'warning' ? 'warning' : 'info'} py-2 small" role="${
           callout.severity === 'warning' ? 'alert' : 'status'
@@ -1177,6 +1252,7 @@
             form.select.label,
           )}</label>
           <select class="form-control form-control-sm" id="typeSelect" data-nodeid="${nodeId}"
+            data-focus-key="select"
             aria-describedby="typeSelectNote"${form.select.disabled || typeWriteRunning ? ' disabled' : ''}>
             ${
               form.select.disabled
@@ -1205,12 +1281,12 @@
         <div class="type-actions">
           <span>${
             form.revert
-              ? `<button type="button" class="btn btn-sm btn-outline-secondary type-revert" data-nodeid="${nodeId}"${
+              ? `<button type="button" class="btn btn-sm btn-outline-secondary type-revert" data-nodeid="${nodeId}" data-focus-key="revert"${
                   form.revert.disabled || typeWriteRunning ? ' disabled' : ''
                 }>${uiHelpers.escapeHtml(form.revert.label)}</button>`
               : ''
           }</span>
-          <button type="button" class="btn btn-sm btn-primary type-apply" data-nodeid="${nodeId}"${
+          <button type="button" class="btn btn-sm btn-primary type-apply" data-nodeid="${nodeId}" data-focus-key="apply"${
             form.apply.disabled || typeWriteRunning ? ' disabled' : ''
           }>${uiHelpers.escapeHtml(form.apply.label)}</button>
         </div>`;
@@ -1220,37 +1296,43 @@
       let typeFormDrawn = null;
 
       /**
-       * Where the keyboard was inside the form, so it can be put back on the control that
-       * replaces the one it was on. Both the selection and the five-second refresh redraw this,
-       * and without it a reader choosing from the list is dropped out of it on every change.
+       * Where the keyboard was inside a half of the section, so it can be put back on whatever
+       * takes that control's place. Both halves are redrawn by the five-second refresh, and the
+       * form by every change of selection, so without this a reader is dropped out of the
+       * control they are using by a refresh they did not ask for.
+       *
+       * Each control carries the key it is found by, rather than the page matching on shapes.
        */
-      const formFocusMark = () => {
+      const focusKeyIn = (host) => {
         const active = document.activeElement;
-        const host = document.getElementById('typeFormHost');
         if (!host || !active || !host.contains(active)) return null;
 
-        if (active.id === 'typeSelect') return '#typeSelect';
-        if (active.classList.contains('type-apply')) return '.type-apply';
-        if (active.classList.contains('type-revert')) return '.type-revert';
-        return null;
+        return active.getAttribute('data-focus-key');
       };
 
       /** Whether an element can take the keyboard: present, and not refusing it. */
       const canTakeFocus = (element) => Boolean(element) && !element.disabled;
 
+      const byFocusKey = (host, key) =>
+        key
+          ? [...host.querySelectorAll('[data-focus-key]')].find(
+              (element) => element.getAttribute('data-focus-key') === key,
+            )
+          : null;
+
       /**
-       * Puts the keyboard back after the form is redrawn.
+       * Puts the keyboard back after a half of the section is redrawn.
        *
        * The control it was on may be gone, or may have been disabled by what the refresh
        * reported, and a disabled control does not take focus. The list is the next most useful
        * place, then the section itself, which is focusable whenever nothing in it is, and
        * failing that the way back out of the page.
        */
-      const restoreFormFocus = (mark) => {
+      const restoreSectionFocus = (host, key) => {
         const formHost = document.getElementById('typeFormHost');
         const candidates = [
-          formHost.querySelector(mark),
-          formHost.querySelector('#typeSelect'),
+          byFocusKey(host, key),
+          formHost ? formHost.querySelector('#typeSelect') : null,
           document.getElementById('nodeSectionType'),
           document.getElementById('backToNodes'),
         ];
@@ -1274,15 +1356,25 @@
         if (panelSignature !== typePanelDrawn) {
           typePanelDrawn = panelSignature;
 
+          // The panel half carries controls of its own now, so it is treated like the form.
+          const panelKey = focusKeyIn(rows);
+
           if (state.error) {
             rows.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(state.error)}</p>`;
           } else if (!state.payload) {
             rows.innerHTML = '<p class="small text-muted">Loading device type...</p>';
           } else {
             const panel = uiHelpers.describeTypePanel(state.payload);
-            rows.innerHTML = `${panel.panels.map(typeCalloutHtml).join('')}${panel.rows
-              .map(typeRowHtml)
-              .join('')}${panel.notices.map(typeCalloutHtml).join('')}`;
+            const exceptions = uiHelpers.describeTypeExceptions(state.payload);
+            rows.innerHTML = `${typeExceptionsHtml(detailNodeId, exceptions)}${panel.panels
+              .map(typeCalloutHtml)
+              .join('')}${panel.rows.map(typeRowHtml).join('')}${panel.notices
+              .map(typeCalloutHtml)
+              .join('')}`;
+          }
+
+          if (panelKey) {
+            restoreSectionFocus(rows, panelKey);
           }
         }
 
@@ -1297,7 +1389,7 @@
            * Read before either branch, because both take the control the keyboard is on away:
            * one replaces it, the other removes it along with the rest of the form.
            */
-          const mark = formFocusMark();
+          const mark = focusKeyIn(formHost);
 
           if (!state.payload || state.error) {
             formHost.innerHTML = '';
@@ -1309,14 +1401,14 @@
             clearTypeAnnounce();
 
             if (mark) {
-              restoreFormFocus(mark);
+              restoreSectionFocus(formHost, mark);
             }
           } else {
             const form = uiHelpers.describeTypeForm(state.payload, draft);
             formHost.innerHTML = typeFormHtml(detailNodeId, form);
 
             if (mark) {
-              restoreFormFocus(mark);
+              restoreSectionFocus(formHost, mark);
             }
 
             /**
@@ -1613,11 +1705,49 @@
       /** The write a confirmation is waiting on, held between opening the dialog and Confirm. */
       let pendingTypeWrite = null;
 
+      const TYPE_WRITE_ROUTES = {
+        apply: 'set-node-type',
+        revert: 'clear-node-type',
+        remove: 'remove-type-override',
+        acknowledge: 'acknowledge-type-orphan',
+      };
+
+      /**
+       * What each write sends. Every one of them carries the piece of state it was composed
+       * against, so the plugin can refuse it if that has moved rather than act on a stale page.
+       */
+      const typeWriteBody = (action, nodeId, draft, payload, observationId) => {
+        if (action === 'apply') {
+          return {
+            nodeId,
+            primaryKind: draft,
+            expectedFingerprint: payload.fingerprint,
+            expectedRevision: payload.cohortRevision,
+          };
+        }
+        if (action === 'revert') {
+          return {
+            nodeId,
+            expectedFingerprint: payload.fingerprint,
+            expectedRevision: payload.cohortRevision,
+          };
+        }
+        if (action === 'remove') {
+          return { nodeId, expectedRevision: payload.cohortRevision };
+        }
+
+        return { nodeId, observationId, expectedFingerprint: payload.fingerprint };
+      };
+
       const openTypeWriteDialog = (nodeId, action) => {
         const state = typeState.get(String(nodeId));
         if (!state || !state.payload) return;
 
-        const draft = draftFor(nodeId, state.payload) || state.payload.primaryKind;
+        const invalid = state.payload.invalid;
+        const draft =
+          action === 'remove'
+            ? invalid && invalid.primaryKind
+            : draftFor(nodeId, state.payload) || state.payload.primaryKind;
         const dialog = uiHelpers.describeTypeWrite(state.payload, draft, action);
 
         pendingTypeWrite = { nodeId, action, draft, payload: state.payload };
@@ -1626,7 +1756,11 @@
           ${dialog.lines
             .map((line) => `<p class="mb-1">${uiHelpers.escapeHtml(line)}</p>`)
             .join('')}
-          <p class="mb-1 mt-2">${uiHelpers.escapeHtml(dialog.warning)}</p>
+          ${
+            dialog.warning
+              ? `<p class="mb-1 mt-2">${uiHelpers.escapeHtml(dialog.warning)}</p>`
+              : ''
+          }
           ${dialog.matter ? `<p class="mb-0">${uiHelpers.escapeHtml(dialog.matter)}</p>` : ''}`;
         document.getElementById('confirmTypeWrite').textContent = dialog.confirmLabel;
         showModal('typeWriteModal');
@@ -1642,6 +1776,11 @@
         if (!write) return;
 
         const { nodeId, action, draft, payload } = write;
+        /**
+         * Removing an override and acknowledging a hardware change report themselves by the
+         * panel that asked for them going away. Nothing in HomeKit moves for either, so there
+         * is nothing to say that the section does not already show.
+         */
         pendingTypeWrite = null;
         hideModals();
 
@@ -1649,19 +1788,10 @@
         renderTypeSection();
 
         try {
-          const outcome =
-            action === 'revert'
-              ? await window.homebridge.request('clear-node-type', {
-                  nodeId,
-                  expectedFingerprint: payload.fingerprint,
-                  expectedRevision: payload.cohortRevision,
-                })
-              : await window.homebridge.request('set-node-type', {
-                  nodeId,
-                  primaryKind: draft,
-                  expectedFingerprint: payload.fingerprint,
-                  expectedRevision: payload.cohortRevision,
-                });
+          const outcome = await window.homebridge.request(
+            TYPE_WRITE_ROUTES[action],
+            typeWriteBody(action, nodeId, draft, payload, write.observationId),
+          );
 
           /**
            * The payload that comes back describes the network after the write, whether it was
@@ -1687,7 +1817,7 @@
             if (refusal.gone && String(detailNodeId) === String(nodeId)) {
               markNodeGone();
             }
-          } else {
+          } else if (action === 'apply' || action === 'revert') {
             const result = uiHelpers.describeWriteOutcome(
               outcome,
               draft,
@@ -1720,12 +1850,33 @@
       });
 
       document.getElementById('nodeSectionType').addEventListener('click', (e) => {
-        const button = e.target.closest('.type-apply, .type-revert');
+        const button = e.target.closest(
+          '.type-apply, .type-revert, .type-remove-override, .type-acknowledge',
+        );
         if (!button) return;
 
+        const nodeId = button.getAttribute('data-nodeid');
+
+        // Acknowledging says nothing is wrong, so there is nothing to confirm before it.
+        if (button.classList.contains('type-acknowledge')) {
+          pendingTypeWrite = {
+            nodeId,
+            action: 'acknowledge',
+            draft: null,
+            payload: (typeState.get(String(nodeId)) || {}).payload,
+            observationId: button.getAttribute('data-observation'),
+          };
+          runTypeWrite();
+          return;
+        }
+
         openTypeWriteDialog(
-          button.getAttribute('data-nodeid'),
-          button.classList.contains('type-revert') ? 'revert' : 'apply',
+          nodeId,
+          button.classList.contains('type-remove-override')
+            ? 'remove'
+            : button.classList.contains('type-revert')
+              ? 'revert'
+              : 'apply',
         );
       });
 

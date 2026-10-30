@@ -24,6 +24,7 @@ const { describeHealStart, healIsRunning,
   describeDiagnosticsSection,
   describeTypePanel,
   describeTypeForm,
+  describeTypeExceptions,
   describeWriteRefusal,
   describeTypeWrite,
   describeWriteOutcome,
@@ -2017,6 +2018,121 @@ describe('what a type write did', () => {
   });
 });
 
+describe('an override that no longer fits', () => {
+  const payload = (over: Record<string, unknown> = {}) => ({
+    nodeId: 8,
+    fingerprint: { manufacturerId: 881, productType: 4, productId: 2 },
+    primaryKind: 'motion-sensor',
+    orphans: [],
+    invalid: null,
+    ...over,
+  });
+
+  const invalid = (appliedTo: { nodeId: number; name: string }[]) =>
+    describeTypeExceptions(payload({ invalid: { primaryKind: 'window-covering', appliedTo } }))
+      .invalid;
+
+  it('names the type this device cannot take, and who still has it', () => {
+    const panel = invalid([
+      { nodeId: 5, name: "Nico's Shade" },
+      { nodeId: 11, name: 'Office Shade' },
+    ])!;
+
+    expect(panel.heading).toBe('Your saved override cannot be applied to this device');
+    expect(panel.body).toBe(
+      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so it uses its own type. The override is still applied to:',
+    );
+    expect(panel.chips).toEqual([
+      { nodeId: 5, name: "Nico's Shade" },
+      { nodeId: 11, name: 'Office Shade' },
+    ]);
+    expect(panel.manage).toMatchObject({ nodeId: 5, text: "Manage it from Node 5 Nico's Shade" });
+    expect(panel.remove).toBeNull();
+  });
+
+  it('introduces no list when there is nobody to list', () => {
+    // The closing sentence of the body introduces the chips, and an override applied to
+    // nothing is removed rather than read about somewhere else.
+    const panel = invalid([])!;
+
+    expect(panel.body).toBe(
+      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so it uses its own type.',
+    );
+    expect(panel.chips).toEqual([]);
+    expect(panel.manage).toBeNull();
+    expect(panel.remove).toMatchObject({ label: 'Remove saved override' });
+  });
+
+  it('leaves the choice to the node that has the override', () => {
+    const elsewhere = { primaryKind: 'window-covering', appliedTo: [{ nodeId: 5, name: 'Shade' }] };
+    const nowhere = { primaryKind: 'window-covering', appliedTo: [] };
+
+    expect(
+      describeTypeForm(payload({ invalid: elsewhere, options: ['motion-sensor'], cohort: [] }), null)
+        .select.disabled,
+    ).toBe(true);
+    expect(
+      describeTypeForm(payload({ invalid: nowhere, options: ['motion-sensor'], cohort: [] }), null)
+        .select.disabled,
+    ).toBe(false);
+  });
+
+  it('shows what the override was saved for beside what the node reports now', () => {
+    const [orphan] = describeTypeExceptions(
+      payload({
+        orphans: [
+          {
+            observationId: 'obs-1',
+            fingerprint: { manufacturerId: 2748, productType: 2, productId: 16 },
+            primaryKind: 'window-covering',
+            appliedAt: '2026-10-12T18:20:00Z',
+            orphanedAt: '2026-10-20T10:00:00Z',
+          },
+        ],
+      }),
+    ).orphans;
+
+    expect(orphan.heading).toBe('A saved override no longer matches this node');
+    expect(orphan.body).toContain('Z-Wave reuses node numbers after a device is removed');
+    expect(orphan.savedFor).toMatchObject({
+      title: 'Override saved for',
+      hex: ['0x0ABC', '0x0002', '0x0010'],
+      type: 'Window Covering',
+    });
+    expect(orphan.nowReports).toMatchObject({
+      title: 'Node 8 now reports',
+      hex: ['0x0371', '0x0004', '0x0002'],
+      type: 'Motion Sensor',
+    });
+    expect(orphan.acknowledge).toBe('Acknowledge hardware change');
+  });
+
+  it('keeps each observation answerable on its own', () => {
+    const { orphans } = describeTypeExceptions(
+      payload({
+        orphans: [
+          { observationId: 'obs-1', fingerprint: null, primaryKind: null, appliedAt: null },
+          { observationId: 'obs-2', fingerprint: null, primaryKind: null, appliedAt: null },
+        ],
+      }),
+    );
+
+    expect(orphans.map((orphan: any) => orphan.observationId)).toEqual(['obs-1', 'obs-2']);
+  });
+
+  it('asks before removing an override, and says it changes nothing', () => {
+    expect(describeTypeWrite({ nodeId: 8 }, 'window-covering', 'remove')).toMatchObject({
+      title: 'Remove this saved override?',
+      lines: [
+        'Window Covering is no longer applied to any device, so removing it changes nothing in HomeKit.',
+      ],
+      confirmLabel: 'Remove',
+      warning: null,
+      matter: null,
+    });
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -2637,8 +2753,11 @@ describe('management page integration', () => {
     const script = lastScript();
 
     expect(script).toContain('uiHelpers.describeTypePanel(state.payload)');
-    expect(script).toContain('panel.panels.map(typeCalloutHtml)');
-    expect(script).toContain('panel.notices.map(typeCalloutHtml)');
+    expect(script).toContain('uiHelpers.describeTypeExceptions(state.payload)');
+    // Written across lines by the formatter, so matched on the pieces rather than the line.
+    expect(script).toMatch(/panel\.panels\s*\.?\s*\n?\s*\.map\(typeCalloutHtml\)/);
+    expect(script).toMatch(/panel\.notices\s*\n?\s*\.map\(typeCalloutHtml\)/);
+    expect(script).toMatch(/panel\.rows\.map\(typeRowHtml\)/);
   });
 
   it('escapes every value the plugin supplies for those rows', () => {
@@ -2711,10 +2830,13 @@ describe('management page integration', () => {
      */
     const write = declaration('runTypeWrite');
 
-    expect(write).toContain('expectedFingerprint: payload.fingerprint');
-    expect(write).toContain('expectedRevision: payload.cohortRevision');
-    expect(write).toContain("await window.homebridge.request('clear-node-type'");
-    expect(write).toContain("await window.homebridge.request('set-node-type'");
+    const body = declaration('typeWriteBody');
+
+    expect(body).toContain('expectedFingerprint: payload.fingerprint');
+    expect(body).toContain('expectedRevision: payload.cohortRevision');
+    expect(write).toContain('TYPE_WRITE_ROUTES[action]');
+    expect(lastScript()).toContain("apply: 'set-node-type'");
+    expect(lastScript()).toContain("revert: 'clear-node-type'");
   });
 
   it('holds both buttons and the list while a write is running', () => {
@@ -2765,18 +2887,18 @@ describe('management page integration', () => {
   it('puts the keyboard back on the control that replaced the one it was on', () => {
     const render = declaration('renderTypeSection');
 
-    expect(render).toContain('const mark = formFocusMark();');
+    expect(render).toContain('const mark = focusKeyIn(formHost);');
     expect(render).toContain('if (mark) {');
-    expect(render).toContain('restoreFormFocus(mark);');
-    expect(declaration('formFocusMark')).toContain("if (active.id === 'typeSelect') return '#typeSelect';");
+    expect(render).toContain('restoreSectionFocus(formHost, mark);');
+    expect(declaration('focusKeyIn')).toContain("return active.getAttribute('data-focus-key');");
 
     // Read before the control is replaced, put back after: the other order has nothing to ask.
     const redraw = render.slice(render.indexOf('formHost.innerHTML = typeFormHtml('));
 
-    expect(render.indexOf('const mark = formFocusMark();')).toBeLessThan(
+    expect(render.indexOf('const mark = focusKeyIn(formHost);')).toBeLessThan(
       render.indexOf('formHost.innerHTML = typeFormHtml('),
     );
-    expect(redraw).toContain('restoreFormFocus(mark);');
+    expect(redraw).toContain('restoreSectionFocus(formHost, mark);');
   });
 
   it('draws what the plugin reports apart from what is being decided', () => {
@@ -2837,7 +2959,7 @@ describe('management page integration', () => {
      * still carrying a sentence about a form that was no longer there.
      */
     const render = declaration('renderTypeSection');
-    const mark = render.indexOf('const mark = formFocusMark();');
+    const mark = render.indexOf('const mark = focusKeyIn(formHost);');
     const branch = render.indexOf('if (!state.payload || state.error) {');
 
     expect(mark).toBeGreaterThan(-1);
@@ -2846,7 +2968,7 @@ describe('management page integration', () => {
     const errorBranch = render.slice(branch, render.indexOf('} else {', branch));
     expect(errorBranch).toContain("formHost.innerHTML = '';");
     expect(errorBranch).toContain('clearTypeAnnounce();');
-    expect(errorBranch).toContain('restoreFormFocus(mark);');
+    expect(errorBranch).toContain('restoreSectionFocus(formHost, mark);');
   });
 
   it('takes the form away with a reading that failed', () => {
@@ -2866,9 +2988,9 @@ describe('management page integration', () => {
      * A refresh can disable the button focus was on, and a disabled control does not take it,
      * so without somewhere else to go the reader is dropped to the document body.
      */
-    const restore = declaration('restoreFormFocus');
+    const restore = declaration('restoreSectionFocus');
 
-    expect(restore).toContain('formHost.querySelector(mark)');
+    expect(restore).toContain('byFocusKey(host, key)');
     expect(restore).toContain("formHost.querySelector('#typeSelect')");
     expect(restore).toContain("document.getElementById('nodeSectionType')");
     expect(restore).toContain("document.getElementById('backToNodes')");
@@ -2882,5 +3004,66 @@ describe('management page integration', () => {
     expect(declaration('closeNodeDetail')).toContain('clearTypeAnnounce();');
     expect(declaration('showNodeSections')).toContain('clearTypeAnnounce();');
     expect(script).toContain("if (region) region.textContent = '';");
+  });
+
+  it('reads and restores the keyboard in the half that reports the node too', () => {
+    /**
+     * That half carries Manage, Remove and Acknowledge now, and the five-second refresh
+     * redraws it, so a reader using one of them would be dropped out of it.
+     */
+    const render = declaration('renderTypeSection');
+
+    expect(render).toContain('const panelKey = focusKeyIn(rows);');
+    expect(render).toContain('restoreSectionFocus(rows, panelKey);');
+    expect(render.indexOf('const panelKey = focusKeyIn(rows);')).toBeLessThan(
+      render.indexOf('rows.innerHTML'),
+    );
+  });
+
+  it('gives every control in the section a key it can be found by again', () => {
+    const script = lastScript();
+
+    ['select', 'apply', 'revert', 'manage', 'remove-override'].forEach((key) =>
+      expect(script).toContain(`data-focus-key="${key}"`),
+    );
+    // One per observation, since a node can carry more than one.
+    expect(script).toContain('data-focus-key="ack:${uiHelpers.escapeHtml(');
+  });
+
+  it('acknowledges a hardware change without asking first', () => {
+    /**
+     * Acknowledging says nothing is wrong and changes nothing in HomeKit, so there is nothing
+     * to confirm. It carries the observation it answers, and the fingerprint it was read for.
+     */
+    const script = lastScript();
+
+    expect(script).toContain("if (button.classList.contains('type-acknowledge')) {");
+    expect(script).toContain("observationId: button.getAttribute('data-observation')");
+    expect(declaration('typeWriteBody')).toContain(
+      'return { nodeId, observationId, expectedFingerprint: payload.fingerprint };',
+    );
+    expect(lastScript()).toContain("acknowledge: 'acknowledge-type-orphan'");
+  });
+
+  it('asks before removing an override, and sends the revision it read', () => {
+    const script = lastScript();
+
+    expect(script).toContain("? 'remove'");
+    expect(declaration('typeWriteBody')).toContain(
+      'return { nodeId, expectedRevision: payload.cohortRevision };',
+    );
+    expect(lastScript()).toContain("remove: 'remove-type-override'");
+  });
+
+  it('lets the panel going away be the answer for the two that change nothing', () => {
+    // Neither moves anything in HomeKit, so there is nothing to say the section does not show.
+    expect(declaration('runTypeWrite')).toContain(
+      "} else if (action === 'apply' || action === 'revert') {",
+    );
+  });
+
+  it('draws no warning in a dialog that has none', () => {
+    expect(declaration('openTypeWriteDialog')).toContain('dialog.warning');
+    expect(declaration('openTypeWriteDialog')).toContain("? `<p class=\"mb-1 mt-2\">");
   });
 });
