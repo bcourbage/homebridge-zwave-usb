@@ -2040,7 +2040,7 @@ describe('an override that no longer fits', () => {
 
     expect(panel.heading).toBe('Your saved override cannot be applied to this device');
     expect(panel.body).toBe(
-      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so it uses its own type. The override is still applied to:',
+      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so the saved override does not apply here. The override is still applied to:',
     );
     expect(panel.chips).toEqual([
       { nodeId: 5, name: "Nico's Shade" },
@@ -2056,7 +2056,7 @@ describe('an override that no longer fits', () => {
     const panel = invalid([])!;
 
     expect(panel.body).toBe(
-      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so it uses its own type.',
+      'This device reports the same hardware fingerprint, but it cannot take Window Covering, so the saved override does not apply here.',
     );
     expect(panel.chips).toEqual([]);
     expect(panel.manage).toBeNull();
@@ -2105,6 +2105,33 @@ describe('an override that no longer fits', () => {
       type: 'Motion Sensor',
     });
     expect(orphan.acknowledge).toBe('Acknowledge hardware change');
+    expect(orphan.canAcknowledge).toBe(true);
+  });
+
+  it('cannot acknowledge against a fingerprint the node is not reporting', () => {
+    /**
+     * The acknowledgement is answered against what the node reports now, so a re-interview
+     * that has left it without a fingerprint leaves nothing to send. The section already says
+     * the interview has to finish first.
+     */
+    const { orphans } = describeTypeExceptions(
+      payload({
+        fingerprint: null,
+        orphans: [{ observationId: 'obs-1', fingerprint: null, primaryKind: null, appliedAt: null }],
+      }),
+    );
+
+    expect(orphans[0].canAcknowledge).toBe(false);
+  });
+
+  it('says that a removal and an acknowledgement happened', () => {
+    expect(describeWriteOutcome({}, null, [], 'remove').lines).toEqual([
+      'Saved override removed.',
+    ]);
+    expect(describeWriteOutcome({}, null, [], 'acknowledge').lines).toEqual([
+      'Hardware change acknowledged.',
+    ]);
+    expect(describeWriteOutcome({}, null, [], 'remove').type).toBe('success');
   });
 
   it('keeps each observation answerable on its own', () => {
@@ -3055,11 +3082,37 @@ describe('management page integration', () => {
     expect(lastScript()).toContain("remove: 'remove-type-override'");
   });
 
-  it('lets the panel going away be the answer for the two that change nothing', () => {
-    // Neither moves anything in HomeKit, so there is nothing to say the section does not show.
-    expect(declaration('runTypeWrite')).toContain(
-      "} else if (action === 'apply' || action === 'revert') {",
+  it('answers every write it was asked for', () => {
+    /**
+     * A panel going away is useful, but it is not something a screen reader reports, and with
+     * several panels left standing it is not obvious which one went.
+     */
+    const write = declaration('runTypeWrite');
+
+    expect(write).toContain('uiHelpers.describeWriteOutcome(');
+    expect(write).not.toContain("} else if (action === 'apply' || action === 'revert') {");
+  });
+
+  it('allows one write at a time', () => {
+    /**
+     * A second would be composed against state the first has moved, and two answers arriving
+     * out of order would redraw the section from the older one.
+     */
+    expect(declaration('runTypeWrite')).toContain('if (!write || typeWriteRunning) return;');
+  });
+
+  it('holds the panel buttons while a write runs, like the form ones', () => {
+    const script = lastScript();
+    const render = declaration('renderTypeSection');
+
+    const panelSignature = render.slice(
+      render.indexOf('const panelSignature'),
+      render.indexOf('if (panelSignature !== typePanelDrawn)'),
     );
+
+    expect(panelSignature).toContain('${typeWriteRunning}');
+    expect(script).toContain("data-focus-key=\"remove-override\"${typeWriteRunning ? ' disabled' : ''}");
+    expect(script).toContain("typeWriteRunning || !orphan.canAcknowledge ? ' disabled' : ''");
   });
 
   it('draws no warning in a dialog that has none', () => {

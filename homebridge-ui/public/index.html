@@ -1155,7 +1155,7 @@
                  }
                  ${
                    exceptions.invalid.remove
-                     ? `<div class="mt-2"><button type="button" class="btn btn-sm btn-outline-danger type-remove-override" data-nodeid="${nodeId}" data-focus-key="remove-override">${uiHelpers.escapeHtml(
+                     ? `<div class="mt-2"><button type="button" class="btn btn-sm btn-outline-danger type-remove-override" data-nodeid="${nodeId}" data-focus-key="remove-override"${typeWriteRunning ? ' disabled' : ''}>${uiHelpers.escapeHtml(
                          exceptions.invalid.remove.label,
                        )}</button></div>`
                      : ''
@@ -1175,7 +1175,9 @@
                    orphan.observationId,
                  )}" data-focus-key="ack:${uiHelpers.escapeHtml(
                    orphan.observationId,
-                 )}">${uiHelpers.escapeHtml(orphan.acknowledge)}</button></div>
+                 )}"${typeWriteRunning || !orphan.canAcknowledge ? ' disabled' : ''}>${uiHelpers.escapeHtml(
+                   orphan.acknowledge,
+                 )}</button></div>
                </div>`,
           )
           .join('')}`;
@@ -1349,7 +1351,7 @@
 
         const state = typeState.get(String(detailNodeId)) || {};
         const draft = draftFor(detailNodeId, state.payload);
-        const panelSignature = `${detailNodeId}:${state.error || ''}:${JSON.stringify(
+        const panelSignature = `${detailNodeId}:${state.error || ''}:${typeWriteRunning}:${JSON.stringify(
           state.payload || null,
         )}`;
 
@@ -1773,14 +1775,10 @@
        */
       const runTypeWrite = async () => {
         const write = pendingTypeWrite;
-        if (!write) return;
+        // One write at a time: a second would be composed against state the first has moved.
+        if (!write || typeWriteRunning) return;
 
         const { nodeId, action, draft, payload } = write;
-        /**
-         * Removing an override and acknowledging a hardware change report themselves by the
-         * panel that asked for them going away. Nothing in HomeKit moves for either, so there
-         * is nothing to say that the section does not already show.
-         */
         pendingTypeWrite = null;
         hideModals();
 
@@ -1817,7 +1815,7 @@
             if (refusal.gone && String(detailNodeId) === String(nodeId)) {
               markNodeGone();
             }
-          } else if (action === 'apply' || action === 'revert') {
+          } else {
             const result = uiHelpers.describeWriteOutcome(
               outcome,
               draft,

@@ -1059,9 +1059,15 @@
              * said when there is no list: an override applied to nothing is removed, not read
              * about somewhere else.
              */
+            /**
+             * What the device does instead is not said: a rebuild that failed leaves HomeKit
+             * publishing something other than this node's own type, and the panel cannot tell
+             * which. What it can say is that the override is not what this node is published
+             * as, which is true either way.
+             */
             body: `This device reports the same hardware fingerprint, but it cannot take ${typeName(
               invalid.primaryKind,
-            )}, so it uses its own type.${
+            )}, so the saved override does not apply here.${
               elsewhere.length > 0 ? ' The override is still applied to:' : ''
             }`,
             chips: elsewhere.map((node) => ({ nodeId: node.nodeId, name: node.name })),
@@ -1106,6 +1112,12 @@
           type: data.primaryKind ? typeName(data.primaryKind) : null,
         },
         acknowledge: 'Acknowledge hardware change',
+        /**
+         * The acknowledgement is answered against the fingerprint the node reports now, so
+         * there is nothing to send while a re-interview has left it without one. The section
+         * already says the interview has to finish first.
+         */
+        canAcknowledge: Boolean(data.fingerprint),
       })),
     };
   }
@@ -1193,6 +1205,19 @@
    * apply would report a type as saved that had just been cleared.
    */
   function describeWriteOutcome(outcome, kind, cohort, action) {
+    if (action === 'remove' || action === 'acknowledge') {
+      /**
+       * Nothing in HomeKit moves for either, but a reader who asked for something is owed an
+       * answer saying it happened, and a panel going away is not one a screen reader reports.
+       */
+      return {
+        type: 'success',
+        lines: [
+          action === 'remove' ? 'Saved override removed.' : 'Hardware change acknowledged.',
+        ],
+      };
+    }
+
     const result = outcome || {};
     const failed = Array.isArray(result.failed) ? result.failed : [];
     const rebuilt = Array.isArray(result.rebuilt) ? result.rebuilt : [];
