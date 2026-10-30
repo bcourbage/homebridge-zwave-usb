@@ -362,6 +362,7 @@
 
         <div class="card card-body" id="nodeDetail" style="display: none;" title="">
           <a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>
+          <div id="nodeDetailError"></div>
           <div id="nodeDetailHeader"></div>
         </div>
       </div>
@@ -480,8 +481,6 @@
         }
       };
 
-      const statusMap = ['Unknown', 'Asleep', 'Awake', 'Dead', 'Alive'];
-
       /**
        * What this page remembers about a firmware update per node, keyed by node id as a
        * string. It holds a phase and at most a version, never an update payload. The plugin's
@@ -596,7 +595,7 @@
           );
           const actions = uiHelpers.describeNodeActions(node, firmwareState);
           const notices = uiHelpers.describeNodeNotices(node, firmwareState);
-          const status = statusMap[node.status] || 'Unknown';
+          const status = uiHelpers.describeNodeStatus(node);
           const nodeName = node.name || node.label || 'Node ' + node.nodeId;
 
           const tr = document.createElement('tr');
@@ -604,7 +603,7 @@
 	              <td>${node.nodeId}</td>
 	              <td id="node-name-${node.nodeId}">${uiHelpers.escapeHtml(nodeName)}${batteryHtml(uiHelpers.describeBattery(node))}</td>
 	              <td>
-	                <span class="badge badge-${status === 'Alive' || status === 'Awake' ? 'success' : 'secondary'}">${status}</span>
+	                <span class="badge badge-${status.tone}">${status.text}</span>
 	              </td>
 	              <td>${uiHelpers.escapeHtml(node.firmwareVersion || 'Unknown')}</td>
 	              <td class="node-actions" id="node-action-${node.nodeId}">${actionCellHtml(node.nodeId, actions)}</td>
@@ -622,10 +621,17 @@
         });
       };
 
-      const rerenderNodes = () => renderNodes(lastNodes);
-
       /** The node whose own page is open, or null while the list is showing. */
       let detailNodeId = null;
+
+      /**
+       * Draws whatever is on screen from what the page already knows. An action changes what it
+       * knows in one place, and the list or the node's own page, whichever is showing, follows.
+       */
+      const rerenderNodes = () => {
+        renderNodes(lastNodes);
+        if (detailNodeId !== null) renderNodeDetail();
+      };
 
       /**
        * A labeled button for the node's page. It carries the same action class and node number
@@ -645,35 +651,46 @@
         }${button.disabled ? ' disabled' : ''} title="">${body}</button>`;
       };
 
+      /**
+       * What the page last drew, so a refresh that finds nothing changed leaves it alone.
+       * Rewriting it every five seconds takes the keyboard out of the page, and would take a
+       * half-made choice with it once a section carries a form.
+       */
+      let detailDrawn = null;
+
+      /** Never equal to a description, which is JSON and always begins with a brace. */
+      const DETAIL_GONE = 'gone';
+
       const renderNodeDetail = () => {
         const node = lastNodes.find((n) => String(n.nodeId) === String(detailNodeId));
         const host = document.getElementById('nodeDetailHeader');
         if (!host) return;
 
         if (!node) {
-          // Requirement: a node that leaves the network while its page is open says so here
-          // rather than leaving the page describing something that is gone.
+          // A node that leaves the network while its page is open says so here rather than
+          // leaving the page describing something that is gone.
+          if (detailDrawn === DETAIL_GONE) return;
+          detailDrawn = DETAIL_GONE;
           host.innerHTML =
             '<p class="small text-muted">This node is no longer in the network.</p>';
           return;
         }
 
-        const head = uiHelpers.describeNodeHeader(node);
-        const firmwareState = uiHelpers.firmwareStateOf(
+        const detail = uiHelpers.describeNodeDetail(
           node,
-          firmwareRecords.get(String(node.nodeId)),
+          uiHelpers.firmwareStateOf(node, firmwareRecords.get(String(node.nodeId))),
         );
-        const actions = uiHelpers.describeNodeActions(node, firmwareState);
-        const buttons = actions.kind === 'buttons' ? actions.buttons : [];
-        const rename = buttons.find((b) => b.action === 'rename-node');
-        const labeled = buttons.filter((b) =>
-          ['refresh-node-info', 'check-update', 'start-update', 'remove-node'].includes(b.action),
-        );
+
+        const signature = JSON.stringify(detail);
+        if (signature === detailDrawn) return;
+        detailDrawn = signature;
+
+        const head = detail.header;
 
         host.innerHTML = `
           <div class="node-detail-head">
-            <h5 id="node-name-${node.nodeId}">${uiHelpers.escapeHtml(head.name)}</h5>
-            ${rename ? actionButtonHtml(node.nodeId, rename) : ''}
+            <h5>${uiHelpers.escapeHtml(head.name)}</h5>
+            ${detail.rename ? actionButtonHtml(node.nodeId, detail.rename) : ''}
           </div>
           <div class="node-detail-facts">
             <span class="text-muted">Node ${node.nodeId}</span>
@@ -682,30 +699,63 @@
             <span class="text-muted">${uiHelpers.escapeHtml(head.listening)}</span>
           </div>
           ${
-            actions.kind === 'progress'
+            detail.progress
               ? `<div class="progress mt-3" style="height: 20px;"><div class="progress-bar progress-bar-striped progress-bar-animated${
-                  actions.failed ? ' bg-danger' : ''
-                }" role="progressbar" style="width: ${actions.percent}%">${
-                  actions.percent
+                  detail.progress.failed ? ' bg-danger' : ''
+                }" role="progressbar" style="width: ${detail.progress.percent}%">${
+                  detail.progress.percent
                 }%</div></div>`
-              : `<div class="node-detail-actions">${labeled
+              : `<div class="node-detail-actions">${detail.controls
                   .map((button) => detailButtonHtml(node.nodeId, button))
                   .join('')}</div>`
           }
         `;
       };
 
+      /** Where the list was left when a node's page was opened over it. */
+      let listScroll = 0;
+
+      /**
+       * This page scrolls as one document inside the host's frame, so the offset belongs to the
+       * document and not to the card. Hiding the list shortens the document and the browser
+       * clamps the offset to what is left, which is why it is read before the list goes and
+       * written back after it returns.
+       */
+      const scrollOffset = () =>
+        window.pageYOffset || (document.documentElement || {}).scrollTop || 0;
+
       const openNodeDetail = (nodeId) => {
+        listScroll = scrollOffset();
         detailNodeId = String(nodeId);
+        detailDrawn = null;
         document.getElementById('nodeList').style.display = 'none';
         document.getElementById('nodeDetail').style.display = '';
         renderNodeDetail();
+        // The page that has just replaced the list starts at its own top, wherever the reader
+        // happened to be in the list when they left it.
+        window.scrollTo(0, 0);
       };
 
       const closeNodeDetail = () => {
         detailNodeId = null;
+        detailDrawn = null;
         document.getElementById('nodeDetail').style.display = 'none';
         document.getElementById('nodeList').style.display = '';
+        window.scrollTo(0, listScroll);
+      };
+
+      /**
+       * A refresh that failed, said on the node's own page. The list can give its rows over to
+       * the message, but the page is showing one node and has nothing to give, so it keeps what
+       * it has and says above it that this is no longer current.
+       */
+      const showNodeError = (message) => {
+        const host = document.getElementById('nodeDetailError');
+        if (!host) return;
+
+        host.innerHTML = message
+          ? `<p class="small text-danger">${uiHelpers.escapeHtml(message)}</p>`
+          : '';
       };
 
       const loadNodes = async () => {
@@ -717,6 +767,7 @@
 
           if (!Array.isArray(nodes)) {
             tbody.innerHTML = '<tr><td colspan="5" class="text-center text-danger">Plugin not responding. Is it running?</td></tr>';
+            showNodeError('Plugin not responding. Is it running?');
             return;
           }
 
@@ -731,13 +782,14 @@
           });
 
           lastNodes = nodes;
-          renderNodes(nodes);
-          if (detailNodeId !== null) renderNodeDetail();
+          showNodeError('');
+          rerenderNodes();
         } catch (err) {
           const tbody = document.getElementById('nodeTableBody');
           if (tbody) {
             tbody.innerHTML = `<tr><td colspan="5" class="text-center text-danger">${uiHelpers.escapeHtml(err.message)}</td></tr>`;
           }
+          showNodeError(err.message);
         }
       };
 
@@ -779,9 +831,15 @@
 
         // 1. Rename Logic
         if (target.classList.contains('rename-node')) {
-          const nameCell = document.getElementById(`node-name-${nodeId}`);
+          /**
+           * Read from what the plugin reported rather than from the cell on screen, because the
+           * list and the node's own page both carry the name and only one of them is showing.
+           */
+          const named = lastNodes.find((n) => String(n.nodeId) === String(nodeId));
           activeNodeId = nodeId;
-          document.getElementById('newLabelInput').value = nameCell ? nameCell.textContent : '';
+          document.getElementById('newLabelInput').value = named
+            ? named.name || named.label || `Node ${named.nodeId}`
+            : '';
           showModal('renameModal');
           return;
         }
@@ -893,12 +951,19 @@
       });
 
       // A notice that asks the reader to review a node sends them to that node's own page.
-      document.getElementById('nodeTableBody').addEventListener('click', (e) => {
+      const handleReviewLink = (e) => {
         const link = e.target.closest('a[href^="#node-"]');
         if (!link) return;
+
+        const nodeId = uiHelpers.nodeIdFromReviewLink(link.getAttribute('href'));
+        if (nodeId === null) return;
+
         e.preventDefault();
-        openNodeDetail(link.getAttribute('href').slice('#node-'.length));
-      });
+        openNodeDetail(nodeId);
+      };
+
+      document.getElementById('nodeTableBody').addEventListener('click', handleReviewLink);
+      document.getElementById('nodeDetail').addEventListener('click', handleReviewLink);
 
       /**
        * Everything that happens once the firmware warning is accepted.

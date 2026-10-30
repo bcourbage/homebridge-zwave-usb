@@ -16,6 +16,10 @@ const { describeHealStart, healIsRunning,
   typeName,
   withoutFirmwareProgress,
   describeBattery,
+  describeNodeStatus,
+  describeNodeHeader,
+  describeNodeDetail,
+  nodeIdFromReviewLink,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1128,6 +1132,152 @@ describe('battery indicator', () => {
   });
 });
 
+describe('a node status badge', () => {
+  it('names each status a controller reports and calls anything else unknown', () => {
+    expect([0, 1, 2, 3, 4].map((status) => describeNodeStatus({ status }).text)).toEqual([
+      'Unknown',
+      'Asleep',
+      'Awake',
+      'Dead',
+      'Alive',
+    ]);
+
+    expect(describeNodeStatus({ status: 9 }).text).toBe('Unknown');
+    expect(describeNodeStatus({}).text).toBe('Unknown');
+    expect(describeNodeStatus(undefined).text).toBe('Unknown');
+  });
+
+  it('colors a node that is answering and leaves the rest plain', () => {
+    expect(describeNodeStatus({ status: 4 }).tone).toBe('success');
+    expect(describeNodeStatus({ status: 2 }).tone).toBe('success');
+
+    [0, 1, 3].forEach((status) => expect(describeNodeStatus({ status }).tone).toBe('secondary'));
+  });
+});
+
+describe('a node page header', () => {
+  it('falls back from the name to the label to the number', () => {
+    expect(describeNodeHeader({ nodeId: 5, name: 'Shade', label: 'ZW140' }).name).toBe('Shade');
+    expect(describeNodeHeader({ nodeId: 5, label: 'ZW140' }).name).toBe('ZW140');
+    expect(describeNodeHeader({ nodeId: 5 }).name).toBe('Node 5');
+  });
+
+  it('says when the firmware version has not been reported', () => {
+    expect(describeNodeHeader({ nodeId: 5, firmwareVersion: '1.2' }).firmware).toBe('Firmware 1.2');
+    expect(describeNodeHeader({ nodeId: 5 }).firmware).toBe('Firmware unknown');
+  });
+
+  it('says whether the node has to be woken before it will answer', () => {
+    expect(describeNodeHeader({ nodeId: 5, isListening: true }).listening).toBe('Always listening');
+    expect(describeNodeHeader({ nodeId: 5, isFrequentListening: true }).listening).toBe(
+      'Listens frequently',
+    );
+    expect(describeNodeHeader({ nodeId: 5 }).listening).toBe('Sleeps between reports');
+  });
+
+  it('carries the same badge the list draws', () => {
+    // One table of status names, so the two surfaces cannot come to disagree.
+    const node = { nodeId: 4, status: 3 };
+
+    expect(describeNodeHeader(node).status).toBe(describeNodeStatus(node).text);
+    expect(describeNodeHeader(node).statusTone).toBe(describeNodeStatus(node).tone);
+  });
+});
+
+describe('a node page description', () => {
+  const node = { nodeId: 5, name: 'Shade', status: 4, isListening: true };
+
+  it('offers Rename beside the name and the three controls below it', () => {
+    const detail = describeNodeDetail(node, { name: 'idle' });
+
+    expect(detail.rename.action).toBe('rename-node');
+    expect(detail.controls.map((button: any) => button.action)).toEqual([
+      'refresh-node-info',
+      'check-update',
+      'remove-node',
+    ]);
+  });
+
+  it('leaves Diagnostics and the way in to the places that offer them', () => {
+    // Diagnostics has a section of its own, and the way in is how the reader got here.
+    const actions = describeNodeDetail(node, { name: 'idle' }).controls.map(
+      (button: any) => button.action,
+    );
+
+    expect(actions).not.toContain('node-diagnostics');
+    expect(actions).not.toContain('open-node');
+  });
+
+  it('offers the update in place of the check once one is waiting', () => {
+    const detail = describeNodeDetail(node, { name: 'available', version: '2.0' });
+
+    expect(detail.controls.map((button: any) => button.action)).toEqual([
+      'refresh-node-info',
+      'start-update',
+      'remove-node',
+    ]);
+  });
+
+  it('replaces the controls with progress while an update runs', () => {
+    const detail = describeNodeDetail(node, { name: 'updating', percent: 40 });
+
+    expect(detail.progress).toEqual({ percent: 40, failed: false });
+    expect(detail.controls).toEqual([]);
+    expect(detail.rename).toBeNull();
+    expect(describeNodeDetail(node, { name: 'failed', percent: 70 }).progress.failed).toBe(true);
+  });
+
+  it('offers the controller nothing, since nothing here acts on it', () => {
+    const detail = describeNodeDetail({ nodeId: 1 }, { name: 'idle' });
+
+    expect(detail.rename).toBeNull();
+    expect(detail.controls).toEqual([]);
+    expect(detail.progress).toBeNull();
+  });
+
+  it('describes an unchanged node identically, which is what lets a refresh leave it alone', () => {
+    /**
+     * The page compares the description it is given against the one it drew and writes nothing
+     * when they match. A description that differed between two passes over the same node would
+     * defeat that and take the keyboard, and later a half-made choice, with every refresh.
+     */
+    const first = JSON.stringify(describeNodeDetail(node, { name: 'idle' }));
+    const second = JSON.stringify(describeNodeDetail({ ...node }, { name: 'idle' }));
+
+    expect(second).toBe(first);
+  });
+
+  it('describes it differently as soon as anything the page shows has moved', () => {
+    const base = JSON.stringify(describeNodeDetail(node, { name: 'idle' }));
+
+    expect(JSON.stringify(describeNodeDetail({ ...node, status: 3 }, { name: 'idle' }))).not.toBe(
+      base,
+    );
+    expect(JSON.stringify(describeNodeDetail({ ...node, name: 'Blind' }, { name: 'idle' }))).not.toBe(
+      base,
+    );
+    expect(
+      JSON.stringify(describeNodeDetail({ ...node, firmwareVersion: '3.1' }, { name: 'idle' })),
+    ).not.toBe(base);
+    expect(
+      JSON.stringify(describeNodeDetail(node, { name: 'available', version: '2.0' })),
+    ).not.toBe(base);
+  });
+});
+
+describe('a review link', () => {
+  it('reads the node it points at', () => {
+    expect(nodeIdFromReviewLink('#node-7')).toBe('7');
+    expect(nodeIdFromReviewLink('#node-12')).toBe('12');
+  });
+
+  it('refuses anything else, so a link added later is not mistaken for one', () => {
+    ['#node-', '#node-7x', '#nodes-7', '#other', '', null, undefined].forEach((href) =>
+      expect(nodeIdFromReviewLink(href)).toBeNull(),
+    );
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -1457,8 +1607,8 @@ describe('management page integration', () => {
 
   it('puts the battery beside the name without disturbing the rename field', () => {
     /**
-     * The rename dialog prefills from the name cell's text, so the indicator has to contribute
-     * none: it is an SVG inside a span, written against the name with no space between them.
+     * The indicator carries no text of its own: it is an SVG inside a span, written against the
+     * name with no space between them, so the cell reads as the name and nothing else.
      */
     const html = readPage();
 
@@ -1475,5 +1625,88 @@ describe('management page integration', () => {
     for (const written of ['notice.text', 'button.label', 'nodeName', "node.firmwareVersion || 'Unknown'"]) {
       expect(script).toContain(`uiHelpers.escapeHtml(${written})`);
     }
+  });
+
+  const lastScript = () =>
+    [...readPage().matchAll(/<script>([\s\S]*?)<\/script>/g)].at(-1)![1] as string;
+
+  /** The body of a top-level `const name = ... };` in the page's inline script. */
+  const declaration = (name: string) => {
+    const match = new RegExp(`const ${name} = [\\s\\S]*?\\n      \\};`).exec(lastScript());
+    expect(match).not.toBeNull();
+    return match![0];
+  };
+
+  it('draws both surfaces from one repaint', () => {
+    /**
+     * Check Update and the firmware flow change what the page knows and then redraw. Redrawing
+     * the table alone left an open node page showing the state the node was in before the click
+     * until the next refresh, and showing nothing at all while a dialog held that refresh off.
+     */
+    const repaint = declaration('rerenderNodes');
+
+    expect(repaint).toContain('renderNodes(lastNodes)');
+    expect(repaint).toContain('renderNodeDetail()');
+  });
+
+  it('redraws a node page only when its description has changed', () => {
+    /**
+     * The five-second refresh has to keep the view current without resetting what the reader is
+     * part way through. Comparing the description against the one already drawn means an
+     * unchanged node touches no DOM at all, so focus stays where it was put.
+     */
+    const script = lastScript();
+
+    expect(script).toContain('const signature = JSON.stringify(detail);');
+    expect(script).toContain('if (signature === detailDrawn) return;');
+    expect(declaration('openNodeDetail')).toContain('detailDrawn = null;');
+    expect(declaration('closeNodeDetail')).toContain('detailDrawn = null;');
+  });
+
+  it('returns the list to where the reader left it', () => {
+    expect(declaration('openNodeDetail')).toContain('listScroll = scrollOffset();');
+    expect(declaration('closeNodeDetail')).toContain('window.scrollTo(0, listScroll);');
+  });
+
+  it('says on the node page that a refresh did not answer', () => {
+    /**
+     * The list can give its rows over to the message. The node page is showing one node, so it
+     * keeps what it has and says above it that this is no longer current, rather than going on
+     * presenting stale readings as if they had just arrived.
+     */
+    const load = declaration('loadNodes');
+
+    expect(load).toContain("showNodeError('Plugin not responding. Is it running?')");
+    expect(load).toContain('showNodeError(err.message)');
+    expect(load).toContain("showNodeError('')");
+  });
+
+  it('keeps one table of status names between the list and the node page', () => {
+    const html = readPage();
+
+    expect(html).toContain('uiHelpers.describeNodeStatus(node)');
+    ['Asleep', 'Awake', 'Dead', 'Alive'].forEach((status) =>
+      expect(html).not.toContain(`'${status}'`),
+    );
+  });
+
+  it('answers an action and a review link wherever either is drawn', () => {
+    const script = lastScript();
+
+    ['nodeTableBody', 'nodeDetail'].forEach((id) => {
+      expect(script).toContain(`getElementById('${id}').addEventListener('click', handleNodeAction)`);
+      expect(script).toContain(`getElementById('${id}').addEventListener('click', handleReviewLink)`);
+    });
+  });
+
+  it('takes the name for a rename from what the plugin reported', () => {
+    /**
+     * Both surfaces draw the name, and only one is on screen, so reading it back out of the
+     * document found whichever cell came first rather than the one that was clicked.
+     */
+    const script = lastScript();
+
+    expect(script).toContain('const named = lastNodes.find');
+    expect(script).not.toContain('node-name-${nodeId}');
   });
 });

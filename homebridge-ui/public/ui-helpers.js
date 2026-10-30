@@ -551,17 +551,30 @@
   const NODE_STATUS = ['Unknown', 'Asleep', 'Awake', 'Dead', 'Alive'];
 
   /**
+   * The badge the list and the node's own page both draw, so the two cannot come to differ
+   * about what a node is doing or about which color says so.
+   */
+  function describeNodeStatus(node) {
+    const text = NODE_STATUS[(node || {}).status] || 'Unknown';
+
+    return {
+      text,
+      tone: text === 'Alive' || text === 'Awake' ? 'success' : 'secondary',
+    };
+  }
+
+  /**
    * What a node's own page says about it above everything else: who it is, whether it is
    * answering, and whether it can be reached without waiting for it to wake.
    */
   function describeNodeHeader(node) {
-    const status = NODE_STATUS[node.status] || 'Unknown';
+    const status = describeNodeStatus(node);
 
     return {
       name: node.name || node.label || `Node ${node.nodeId}`,
       nodeId: node.nodeId,
-      status,
-      statusTone: status === 'Alive' || status === 'Awake' ? 'success' : 'secondary',
+      status: status.text,
+      statusTone: status.tone,
       firmware: node.firmwareVersion ? `Firmware ${node.firmwareVersion}` : 'Firmware unknown',
       listening: node.isListening
         ? 'Always listening'
@@ -569,6 +582,44 @@
           ? 'Listens frequently'
           : 'Sleeps between reports',
     };
+  }
+
+  /**
+   * The actions a node's own page offers, in the order it draws them. Diagnostics is not among
+   * them: it has a section of its own.
+   */
+  const DETAIL_CONTROLS = ['refresh-node-info', 'check-update', 'start-update', 'remove-node'];
+
+  /**
+   * Everything a node's own page draws, decided here rather than in the page.
+   *
+   * Two passes over the same node produce the same description, which is what lets the page
+   * compare one against the last and leave the view alone when nothing has moved. A refresh
+   * that rewrote the page every five seconds would take the keyboard with it, and would take a
+   * half-made choice with it once a section carries a form.
+   */
+  function describeNodeDetail(node, firmwareState) {
+    const actions = describeNodeActions(node, firmwareState);
+    const buttons = actions.kind === 'buttons' ? actions.buttons : [];
+
+    return {
+      header: describeNodeHeader(node),
+      rename: buttons.find((button) => button.action === 'rename-node') || null,
+      controls: buttons.filter((button) => DETAIL_CONTROLS.indexOf(button.action) !== -1),
+      progress:
+        actions.kind === 'progress' ? { percent: actions.percent, failed: actions.failed } : null,
+    };
+  }
+
+  /**
+   * The node a review link points at, or null for any other link. A notice sends a reader to
+   * the node it is about, and parsing the target here keeps the page from treating a link it
+   * gains later as one of them.
+   */
+  function nodeIdFromReviewLink(href) {
+    const match = /^#node-(\d+)$/.exec(String(href == null ? '' : href));
+
+    return match ? match[1] : null;
   }
 
   /** The name of every type a device can be published as. A kind is never shown. */
@@ -773,8 +824,10 @@
     describeNodeNotices,
     withoutFirmwareProgress,
     describeBattery,
-    NODE_STATUS,
+    describeNodeStatus,
     describeNodeHeader,
+    describeNodeDetail,
+    nodeIdFromReviewLink,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,
