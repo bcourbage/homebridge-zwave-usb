@@ -900,6 +900,16 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     const result = await write(resolver);
+
+    if (result.refusal) {
+      /**
+       * The reader is told the write did not happen and is sent to what the panel now reports,
+       * which is the condition the refusal names. The code itself is only useful to someone
+       * reading the log, and is kept here rather than put in front of them.
+       */
+      this.log.debug(`Type change for Node ${nodeId} was refused: ${result.refusal}`);
+    }
+
     const { rebuilt, failed } = result.refusal
       ? { rebuilt: [], failed: [] }
       : this.rebuildForTypeChange(result.rebuild);

@@ -2567,6 +2567,49 @@ describe('ZWaveUsbPlatform', () => {
       expect(body.rebuilt).toEqual([]);
     });
 
+    it('writes the refusal code to the log and not to the reader', async () => {
+      /**
+       * The panel says the write did not happen and sends the reader to what it now reports,
+       * which is the condition the code names. The code itself is only of use to someone
+       * reading the log, so that is where it has to arrive.
+       */
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'setNodeType')
+        .mockResolvedValue({ refusal: 'not-overridable', rebuild: [] });
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(platform.log.debug).toHaveBeenCalledWith(
+        'Type change for Node 10 was refused: not-overridable',
+      );
+    });
+
+    it('says nothing to the log about a write it accepted', async () => {
+      saved();
+      const platform = newPlatform(new Map([[10, shadeNode(10)]]));
+      platform.zwaveAccessories = new Map([[10, published(10, 'before')]]);
+      jest
+        .spyOn(TypeOverrideResolver.prototype, 'setNodeType')
+        .mockResolvedValue({ rebuild: [] });
+
+      await driveRoute(platform, '/nodes/10/type', 'POST', {
+        primaryKind: 'window-covering',
+        expectedFingerprint: FINGERPRINT,
+        expectedRevision: 'anything',
+      });
+
+      expect(platform.log.debug).not.toHaveBeenCalledWith(
+        expect.stringContaining('was refused'),
+      );
+    });
+
     it('passes over a node that left the network before the rebuild reached it', async () => {
       // Node numbers go away when a device is excluded. One that is gone was not rebuilt and
       // did not fail to rebuild: there is nothing there to report either way.

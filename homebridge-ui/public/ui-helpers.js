@@ -880,7 +880,14 @@
     if (!editable) {
       return {
         cohort: null,
-        select: { label: 'Publish this device as', value: null, options: [], disabled: true, placeholder: 'Not available' },
+        select: {
+          label: 'Publish this device as',
+          value: null,
+          options: [],
+          disabled: true,
+          placeholder: 'Not available',
+          note: null,
+        },
         hint: null,
         warning: null,
         apply: { label: 'Apply', disabled: true, hint: null },
@@ -935,8 +942,8 @@
 
     /**
      * The warning describes what the buttons below it would do, so it counts whichever of them
-     * can be pressed. With neither available nothing would change at all, and the cohort is
-     * then the only honest answer to how many accessories a change here reaches.
+     * can be pressed. With neither available there is no change to count, and the warning says
+     * what changing a type does without naming a number of accessories.
      */
     const changeCount = !applyDisabled ? changing.length : revertCount > 0 ? revertCount : null;
 
@@ -965,6 +972,13 @@
         options,
         disabled: false,
         placeholder: null,
+        /**
+         * Said rather than left to be worked out from a disabled button. Not "no longer":
+         * a current type or a default can be one the whole cohort was never able to take.
+         */
+        note: available.has(chosen)
+          ? null
+          : 'The selected type is not available for every device with this hardware.',
       },
       hint: 'Other services on this device, such as Battery, are kept as they are.',
       warning:

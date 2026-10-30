@@ -1764,6 +1764,18 @@ describe('choosing a device type', () => {
     expect(form.apply).toMatchObject({ label: 'Apply', disabled: true });
   });
 
+  it('says why a type it is showing cannot be acted on', () => {
+    /**
+     * Not "no longer": a current type or a node's own default can be one the whole cohort was
+     * never able to take, so nothing is claimed about when it stopped being available.
+     */
+    expect(describeTypeForm(overridden({ options: ['multilevel-switch'] }), null).select.note).toBe(
+      'The selected type is not available for every device with this hardware.',
+    );
+    expect(describeTypeForm(overridden(), 'multilevel-switch').select.note).toBeNull();
+    expect(describeTypeForm(overridden({ fingerprint: null }), null).select.note).toBeNull();
+  });
+
   it('holds a choice a refresh has invalidated instead of silently swapping it', () => {
     /**
      * The exact sequence: a type is chosen while the cohort can take it, and the next payload
