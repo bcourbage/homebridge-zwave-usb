@@ -2541,7 +2541,8 @@ describe('management page integration', () => {
      */
     const away = declaration('showNodeSections');
 
-    expect(away).toContain("panel.innerHTML = '';");
+    // What it held goes; what it is made of stays, so it can be drawn into again.
+    expect(away).toContain('panel.innerHTML = SECTION_SKELETON.get(section.panel)');
     expect(away).toContain("strip.style.display = present ? '' : 'none';");
     expect(declaration('markNodeGone')).toContain('showNodeSections(false);');
   });
@@ -2766,7 +2767,7 @@ describe('management page integration', () => {
 
     expect(render).toContain('const mark = formFocusMark();');
     expect(render).toContain('if (mark) {');
-    expect(render).toContain('replacement.focus({ preventScroll: true });');
+    expect(render).toContain('restoreFormFocus(mark);');
     expect(declaration('formFocusMark')).toContain("if (active.id === 'typeSelect') return '#typeSelect';");
 
     // Read before the control is replaced, put back after: the other order has nothing to ask.
@@ -2774,7 +2775,7 @@ describe('management page integration', () => {
       render.indexOf('formHost.innerHTML = typeFormHtml('),
     );
     expect(render.indexOf('formHost.innerHTML = typeFormHtml(')).toBeLessThan(
-      render.indexOf('replacement.focus('),
+      render.indexOf('restoreFormFocus(mark);'),
     );
   });
 
@@ -2810,6 +2811,56 @@ describe('management page integration', () => {
 
     expect(render).toContain('if (typeNoteSaid === null) {');
     expect(render).toContain('} else if (note !== typeNoteSaid) {');
-    expect(declaration('openNodeDetail')).toContain('typeNoteSaid = null;');
+    expect(declaration('clearTypeAnnounce')).toContain('typeNoteSaid = null;');
+  });
+
+  it('leaves an emptied section able to be drawn into again', () => {
+    /**
+     * The Device type section is two hosts, one for what the plugin reports and one for the
+     * decision. Emptying the section itself took them with it, and the next node opened found
+     * nothing to draw into.
+     */
+    const away = declaration('showNodeSections');
+
+    expect(away).toContain("panel.innerHTML = SECTION_SKELETON.get(section.panel) || '';");
+    expect(away).not.toContain("panel.innerHTML = '';");
+
+    // Read from the markup rather than written out again, so the two cannot drift apart.
+    expect(lastScript()).toContain('const SECTION_SKELETON = new Map(');
+  });
+
+  it('takes the form away with a reading that failed', () => {
+    /**
+     * The report half says the refresh failed while the form went on offering buttons built
+     * from the payload before it, which a reader could still press.
+     */
+    const render = declaration('renderTypeSection');
+    const formSignature = render.slice(render.indexOf('const formSignature'));
+
+    expect(formSignature.slice(0, 120)).toContain("state.error || ''");
+    expect(render).toContain("formHost.innerHTML = '';");
+  });
+
+  it('has somewhere to put the keyboard when the control will not take it', () => {
+    /**
+     * A refresh can disable the button focus was on, and a disabled control does not take it,
+     * so without somewhere else to go the reader is dropped to the document body.
+     */
+    const restore = declaration('restoreFormFocus');
+
+    expect(restore).toContain('formHost.querySelector(mark)');
+    expect(restore).toContain("formHost.querySelector('#typeSelect')");
+    expect(restore).toContain("document.getElementById('nodeSectionType')");
+    expect(restore).toContain("document.getElementById('backToNodes')");
+    expect(declaration('canTakeFocus')).toContain('!element.disabled');
+  });
+
+  it('says nothing about the node a reader has left', () => {
+    const script = lastScript();
+
+    expect(declaration('openNodeDetail')).toContain('clearTypeAnnounce();');
+    expect(declaration('closeNodeDetail')).toContain('clearTypeAnnounce();');
+    expect(declaration('showNodeSections')).toContain('clearTypeAnnounce();');
+    expect(script).toContain("if (region) region.textContent = '';");
   });
 });

@@ -833,7 +833,7 @@
         renderNodeDetail();
         typePanelDrawn = null;
         typeFormDrawn = null;
-        typeNoteSaid = null;
+        clearTypeAnnounce();
         typeDrafts.delete(String(nodeId));
         selectNodeSection('type');
         renderDiagnosticsSection();
@@ -853,6 +853,7 @@
         const leaving = detailNodeId;
         detailNodeId = null;
         detailDrawn = null;
+        clearTypeAnnounce();
         document.getElementById('nodeDetail').style.display = 'none';
         document.getElementById('nodeList').style.display = '';
         window.scrollTo(0, listScroll);
@@ -879,6 +880,19 @@
       let nodeSection = 'type';
 
       /**
+       * What each section is made of when it holds nothing, read from the markup once rather
+       * than written out again here. A section whose own structure was emptied along with its
+       * contents could not be drawn into afterwards: the Device type section is two hosts, one
+       * for what the plugin reports and one for the decision being made.
+       */
+      const SECTION_SKELETON = new Map(
+        NODE_SECTIONS.map((section) => [
+          section.panel,
+          (document.getElementById(section.panel) || { innerHTML: '' }).innerHTML,
+        ]),
+      );
+
+      /**
        * Whether the node still exists decides whether its sections are offered at all. Taking
        * them away empties them, so nothing that acts on a node outlives the node.
        */
@@ -893,7 +907,7 @@
           if (present) return;
 
           panel.style.display = 'none';
-          panel.innerHTML = '';
+          panel.innerHTML = SECTION_SKELETON.get(section.panel) || '';
           panel.tabIndex = -1;
         });
 
@@ -901,6 +915,7 @@
           diagnosticsDrawn = null;
           typePanelDrawn = null;
           typeFormDrawn = null;
+          clearTypeAnnounce();
         }
       };
 
@@ -1109,6 +1124,12 @@
        * a fingerprint can change under a node that is being re-interviewed, so a choice held
        * only by node number could be applied to a different device that happens to accept it.
        */
+      const clearTypeAnnounce = () => {
+        const region = document.getElementById('typeAnnounce');
+        if (region) region.textContent = '';
+        typeNoteSaid = null;
+      };
+
       const draftFor = (nodeId, payload) => {
         const held = typeDrafts.get(String(nodeId));
         if (!held) return null;
@@ -1210,6 +1231,30 @@
         return null;
       };
 
+      /** Whether an element can take the keyboard: present, and not refusing it. */
+      const canTakeFocus = (element) => Boolean(element) && !element.disabled;
+
+      /**
+       * Puts the keyboard back after the form is redrawn.
+       *
+       * The control it was on may be gone, or may have been disabled by what the refresh
+       * reported, and a disabled control does not take focus. The list is the next most useful
+       * place, then the section itself, which is focusable whenever nothing in it is, and
+       * failing that the way back out of the page.
+       */
+      const restoreFormFocus = (mark) => {
+        const formHost = document.getElementById('typeFormHost');
+        const candidates = [
+          formHost.querySelector(mark),
+          formHost.querySelector('#typeSelect'),
+          document.getElementById('nodeSectionType'),
+          document.getElementById('backToNodes'),
+        ];
+
+        const target = candidates.find(canTakeFocus);
+        if (target) target.focus({ preventScroll: true });
+      };
+
       const renderTypeSection = () => {
         const host = document.getElementById('nodeSectionType');
         const rows = document.getElementById('typePanelRows');
@@ -1237,7 +1282,7 @@
           }
         }
 
-        const formSignature = `${detailNodeId}:${draft}:${typeWriteRunning}:${JSON.stringify(
+        const formSignature = `${detailNodeId}:${state.error || ''}:${draft}:${typeWriteRunning}:${JSON.stringify(
           state.payload || null,
         )}`;
 
@@ -1252,8 +1297,7 @@
             formHost.innerHTML = typeFormHtml(detailNodeId, form);
 
             if (mark) {
-              const replacement = formHost.querySelector(mark);
-              if (replacement) replacement.focus({ preventScroll: true });
+              restoreFormFocus(mark);
             }
 
             /**
