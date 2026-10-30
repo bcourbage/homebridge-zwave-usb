@@ -1668,6 +1668,36 @@ describe('management page integration', () => {
     expect(declaration('closeNodeDetail')).toContain('window.scrollTo(0, listScroll);');
   });
 
+  it('remembers that position only on the way in from the list', () => {
+    /**
+     * A node opened from another node's page would otherwise record the page's own offset,
+     * which is zero, and back would land at the top of a list the reader had scrolled.
+     */
+    expect(declaration('openNodeDetail')).toContain(
+      'if (detailNodeId === null) listScroll = scrollOffset();',
+    );
+  });
+
+  it('carries the keyboard across the navigation', () => {
+    /**
+     * The control that was clicked goes away with the surface it sits on, so without this the
+     * keyboard is left on the document body at the top of the page, both on the way in and on
+     * the way back. The page takes it on the way in, since a redraw replaces everything inside
+     * it, and the row's own way-in button takes it on the way back.
+     */
+    const html = readPage();
+
+    expect(html).toContain('id="nodeList" tabindex="-1"');
+    expect(html).toMatch(/id="nodeDetail"[^>]*tabindex="-1"/);
+    expect(html).toMatch(/#nodeList:focus,\s*#nodeDetail:focus\s*\{\s*outline:\s*none/);
+
+    expect(declaration('openNodeDetail')).toContain('detail.focus({ preventScroll: true });');
+
+    const close = declaration('closeNodeDetail');
+    expect(close).toContain("button.getAttribute('data-nodeid') === String(leaving)");
+    expect(close).toContain("(wayIn || document.getElementById('nodeList')).focus(");
+  });
+
   it('says on the node page that a refresh did not answer', () => {
     /**
      * The list can give its rows over to the message. The node page is showing one node, so it

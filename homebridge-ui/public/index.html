@@ -148,6 +148,7 @@
     #nodeTable th.col-actions, #nodeTable td.node-actions { text-align: right; }
 
     /* A node's own page, which replaces the table rather than sitting beside it. */
+    #nodeList:focus, #nodeDetail:focus { outline: none; }
     .node-detail-back { display: inline-block; margin-bottom: 12px; }
     .node-detail-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
     .node-detail-head h5 { margin: 0; }
@@ -315,7 +316,7 @@
 
       <!-- Maintenance Tab -->
       <div class="tab-pane fade" id="maintenance" role="tabpanel">
-        <div class="card card-body" id="nodeList">
+        <div class="card card-body" id="nodeList" tabindex="-1">
           <h5>Z-Wave Node Maintenance</h5>
           <p class="text-muted small">
             View and manage your Z-Wave nodes. Check for official firmware updates via Z-Wave JS Service.
@@ -360,7 +361,7 @@
           </div>
         </div>
 
-        <div class="card card-body" id="nodeDetail" style="display: none;" title="">
+        <div class="card card-body" id="nodeDetail" style="display: none;" title="" tabindex="-1">
           <a href="#" class="node-detail-back" id="backToNodes">&lsaquo; All nodes</a>
           <div id="nodeDetailError"></div>
           <div id="nodeDetailHeader"></div>
@@ -725,23 +726,48 @@
         window.pageYOffset || (document.documentElement || {}).scrollTop || 0;
 
       const openNodeDetail = (nodeId) => {
-        listScroll = scrollOffset();
+        /**
+         * Only the way in from the list is the list's own position. A node reached from another
+         * node's page leaves what is remembered alone, since back returns to the list from
+         * either of them and the list has not moved in between.
+         */
+        if (detailNodeId === null) listScroll = scrollOffset();
+
+        const detail = document.getElementById('nodeDetail');
         detailNodeId = String(nodeId);
         detailDrawn = null;
         document.getElementById('nodeList').style.display = 'none';
-        document.getElementById('nodeDetail').style.display = '';
+        detail.style.display = '';
         renderNodeDetail();
+        /**
+         * The control that was clicked is inside the list that has just been put away, so the
+         * keyboard would be left on the document body. It comes to the page instead, which is
+         * drawn once and stays, rather than to anything inside it that a redraw replaces.
+         */
+        detail.focus({ preventScroll: true });
         // The page that has just replaced the list starts at its own top, wherever the reader
         // happened to be in the list when they left it.
         window.scrollTo(0, 0);
       };
 
       const closeNodeDetail = () => {
+        const leaving = detailNodeId;
         detailNodeId = null;
         detailDrawn = null;
         document.getElementById('nodeDetail').style.display = 'none';
         document.getElementById('nodeList').style.display = '';
         window.scrollTo(0, listScroll);
+
+        /**
+         * Back to the control the reader came in by, found by node number rather than held as
+         * an element, because every refresh replaces the row it sits in. A node that has left
+         * the network since has no row, and the list itself takes the keyboard.
+         */
+        const wayIn = [...document.querySelectorAll('#nodeTableBody button.open-node')].find(
+          (button) => button.getAttribute('data-nodeid') === String(leaving),
+        );
+
+        (wayIn || document.getElementById('nodeList')).focus({ preventScroll: true });
       };
 
       /**
