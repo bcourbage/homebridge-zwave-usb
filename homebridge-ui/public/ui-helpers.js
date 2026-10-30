@@ -820,6 +820,34 @@
   const REBUILD_WARNING_MANY =
     'Changing the device type replaces the corresponding HomeKit service on each affected accessory. Scenes and automations that use the replaced service may need to be set up again.';
 
+  /** Said where neither button can act, so there is no number of accessories to name. */
+  const REBUILD_WARNING_NONE =
+    'Changing a device type replaces its corresponding HomeKit service. Scenes and automations that use that service may need to be set up again.';
+
+  const WRITE_REFUSALS = {
+    'unknown-node': 'This node is no longer in the network. Nothing was changed.',
+    'fingerprint-changed': 'This node now reports different hardware. Nothing was changed.',
+    'cohort-changed':
+      'The devices that share this hardware changed. Nothing was changed. Review the list and try again.',
+  };
+
+  const WRITE_REFUSAL_OTHER =
+    'The device type could not be changed. Nothing was changed. Review the updated device information.';
+
+  /**
+   * What a refused write tells the reader, and whether the node it was about is gone.
+   *
+   * Only the refusals a reader can act on get a sentence of their own. The rest say the write
+   * did not happen and send them back to what the section now reports, because the code names
+   * a condition the page has already redrawn itself around. The code goes to the log.
+   */
+  function describeWriteRefusal(code) {
+    return {
+      gone: code === 'unknown-node',
+      text: lookup(WRITE_REFUSALS, code) || WRITE_REFUSAL_OTHER,
+    };
+  }
+
   /** How a type reads in the select when it is one of the two the device already knows about. */
   function selectOptionLabel(kind, role, defaultSource) {
     const name = typeName(kind);
@@ -862,17 +890,34 @@
 
     const chosen = draft || data.primaryKind;
 
+    /**
+     * The types the whole cohort can take. The current type and this node's own default are
+     * listed whether or not they are among them, because they are what the device is and what
+     * it would go back to, but a type the cohort cannot take is not one to act on: a mixed
+     * cohort, or a detection the plugin has since corrected, puts either of them outside it.
+     */
+    const available = new Set(data.options || []);
     const seen = new Set();
     const options = [];
     const offer = (kind, role) => {
       if (!kind || seen.has(kind)) return;
       seen.add(kind);
-      options.push({ kind, label: selectOptionLabel(kind, role, data.defaultSource) });
+      options.push({
+        kind,
+        label: selectOptionLabel(kind, role, data.defaultSource),
+        available: available.has(kind),
+      });
     };
 
     offer(data.primaryKind, data.source === 'override' ? 'override' : 'default');
     offer(data.defaultKind, 'default');
     (data.options || []).forEach((kind) => offer(kind, 'other'));
+    /**
+     * A refresh can take the chosen type out of the intersection while the reader is deciding.
+     * It stays in the list so the choice they made is still the one they see, and it carries
+     * the same mark as any other type the cohort cannot take.
+     */
+    offer(chosen, 'other');
 
     const changing = cohortMembers.filter((member) => member.primaryKind !== chosen);
     const reverting = cohortMembers.filter(
@@ -882,7 +927,8 @@
     const matchesOverride = Boolean(override) && override.primaryKind === chosen;
     const everyDefault =
       Boolean(override) && cohortMembers.length > 0 && cohortMembers.every((member) => member.defaultKind === chosen);
-    const applyDisabled = changing.length === 0 || matchesOverride || everyDefault;
+    const applyDisabled =
+      !available.has(chosen) || changing.length === 0 || matchesOverride || everyDefault;
 
     const defaults = new Set(reverting.map((member) => member.defaultKind));
     const revertCount = reverting.length;
@@ -892,11 +938,7 @@
      * can be pressed. With neither available nothing would change at all, and the cohort is
      * then the only honest answer to how many accessories a change here reaches.
      */
-    const changeCount = !applyDisabled
-      ? changing.length
-      : revertCount > 0
-        ? revertCount
-        : cohortMembers.length;
+    const changeCount = !applyDisabled ? changing.length : revertCount > 0 ? revertCount : null;
 
     return {
       cohort: {
@@ -925,7 +967,12 @@
         placeholder: null,
       },
       hint: 'Other services on this device, such as Battery, are kept as they are.',
-      warning: changeCount === 1 ? REBUILD_WARNING_ONE : REBUILD_WARNING_MANY,
+      warning:
+        changeCount === null
+          ? REBUILD_WARNING_NONE
+          : changeCount === 1
+            ? REBUILD_WARNING_ONE
+            : REBUILD_WARNING_MANY,
       apply: {
         label: applyDisabled
           ? 'Apply'
@@ -933,15 +980,21 @@
         disabled: applyDisabled,
         hint: everyDefault ? 'Use Revert to return to the default type.' : null,
       },
-      revert: override
-        ? {
-            label:
-              defaults.size === 1
-                ? `Revert ${revertCount} ${revertCount === 1 ? 'node' : 'nodes'} to ${typeName([...defaults][0])}`
-                : `Revert ${revertCount} nodes to their default types`,
-            disabled: revertCount === 0,
-          }
-        : null,
+      /**
+       * Offered only where it would do something. An override no node in the cohort can take
+       * leaves nothing to revert, and the way to be rid of it is to remove the override
+       * itself, which the invalid panel offers.
+       */
+      revert:
+        override && revertCount > 0
+          ? {
+              label:
+                defaults.size === 1
+                  ? `Revert ${revertCount} ${revertCount === 1 ? 'node' : 'nodes'} to ${typeName([...defaults][0])}`
+                  : `Revert ${revertCount} nodes to their default types`,
+              disabled: false,
+            }
+          : null,
     };
   }
 
@@ -1224,6 +1277,7 @@
     describeDiagnosticsSection,
     describeTypePanel,
     describeTypeForm,
+    describeWriteRefusal,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

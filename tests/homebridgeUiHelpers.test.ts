@@ -24,6 +24,7 @@ const { describeHealStart, healIsRunning,
   describeDiagnosticsSection,
   describeTypePanel,
   describeTypeForm,
+  describeWriteRefusal,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1702,6 +1703,25 @@ describe('choosing a device type', () => {
     ).toBe('Revert 1 node to Multilevel Switch');
   });
 
+  it('offers no Revert where there is nothing to revert', () => {
+    /**
+     * An override no node in the cohort can take leaves every node on its own default, so a
+     * Revert button would offer an operation over no nodes at all. Removing the override is
+     * the way out of that state, and the invalid panel offers it.
+     */
+    const form = describeTypeForm(
+      overridden({
+        cohort: [
+          member(10, { primaryKind: 'multilevel-switch', takesOverride: false }),
+          member(11, { primaryKind: 'multilevel-switch', takesOverride: false }),
+        ],
+      }),
+      null,
+    );
+
+    expect(form.revert).toBeNull();
+  });
+
   it('does not name one default when the nodes have different ones', () => {
     const form = describeTypeForm(
       overridden({ cohort: [member(10), member(11, { defaultKind: 'binary-switch' })] }),
@@ -1717,9 +1737,51 @@ describe('choosing a device type', () => {
 
     const many = describeTypeForm(overridden(), 'multilevel-switch');
     expect(many.warning).toContain('on each affected accessory');
+  });
 
-    // Neither button can be pressed, so the cohort is what a change here would reach.
-    expect(describeTypeForm(plain(), null).warning).toContain('on this accessory');
+  it('names no number of accessories when neither button can act', () => {
+    // There is no change to count, and the cohort is not a count of what would change.
+    const resting = describeTypeForm(plain(), null).warning;
+
+    expect(resting).toBe(
+      'Changing a device type replaces its corresponding HomeKit service. Scenes and automations that use that service may need to be set up again.',
+    );
+    expect(resting).not.toContain('accessories');
+  });
+
+  it('marks a type the cohort cannot take, wherever it came from', () => {
+    /**
+     * The current type and this node's own default are listed whether or not the whole cohort
+     * can take them, because they are what the device is and what it would go back to. A mixed
+     * cohort puts either outside the intersection, and the backend refuses one that is.
+     */
+    const form = describeTypeForm(overridden({ options: ['multilevel-switch'] }), null);
+
+    expect(form.select.options).toEqual([
+      { kind: 'window-covering', label: 'Window Covering (your override)', available: false },
+      { kind: 'multilevel-switch', label: 'Multilevel Switch (detected default)', available: true },
+    ]);
+    expect(form.apply).toMatchObject({ label: 'Apply', disabled: true });
+  });
+
+  it('holds a choice a refresh has invalidated instead of silently swapping it', () => {
+    /**
+     * The exact sequence: a type is chosen while the cohort can take it, and the next payload
+     * no longer offers it. Dropping it would leave the select showing its first option while
+     * Apply acted on the one the reader could no longer see.
+     */
+    const chosen = 'window-covering';
+    const before = describeTypeForm(plain(), chosen);
+
+    expect(before.apply).toMatchObject({ disabled: false });
+
+    const after = describeTypeForm(plain({ options: ['multilevel-switch'] }), chosen);
+
+    expect(after.select.value).toBe(chosen);
+    expect(after.select.options.find((option: any) => option.kind === chosen)).toMatchObject({
+      available: false,
+    });
+    expect(after.apply).toMatchObject({ label: 'Apply', disabled: true });
   });
 
   it('offers nothing to choose where nothing can be chosen', () => {
@@ -1739,6 +1801,43 @@ describe('choosing a device type', () => {
       expect(form.revert).toBeNull();
       expect(form.cohort).toBeNull();
     });
+  });
+});
+
+describe('a refused type write', () => {
+  it('sends a reader to the node-gone state when the node has left', () => {
+    expect(describeWriteRefusal('unknown-node')).toEqual({
+      gone: true,
+      text: 'This node is no longer in the network. Nothing was changed.',
+    });
+  });
+
+  it('says what changed under the reader when the hardware or the cohort did', () => {
+    expect(describeWriteRefusal('fingerprint-changed')).toMatchObject({
+      gone: false,
+      text: 'This node now reports different hardware. Nothing was changed.',
+    });
+    expect(describeWriteRefusal('cohort-changed').text).toBe(
+      'The devices that share this hardware changed. Nothing was changed. Review the list and try again.',
+    );
+  });
+
+  it('sends every other refusal back to what the section now reports', () => {
+    /**
+     * The code names a condition the page has already redrawn itself around, so repeating it
+     * as copy would describe the state the reader is looking at. It goes to the log instead.
+     */
+    ['read-only', 'not-overridable', 'incomplete-request', 'something-new', undefined].forEach(
+      (code) =>
+        expect(describeWriteRefusal(code as string)).toEqual({
+          gone: false,
+          text: 'The device type could not be changed. Nothing was changed. Review the updated device information.',
+        }),
+    );
+  });
+
+  it('cannot take a sentence from an inherited property', () => {
+    expect(describeWriteRefusal('toString').text).toContain('could not be changed');
   });
 });
 
