@@ -611,6 +611,194 @@
     };
   }
 
+  /** What the chip beside a published type says about where that type came from. */
+  const TYPE_SOURCE_CHIPS = {
+    registry: 'Verified default',
+    detected: 'Detected default',
+    override: 'Your override',
+  };
+
+  /** One heading for every way the saved overrides can be unavailable. */
+  const STORE_ERROR_HEADING = 'Saved device type overrides are unavailable.';
+
+  const STORE_ERROR_BODIES = {
+    'permission-denied':
+      'Homebridge does not have permission to read the saved overrides file, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+    unreadable:
+      'The saved overrides file could not be opened, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+    'invalid-json':
+      'The saved overrides file is damaged, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+    'unsupported-version':
+      'The saved overrides file is in a format this plugin does not read, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+    'wrong-network':
+      'The saved overrides file belongs to a different Z-Wave network, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+    'invalid-data':
+      'The saved overrides file holds something this plugin cannot use, so no saved overrides are applied and type changes are disabled. Check the Homebridge log for the file location and details.',
+  };
+
+  /** Four uppercase hex digits behind 0x, which is how a fingerprint is written throughout. */
+  function hexWord(value) {
+    return `0x${Number(value).toString(16).toUpperCase().padStart(4, '0')}`;
+  }
+
+  /** Only the type names ending in a sibilant take "es", and only the switches do. */
+  function pluralTypeName(name) {
+    return /(s|x|ch|sh)$/i.test(name) ? `${name}es` : `${name}s`;
+  }
+
+  /**
+   * What the endpoints of a device publish, in endpoint order. A type published by more than
+   * one endpoint is counted rather than written out again, and no endpoint is named or
+   * numbered, because nothing a reader can do here is per endpoint.
+   */
+  function listEndpointTypes(endpointTypes) {
+    const order = [];
+    const counts = new Map();
+
+    (endpointTypes || []).forEach((endpoint) => {
+      const kind = endpoint.primaryKind;
+      if (!counts.has(kind)) {
+        counts.set(kind, 0);
+        order.push(kind);
+      }
+      counts.set(kind, counts.get(kind) + 1);
+    });
+
+    return order
+      .map((kind) => {
+        const count = counts.get(kind);
+        const name = typeName(kind);
+        return count === 1 ? name : `${count} ${pluralTypeName(name)}`;
+      })
+      .join(', ');
+  }
+
+  /** The day an override was saved, as the page writes dates. */
+  function savedOnText(savedAt) {
+    const when = new Date(savedAt);
+    if (Number.isNaN(when.getTime())) {
+      return null;
+    }
+
+    return when.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  /**
+   * What the Device type section says about a device before anything can be changed: what it is
+   * published as, where that came from, and which hardware the answer belongs to.
+   *
+   * `panels` sit above the rows and describe something that has gone wrong with this node's
+   * type. `notices` sit below them and say why nothing here can be edited.
+   */
+  function describeTypePanel(payload) {
+    const data = payload || {};
+    const rows = [];
+    const panels = [];
+    const notices = [];
+    const failed = data.rebuildFailure ? true : false;
+    const override = data.override || null;
+
+    if (failed) {
+      /**
+       * The page knows the named type is not what HomeKit publishes, so the row is relabeled
+       * rather than left saying "Published as". Neither panel carries the error text: that
+       * reached the reader in the toast that reported the failure, and the log keeps it.
+       */
+      panels.push(
+        override
+          ? {
+              severity: 'warning',
+              heading: 'The saved type has not been applied.',
+              body: `${typeName(override.primaryKind)} is saved for this hardware, but HomeKit could not update this device. Restart Homebridge to try again. Check the Homebridge log for details.`,
+            }
+          : {
+              severity: 'warning',
+              heading: 'The default type has not been restored.',
+              body: `${typeName(data.defaultKind)} is the default for this device, but HomeKit could not restore it. Restart Homebridge to try again. Check the Homebridge log for details.`,
+            },
+      );
+    }
+
+    const publishedLabel = failed ? (override ? 'Saved type' : 'Default type') : 'Published as';
+    const published = data.multiEndpoint
+      ? listEndpointTypes(data.endpointTypes)
+      : data.primaryKind
+        ? typeName(data.primaryKind)
+        : '';
+
+    if (data.fingerprint && published) {
+      rows.push({
+        label: publishedLabel,
+        value: published,
+        chip: lookup(TYPE_SOURCE_CHIPS, data.source) || null,
+      });
+
+      if (data.source === 'override' && override) {
+        const savedOn = savedOnText(override.savedAt);
+        rows.push({
+          label: 'Source',
+          value: savedOn ? `Your override, saved ${savedOn}` : 'Your override',
+          detail: data.defaultKind ? `Default for this node: ${typeName(data.defaultKind)}` : null,
+        });
+      } else if (data.source === 'registry') {
+        rows.push({
+          label: 'Source',
+          value: 'Built-in verified registry',
+          detail: data.registryLabel || null,
+        });
+      } else {
+        rows.push({ label: 'Source', value: 'Detected automatically from the device', detail: null });
+      }
+
+      if (data.label) {
+        rows.push({ label: 'Device label', value: data.label, detail: null });
+      }
+    }
+
+    rows.push(
+      data.fingerprint
+        ? {
+            label: 'Hardware fingerprint',
+            hex: [
+              hexWord(data.fingerprint.manufacturerId),
+              hexWord(data.fingerprint.productType),
+              hexWord(data.fingerprint.productId),
+            ],
+            caption: 'Manufacturer, product type, product',
+          }
+        : { label: 'Hardware fingerprint', value: 'Not reported yet', detail: null },
+    );
+
+    if (!data.fingerprint) {
+      notices.push({
+        severity: 'info',
+        body: "Available once the device's interview has finished.",
+      });
+    } else if (data.multiEndpoint) {
+      notices.push({
+        severity: 'info',
+        body: 'This device provides multiple independent functions. Type overrides are not available for this kind of device yet.',
+      });
+    }
+
+    const storeError = data.store && data.store.error ? data.store.error.code : null;
+    if (storeError) {
+      /**
+       * Drawn amber rather than as information, because the plugin and the device are working
+       * while saved configuration is being ignored and editing is turned off. No text from the
+       * backend is shown; the code chooses the sentence.
+       */
+      notices.push({
+        severity: 'warning',
+        heading: STORE_ERROR_HEADING,
+        body:
+          lookup(STORE_ERROR_BODIES, storeError) || lookup(STORE_ERROR_BODIES, 'unreadable'),
+      });
+    }
+
+    return { panels, rows, notices };
+  }
+
   /**
    * The tab an arrow key moves to, or null for a key the strip does not answer, so the page
    * leaves every other key alone. Both ends wrap, which is what a tab strip does.
@@ -888,6 +1076,7 @@
     nodeIdFromReviewLink,
     nextSectionTab,
     describeDiagnosticsSection,
+    describeTypePanel,
     TYPE_NAMES,
     typeName,
     listNodeNumbers,

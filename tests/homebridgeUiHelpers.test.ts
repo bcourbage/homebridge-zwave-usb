@@ -22,6 +22,7 @@ const { describeHealStart, healIsRunning,
   nodeIdFromReviewLink,
   nextSectionTab,
   describeDiagnosticsSection,
+  describeTypePanel,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -1349,6 +1350,200 @@ describe('the Diagnostics section', () => {
   });
 });
 
+describe('the Device type section', () => {
+  const payload = (over: Record<string, unknown> = {}) => ({
+    nodeId: 10,
+    fingerprint: { manufacturerId: 2748, productType: 2, productId: 16 },
+    label: '[SAMPLE SHADE]',
+    multiEndpoint: false,
+    primaryKind: 'window-covering',
+    source: 'registry',
+    defaultKind: 'window-covering',
+    defaultSource: 'registry',
+    registryLabel: 'Springs Window Fashions RSZ1',
+    override: null,
+    store: { readable: true, error: null },
+    rebuildFailure: null,
+    ...over,
+  });
+
+  const rowFor = (label: string, over: Record<string, unknown> = {}) =>
+    describeTypePanel(payload(over)).rows.find((row: any) => row.label === label);
+
+  it('names the type, where it came from, the label and the fingerprint', () => {
+    const { rows } = describeTypePanel(payload());
+
+    expect(rows.map((row: any) => row.label)).toEqual([
+      'Published as',
+      'Source',
+      'Device label',
+      'Hardware fingerprint',
+    ]);
+    expect(rows[0]).toMatchObject({ value: 'Window Covering', chip: 'Verified default' });
+  });
+
+  it('writes the fingerprint as three four-digit words', () => {
+    expect(rowFor('Hardware fingerprint')).toMatchObject({
+      hex: ['0x0ABC', '0x0002', '0x0010'],
+      caption: 'Manufacturer, product type, product',
+    });
+  });
+
+  it('takes the source row from the source, not from the default', () => {
+    /**
+     * A node whose default comes from the registry but which is published as something else
+     * read as "Built-in verified registry", crediting the registry for a type it did not give.
+     */
+    expect(rowFor('Source')).toMatchObject({
+      value: 'Built-in verified registry',
+      detail: 'Springs Window Fashions RSZ1',
+    });
+    expect(rowFor('Source', { source: 'detected' })).toMatchObject({
+      value: 'Detected automatically from the device',
+      detail: null,
+    });
+    expect(rowFor('Source', { source: 'detected', defaultSource: 'registry' })).toMatchObject({
+      value: 'Detected automatically from the device',
+    });
+  });
+
+  it('dates an override and names what it replaced', () => {
+    const source = rowFor('Source', {
+      source: 'override',
+      defaultKind: 'multilevel-switch',
+      override: { primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },
+    }) as any;
+
+    expect(source.value).toMatch(/^Your override, saved [A-Z][a-z]{2} \d{1,2}, \d{4}$/);
+    expect(source.detail).toBe('Default for this node: Multilevel Switch');
+
+    // The date is the override's own, not a constant.
+    const later = rowFor('Source', {
+      source: 'override',
+      override: { primaryKind: 'window-covering', savedAt: '2025-03-04T12:00:00Z' },
+    }) as any;
+
+    expect(later.value).not.toBe(source.value);
+  });
+
+  it('names the chip for each source', () => {
+    expect(rowFor('Published as', { source: 'detected' })!.chip).toBe('Detected default');
+    expect(
+      rowFor('Published as', {
+        source: 'override',
+        override: { primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },
+      })!.chip,
+    ).toBe('Your override');
+  });
+
+  it('counts a repeated endpoint type rather than writing it out again', () => {
+    const multi = rowFor('Published as', {
+      multiEndpoint: true,
+      primaryKind: null,
+      source: 'detected',
+      endpointTypes: [
+        { endpointIndex: 1, primaryKind: 'garage-door' },
+        { endpointIndex: 2, primaryKind: 'binary-switch' },
+        { endpointIndex: 3, primaryKind: 'binary-switch' },
+      ],
+    });
+
+    expect(multi!.value).toBe('Garage Door, 2 Binary Switches');
+  });
+
+  it('says a device with several functions cannot be overridden', () => {
+    const { notices } = describeTypePanel(
+      payload({ multiEndpoint: true, primaryKind: null, endpointTypes: [] }),
+    );
+
+    expect(notices).toContainEqual({
+      severity: 'info',
+      body: 'This device provides multiple independent functions. Type overrides are not available for this kind of device yet.',
+    });
+  });
+
+  it('shows only the fingerprint row before a device has reported one', () => {
+    /**
+     * Nothing is said about what HomeKit publishes: a node waiting for metadata and an
+     * accessory already cached with an unfinished interview both reach this state, and a
+     * missing fingerprint does not tell them apart.
+     */
+    const { rows, notices } = describeTypePanel(
+      payload({ fingerprint: null, primaryKind: null, label: null }),
+    );
+
+    expect(rows).toEqual([
+      { label: 'Hardware fingerprint', value: 'Not reported yet', detail: null },
+    ]);
+    expect(notices).toEqual([
+      { severity: 'info', body: "Available once the device's interview has finished." },
+    ]);
+  });
+
+  it('warns in amber when the saved overrides cannot be read', () => {
+    // The plugin and the device are working; saved configuration is being ignored.
+    const { notices } = describeTypePanel(
+      payload({ store: { readable: false, error: { code: 'wrong-network' } } }),
+    );
+
+    expect(notices[0].severity).toBe('warning');
+    expect(notices[0].heading).toBe('Saved device type overrides are unavailable.');
+    expect(notices[0].body).toContain('belongs to a different Z-Wave network');
+    expect(notices[0].body).not.toContain('undefined');
+  });
+
+  it('has a sentence for every code the store reports', () => {
+    const codes = [
+      'permission-denied',
+      'unreadable',
+      'invalid-json',
+      'unsupported-version',
+      'wrong-network',
+      'invalid-data',
+    ];
+
+    codes.forEach((code) => {
+      const { notices } = describeTypePanel(
+        payload({ store: { readable: false, error: { code } } }),
+      );
+      expect(notices[0].body).toContain('type changes are disabled');
+    });
+  });
+
+  it('relabels the first row when HomeKit is not publishing the saved decision', () => {
+    const saved = describeTypePanel(
+      payload({
+        source: 'override',
+        defaultKind: 'multilevel-switch',
+        override: { primaryKind: 'window-covering', savedAt: '2026-10-12T18:20:00Z' },
+        rebuildFailure: { error: 'HAP refused' },
+      }),
+    );
+
+    expect(saved.rows[0].label).toBe('Saved type');
+    expect(saved.panels[0]).toMatchObject({
+      severity: 'warning',
+      heading: 'The saved type has not been applied.',
+    });
+    expect(saved.panels[0].body).toContain('Window Covering is saved for this hardware');
+    // The exception reached the reader in the toast; the log keeps it.
+    expect(saved.panels[0].body).not.toContain('HAP refused');
+
+    const reverted = describeTypePanel(
+      payload({
+        primaryKind: 'multilevel-switch',
+        source: 'detected',
+        defaultKind: 'multilevel-switch',
+        rebuildFailure: { error: 'HAP refused' },
+      }),
+    );
+
+    expect(reverted.rows[0].label).toBe('Default type');
+    expect(reverted.panels[0].heading).toBe('The default type has not been restored.');
+    expect(reverted.panels[0].body).toContain('Multilevel Switch is the default for this device');
+  });
+});
+
 describe('management page integration', () => {
   it('has valid inline JavaScript and one instance of each modal', () => {
     const fs = require('fs');
@@ -1951,5 +2146,34 @@ describe('management page integration', () => {
 
     expect(html.match(/id="diagnosticsModal"/g)).toHaveLength(1);
     expect(html).toContain('node-diagnostics');
+  });
+
+  it('reads the device type when the reader comes to the section', () => {
+    const load = declaration('loadTypeSection');
+
+    expect(load).toContain('if (state.loading) return;');
+    expect(load).toContain("window.homebridge.request('get-node-type', nodeId)");
+    expect(declaration('selectNodeSection')).toContain('loadTypeSection();');
+  });
+
+  it('settles the Device type panel after drawing it', () => {
+    // Its read-only states hold nothing focusable, which is where the panel has to take focus.
+    expect(declaration('renderTypeSection')).toContain('settlePanelFocus(host);');
+  });
+
+  it('draws the Device type rows from the helper rather than deciding for itself', () => {
+    const script = lastScript();
+
+    expect(script).toContain('uiHelpers.describeTypePanel(state.payload)');
+    expect(script).toContain('panel.panels.map(typeCalloutHtml)');
+    expect(script).toContain('panel.notices.map(typeCalloutHtml)');
+  });
+
+  it('escapes every value the plugin supplies for those rows', () => {
+    const script = lastScript();
+
+    ['row.label', 'row.value', 'row.chip', 'under', 'callout.heading', 'callout.body'].forEach(
+      (written) => expect(script).toContain(`uiHelpers.escapeHtml(${written})`),
+    );
   });
 });

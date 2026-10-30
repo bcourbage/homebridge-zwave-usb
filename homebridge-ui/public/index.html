@@ -155,6 +155,17 @@
       margin-top: 6px; font-size: 85%; }
     .node-detail-actions { display: flex; flex-wrap: wrap; gap: 0.5rem; margin: 14px 0 4px; }
     #nodeSections { margin-top: 16px; }
+    .type-row { display: flex; gap: 12px; margin-bottom: 10px; }
+    .type-row-label { flex: 0 0 150px; }
+    .type-row-value { flex: 1 1 auto; min-width: 0; }
+    .type-chip { font-weight: 500; margin-left: 8px; vertical-align: 1px; }
+    /* Bootstrap colors <code> pink, which reads as something being wrong with the value. */
+    .type-hex { margin-right: 6px; padding: 2px 6px; border-radius: 3px; color: inherit;
+                background: rgba(127, 127, 127, 0.16); }
+    @media (max-width: 575.98px) {
+      .type-row { display: block; }
+      .type-row-label { margin-bottom: 2px; }
+    }
     .node-section:focus { outline: none; }
     .node-detail-actions .ico { margin-right: 5px; vertical-align: -2px; }
 
@@ -678,9 +689,6 @@
        */
       let detailDrawn = null;
 
-      /** Never equal to a description, which is JSON and always begins with a brace. */
-      const DETAIL_GONE = 'gone';
-
       /**
        * Set when the node this page was opened on leaves the network, and cleared only by
        * opening a node again.
@@ -700,7 +708,6 @@
         if (!node) {
           // A node that leaves the network while its page is open says so here rather than
           // leaving the page describing something that is gone.
-          detailDrawn = DETAIL_GONE;
           detailGone = true;
 
           /**
@@ -792,6 +799,7 @@
         document.getElementById('nodeList').style.display = 'none';
         detail.style.display = '';
         renderNodeDetail();
+        typeDrawn = null;
         selectNodeSection('type');
         renderDiagnosticsSection();
         /**
@@ -856,6 +864,7 @@
 
         if (!present) {
           diagnosticsDrawn = null;
+          typeDrawn = null;
         }
       };
 
@@ -884,6 +893,9 @@
 
         if (name === 'diagnostics') {
           loadDiagnosticsSection();
+        }
+        if (name === 'type') {
+          loadTypeSection();
         }
       };
 
@@ -1004,6 +1016,100 @@
       };
 
       /**
+       * What the Device type section knows about each node, read the same way the Diagnostics
+       * report is: when the reader comes to the section, and never on a timer.
+       */
+      const typeState = new Map();
+
+      const typeFor = (nodeId) => {
+        const key = String(nodeId);
+        if (!typeState.has(key)) {
+          typeState.set(key, {});
+        }
+        return typeState.get(key);
+      };
+
+      const typeRowHtml = (row) => {
+        const value = row.hex
+          ? row.hex.map((word) => `<code class="type-hex">${uiHelpers.escapeHtml(word)}</code>`).join('')
+          : uiHelpers.escapeHtml(row.value);
+        const under = row.caption || row.detail;
+
+        return `
+          <div class="type-row">
+            <div class="type-row-label text-muted">${uiHelpers.escapeHtml(row.label)}</div>
+            <div class="type-row-value">
+              <span>${value}</span>${
+                row.chip
+                  ? `<span class="badge badge-light type-chip">${uiHelpers.escapeHtml(row.chip)}</span>`
+                  : ''
+              }
+              ${under ? `<div class="small text-muted">${uiHelpers.escapeHtml(under)}</div>` : ''}
+            </div>
+          </div>`;
+      };
+
+      const typeCalloutHtml = (callout) => `
+        <div class="alert alert-${callout.severity === 'warning' ? 'warning' : 'info'} py-2 small" role="alert">
+          ${callout.heading ? `<strong>${uiHelpers.escapeHtml(callout.heading)}</strong><br>` : ''}
+          ${uiHelpers.escapeHtml(callout.body)}
+        </div>`;
+
+      /** What the Device type panel is showing, so a redraw that would change nothing is not made. */
+      let typeDrawn = null;
+
+      const renderTypeSection = () => {
+        const host = document.getElementById('nodeSectionType');
+        if (!host || detailNodeId === null || detailGone) return;
+
+        const state = typeState.get(String(detailNodeId)) || {};
+        const signature = `${detailNodeId}:${state.error || ''}:${JSON.stringify(state.payload || null)}`;
+        if (signature === typeDrawn) return;
+        typeDrawn = signature;
+
+        if (state.error) {
+          host.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(state.error)}</p>`;
+        } else if (!state.payload) {
+          host.innerHTML = '<p class="small text-muted">Loading device type...</p>';
+        } else {
+          const panel = uiHelpers.describeTypePanel(state.payload);
+          host.innerHTML = `${panel.panels.map(typeCalloutHtml).join('')}${panel.rows
+            .map(typeRowHtml)
+            .join('')}${panel.notices.map(typeCalloutHtml).join('')}`;
+        }
+
+        settlePanelFocus(host);
+      };
+
+      /**
+       * Read when the reader comes to the section, like the diagnostics report, because a
+       * rebuild or a write from another window changes what it would say. Only a request
+       * already running is not repeated, and what was read last stays until the next answer.
+       */
+      const loadTypeSection = async () => {
+        if (detailNodeId === null) return;
+
+        const nodeId = detailNodeId;
+        const state = typeFor(nodeId);
+
+        if (state.loading) return;
+
+        state.loading = true;
+        renderTypeSection();
+
+        try {
+          const payload = await window.homebridge.request('get-node-type', nodeId);
+          state.payload = payload;
+          state.error = null;
+        } catch (err) {
+          state.error = err.message;
+        } finally {
+          state.loading = false;
+          renderTypeSection();
+        }
+      };
+
+      /**
        * A refresh that failed, said on the node's own page. The list can give its rows over to
        * the message, but the page is showing one node and has nothing to give, so it keeps what
        * it has and says above it that this is no longer current.
@@ -1038,6 +1144,9 @@
           });
           diagnosticsState.forEach((state, key) => {
             if (!present.has(key)) diagnosticsState.delete(key);
+          });
+          typeState.forEach((state, key) => {
+            if (!present.has(key)) typeState.delete(key);
           });
           nodes.forEach((node) => {
             if (node.firmwareProgress) firmwareRecords.delete(String(node.nodeId));
