@@ -360,10 +360,21 @@ describe('the configuration parameters payload', () => {
       expect(payload.groups[0].values[0].allowed).toEqual([{ kind: 'value', value: 4 }]);
     });
 
-    it('reports no permitted set when every entry was unusable', () => {
+    it('reports a set of none where every entry was unusable, which is not no set', () => {
+      /**
+       * Null says the device stated no permitted values and the whole range is open. An empty
+       * set says it stated some and none could be read, which permits nothing. The section draws
+       * neither, but a write is refused against the second and not against the first.
+       */
       const payload = buildNodeParametersPayload(
         paramNode([{ parameter: 2, value: 1, metadata: { allowed: [{ nonsense: true }] } }]),
       );
+
+      expect(payload.groups[0].values[0].allowed).toEqual([]);
+    });
+
+    it('reports no set at all where the device stated none', () => {
+      const payload = buildNodeParametersPayload(paramNode([{ parameter: 2, value: 1 }]));
 
       expect(payload.groups[0].values[0].allowed).toBeNull();
     });

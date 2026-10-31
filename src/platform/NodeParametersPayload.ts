@@ -83,16 +83,34 @@ const asText = (value: unknown): string | null =>
  * zwave-js reports a permitted set as single values and as ranges. A range is `{ from, to, step? }`
  * in its own definition, and an entry that is neither is dropped rather than turned into a range
  * of zero to zero, which would read as a device permitting only the number 0.
+ *
+ * A range whose step is there at all but is not a positive whole number describes no sequence,
+ * and is dropped entirely rather than reduced to a range with no step. A step stated as null is
+ * stated, not omitted. The two are not the same thing:
+ * a range with no step permits every number it covers, so reading nonsense as absence would turn
+ * malformed metadata into a wider permission than the device ever offered.
  */
 function allowedValuesOf(metadata: Record<string, unknown>): AllowedValue[] | null {
-  const allowed = metadata.allowed;
-  if (!Array.isArray(allowed) || allowed.length === 0) {
+  /**
+   * Absence is the only thing that means no restriction. Everything else the device said is an
+   * attempt at stating one, however badly, and an attempt nobody can read permits nothing.
+   */
+  if (metadata.allowed === undefined) {
     return null;
+  }
+
+  const allowed = metadata.allowed;
+  if (!Array.isArray(allowed)) {
+    return [];
   }
 
   const entries: AllowedValue[] = [];
 
   for (const entry of allowed) {
+    if (typeof entry !== 'object' || entry === null) {
+      continue;
+    }
+
     const candidate = entry as { value?: unknown; from?: unknown; to?: unknown; step?: unknown };
     const single = asNumber(candidate.value);
 
@@ -103,13 +121,27 @@ function allowedValuesOf(metadata: Record<string, unknown>): AllowedValue[] | nu
 
     const from = asNumber(candidate.from);
     const to = asNumber(candidate.to);
-
-    if (from !== null && to !== null) {
-      entries.push({ kind: 'range', from, to, step: asNumber(candidate.step) });
+    if (from === null || to === null) {
+      continue;
     }
+
+    const stated = candidate.step !== undefined;
+    const step = asNumber(candidate.step);
+
+    if (stated && (step === null || !Number.isInteger(step) || step < 1)) {
+      continue;
+    }
+
+    entries.push({ kind: 'range', from, to, step });
   }
 
-  return entries.length > 0 ? entries : null;
+  /**
+   * An empty set is not the same as no set. Null says the device stated no permitted values, and
+   * a reader may use the whole range. An empty array says it stated some and none of them could
+   * be read, which permits nothing: the writer refuses against it rather than treating unreadable
+   * metadata as permission to write anything. The section draws neither.
+   */
+  return entries;
 }
 
 function describeValue(
