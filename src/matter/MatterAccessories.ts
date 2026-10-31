@@ -1008,7 +1008,6 @@ export class MatterAccessories {
     this.trackers.set(uuid, existing);
   }
 
-  /** Stops mirroring HomeKit state for an accessory that is being rebuilt or removed. */
   /**
    * Covers the snapshot's own blind spot. The descriptor reads characteristics one at a time
    * and awaits several of them, so a value can move after being read, and no event reports that

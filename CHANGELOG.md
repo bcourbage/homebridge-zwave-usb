@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [5.0.2] - 2026-10-31
+
+### Fixed
+- Matter: attach state listeners before handoff so values that change during registration are not lost; retry a deferred offer when the in-flight registration fails (#24).
+- Matter: garage doors accept Closure commands carrying unsupported speed/latch fields instead of refusing them (#24).
+- Matter: battery status and replaceability are now Unspecified rather than guessed (#24).
+- Maintenance: Rebuild Routes works without a prior node removal, and no longer starts duplicate rebuilds (#25).
+- Maintenance: firmware progress and results read the zwave-js 15 event shapes; failed updates and failed update checks are reported as errors (#25).
+- Maintenance: table text contrast meets AA across config-ui-x themes (#25).
+
+### Changed
+- Maintenance: icon-only node actions with tooltips, a per-row notice line, firmware state that survives refreshes, and battery level beside each device name (#25).
+
+Thanks to Bruno Courbage (@bcourbage) for both PRs.
+
 ## [5.0.1] - 2026-10-25
 
 ### Fixed
