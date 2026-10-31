@@ -89,6 +89,48 @@ describe('homebridge-ui server request wiring', () => {
     expect(ipcRequest).toHaveBeenNthCalledWith(8, '/firmware/abort/9', 'POST');
   });
 
+  it('forwards the parameters requests, naming the device a re-read is meant for', async () => {
+    /**
+     * A re-read puts commands on the network. The plugin is told which device the page meant,
+     * so a node number that changed hands since the page read the list cannot be asked by
+     * mistake.
+     */
+    const requests = new Map<string, (...args: any[]) => Promise<unknown>>();
+    let serverInstance: { ipcRequest?: jest.Mock } | undefined;
+
+    jest.doMock('@homebridge/plugin-ui-utils', () => {
+      return {
+        HomebridgePluginUiServer: class {
+          homebridgeStoragePath = '/tmp';
+          constructor() {
+            serverInstance = this as { ipcRequest?: jest.Mock };
+          }
+          onRequest(name: string, handler: (...args: any[]) => Promise<unknown>) {
+            requests.set(name, handler);
+          }
+          ready() {
+            return undefined;
+          }
+        },
+      };
+    });
+
+    jest.isolateModules(() => {
+      require('../homebridge-ui/server.js');
+    });
+
+    const ipcRequest = jest.fn().mockResolvedValue({ ok: true });
+    serverInstance!.ipcRequest = ipcRequest;
+
+    await requests.get('get-node-parameters')!(9);
+    await requests.get('refresh-node-parameters')!({ nodeId: 9, identity: 'node-as-listed' });
+
+    expect(ipcRequest).toHaveBeenNthCalledWith(1, '/nodes/9/parameters', 'GET');
+    expect(ipcRequest).toHaveBeenNthCalledWith(2, '/nodes/9/parameters/refresh', 'POST', {
+      identity: 'node-as-listed',
+    });
+  });
+
   it('should forward the node diagnostics request to the IPC endpoint', async () => {
     const requests = new Map<string, (...args: any[]) => Promise<unknown>>();
     let serverInstance: { ipcRequest?: jest.Mock } | undefined;

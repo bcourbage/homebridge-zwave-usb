@@ -30,6 +30,10 @@ const { describeHealStart, healIsRunning,
   describeWriteRefusal,
   describeTypeWrite,
   describeWriteOutcome,
+  describeParametersSection,
+  describeParametersRefresh,
+  parametersTabCount,
+  parametersRefreshRunning,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
 describe('homebridge-ui security key helpers', () => {
@@ -2605,6 +2609,218 @@ describe('management page integration', () => {
     return match![0];
   };
 
+  /** The body of a top-level arrow function, which a template literal ends with a backtick. */
+  const templateBody = (name: string) => {
+    const script = lastScript();
+    const at = script.indexOf(`const ${name} = `);
+    expect(at).toBeGreaterThan(-1);
+    const rest = script.slice(at);
+    const end = rest.slice(1).search(/\n {6}(const|let|\/\*\*|function)\b/);
+
+    return end === -1 ? rest : rest.slice(0, end + 1);
+  };
+
+  it('puts Parameters between Device type and Diagnostics, on the same tab semantics', () => {
+    const html = readPage();
+    const strip = html.slice(html.indexOf('id="nodeSections"'), html.indexOf('</ul>', html.indexOf('id="nodeSections"')));
+
+    expect([...strip.matchAll(/id="(nodeSection\w+Tab)"/g)].map(([, id]) => id)).toEqual([
+      'nodeSectionTypeTab',
+      'nodeSectionParametersTab',
+      'nodeSectionDiagnosticsTab',
+    ]);
+    expect(strip).toMatch(/id="nodeSectionParametersTab"[\s\S]*?aria-controls="nodeSectionParameters"/);
+    expect(strip).toMatch(/id="nodeSectionParametersTab"[\s\S]*?aria-selected="false"/);
+    expect(strip).toMatch(/id="nodeSectionParametersTab"[\s\S]*?tabindex="-1"/);
+    expect(html).toMatch(
+      /id="nodeSectionParameters" role="tabpanel"\s*\n\s*aria-labelledby="nodeSectionParametersTab"/,
+    );
+    expect(declaration('NODE_SECTIONS')).toMatch(
+      /'type'[\s\S]*'parameters'[\s\S]*'diagnostics'/,
+    );
+  });
+
+  it('keeps the search field out of everything a refresh redraws', () => {
+    /**
+     * The payload is read again every five seconds while a re-read is running. A search field
+     * inside what that redraws would lose the text typed into it, and the caret with it, in
+     * front of a reader who had touched nothing.
+     */
+    const html = readPage();
+    const render = declaration('renderParametersSection');
+
+    expect(html).toMatch(/id="parameterSearch"/);
+    expect(render).not.toContain("getElementById('parameterSearch')");
+    expect([...render.matchAll(/(\w+)\.innerHTML =/g)].map(([, host]) => host)).toEqual(
+      new Array(5).fill('list'),
+    );
+  });
+
+  it('reads the parameters payload when the page opens, so the tab can carry its count', () => {
+    // The read is of what the plugin already holds; it sends nothing to the device.
+    const open = declaration('openNodeDetail');
+
+    expect(open).toContain('loadParametersSection();');
+    expect(open).toContain('renderParametersTab();');
+  });
+
+  it('starts another node with no filter and nothing revealed', () => {
+    const open = declaration('openNodeDetail');
+
+    expect(open).toContain("parametersSearch = '';");
+    expect(open).toContain('parametersShowAdvanced = false;');
+    expect(open).toContain("document.getElementById('parameterSearch').value = '';");
+  });
+
+  it('holds what it read for the device that holds the number, not for the number', () => {
+    /**
+     * Z-Wave gives a node number away again. A payload read for the device that had the number
+     * before describes that device, and the page would otherwise go on drawing it under the
+     * name of the one that has it now, with nothing to make it read the section again.
+     */
+    const forNode = declaration('parametersFor');
+
+    expect(forNode).toContain('const identity = nodeIdentityOf(nodeId);');
+    expect(forNode).toMatch(/held && \(identity === undefined \|\| held\.identity === identity\)/);
+    expect(forNode).toContain('const fresh = { identity };');
+  });
+
+  it('takes that name from what the plugin listed', () => {
+    const identityOf = declaration('nodeIdentityOf');
+
+    expect(identityOf).toContain('lastNodes.find(');
+    expect(identityOf).toContain('node.identity');
+  });
+
+  it('reads what it holds for a node only through that check', () => {
+    // A read that went straight to the map would be a read that never asked whose payload it is.
+    const page = readPage();
+
+    expect([...page.matchAll(/parametersState\.(get|has)\(/g)]).toHaveLength(1);
+    expect(declaration('parametersFor')).toContain('parametersState.get(key)');
+  });
+
+  it('drops an answer that is not about the device it asked about', () => {
+    /**
+     * The list is read every five seconds and a payload on demand, so the plugin can answer for
+     * the device that holds the number now while the page still holds the one that had it when
+     * it asked. Storing that answer would draw one device's settings under another's name.
+     */
+    const fits = declaration('parametersAnswerFits');
+    const load = declaration('loadParametersSection');
+    const ask = declaration('requestParametersRefresh');
+
+    expect(fits).toContain('parametersFor(nodeId) !== asked');
+    expect(fits).toContain('payload.identity === asked.identity');
+    expect(load).toContain('if (!parametersAnswerFits(nodeId, state, payload)) return;');
+    expect(ask).toContain('if (!parametersAnswerFits(nodeId, state, payload)) return;');
+  });
+
+  it('names the device it is asking when it asks for a re-read', () => {
+    // A re-read puts commands on the network, so the plugin is told which device was meant.
+    expect(declaration('requestParametersRefresh')).toMatch(
+      /request\('refresh-node-parameters', \{\s*\n\s*nodeId,\s*\n\s*identity: state\.identity,/,
+    );
+  });
+
+  it('re-reads while an attempt is running, and where the section has nothing to draw', () => {
+    /**
+     * Settling ends the reason to keep looking without answering the question: it says the
+     * attempt finished, never that a value was confirmed.
+     */
+    const load = declaration('loadNodes');
+
+    expect(load).toMatch(/nodeSection === 'parameters'/);
+    expect(load).toMatch(/unread \|\| uiHelpers\.parametersRefreshRunning\(state\.payload\)/);
+    expect(load).toContain('loadParametersSection();');
+  });
+
+  it('colors the two marks a reader has to act on, in each theme the host gives it', () => {
+    /**
+     * config-ui-x replays its own stylesheet and puts `dark-mode` on the body, so the card is
+     * #fff under the light themes and #2b2b2b under the dark ones, and one set of colors
+     * cannot serve both.
+     */
+    const html = readPage();
+
+    expect(html).toMatch(/\.parameter-mark-caution \{ color: #8a4b00 !important; \}/);
+    expect(html).toMatch(/\.parameter-mark-danger \{ color: #a71d2a !important; \}/);
+    expect(html).toMatch(
+      /body\.dark-mode #maintenance \.parameter-mark-caution \{ color: #e8a33d !important; \}/,
+    );
+    expect(html).toMatch(
+      /body\.dark-mode #maintenance \.parameter-mark-danger \{ color: #ea868f !important; \}/,
+    );
+    /**
+     * This page forces white text on every badge so the filled ones read, and a chip drawn in
+     * its own color has to say so louder. Without this the marks render white on the light
+     * card, which no reading of the stylesheet's text would catch.
+     */
+    expect(html).toMatch(/\.badge \{[^}]*color: #fff !important;/);
+    expect(templateBody('parameterMarksHtml')).toContain(
+      'parameter-mark-${uiHelpers.escapeHtml(',
+    );
+  });
+
+  it('renders every string the device supplied as text', () => {
+    /**
+     * Labels, descriptions, units and state names come from the device and from zwave-js's
+     * device files. A bare interpolation of one would put whatever it contains into the page as
+     * markup, so each is passed through the page's own escaping.
+     */
+    const raw = /\$\{\s*(?!uiHelpers\.escapeHtml)[A-Za-z_$][\w$.]*\s*\}/;
+
+    ['parameterFieldHtml', 'parameterGroupHtml', 'parameterMarksHtml'].forEach((name) => {
+      const body = templateBody(name);
+      expect(body).toContain('uiHelpers.escapeHtml(');
+      expect(`${name}: ${raw.exec(body)?.[0] ?? 'escaped'}`).toBe(`${name}: escaped`);
+    });
+  });
+
+  it('binds the section controls once, at page load', () => {
+    /**
+     * Opening a node does not bind them, so opening one twice cannot leave two listeners
+     * answering one press, and the panel outlives every redraw of what is inside it.
+     */
+    const script = lastScript();
+    const first = script.indexOf("getElementById('nodeSectionParameters').addEventListener");
+    const second = script.indexOf(
+      "getElementById('nodeSectionParameters').addEventListener",
+      first + 1,
+    );
+
+    expect(first).toBeGreaterThan(-1);
+    expect(second).toBeGreaterThan(-1);
+    [first, second].forEach((at) =>
+      expect(depthAt(script, at)).toBe(
+        depthAt(script, script.indexOf("getElementById('nodeSectionDiagnostics').addEventListener")),
+      ),
+    );
+  });
+
+  it('takes the section away with the node it belongs to', () => {
+    const sections = declaration('showNodeSections');
+
+    expect(sections).toContain('parametersDrawn = null;');
+    expect(sections).toContain('clearParametersAnnounce();');
+  });
+
+  it('writes the section live region once, outside what it redraws', () => {
+    /**
+     * A region recreated by a redraw announces whatever is in it again, so a sentence that had
+     * not changed would be read out every five seconds.
+     */
+    const html = readPage();
+
+    expect(html.match(/id="parametersAnnounce"/g)).toHaveLength(1);
+    const between = html.slice(
+      html.indexOf('id="nodeSectionParameters"'),
+      html.indexOf('id="parametersAnnounce"'),
+    );
+    expect(between).toContain('id="nodeSectionDiagnostics"');
+    expect(html).toMatch(/id="parametersAnnounce"[^>]*role="status"[^>]*aria-live="polite"/);
+  });
+
   it('draws both surfaces from one repaint', () => {
     /**
      * Check Update and the firmware flow change what the page knows and then redraw. Redrawing
@@ -2811,15 +3027,18 @@ describe('management page integration', () => {
     /**
      * A panel takes the keyboard when nothing in it can. Counting disabled controls would make
      * a dead end of every covering with an operation running, and of every Device type state
-     * that cannot be edited, which is exactly where the panel has to be reachable.
+     * that cannot be edited, which is exactly where the panel has to be reachable. A control
+     * that is not displayed cannot be reached either: the Parameters section puts its search
+     * and its buttons away in the states that list nothing.
      */
     const script = lastScript();
 
     expect(script).toContain('button:not([disabled])');
     expect(script).toContain('select:not([disabled])');
     expect(declaration('settlePanelFocus')).toContain(
-      'panel.tabIndex = panel.querySelector(PANEL_FOCUSABLE) ? -1 : 0;',
+      'panel.tabIndex = [...panel.querySelectorAll(PANEL_FOCUSABLE)].some(isDisplayed) ? -1 : 0;',
     );
+    expect(declaration('isDisplayed')).toContain('element.offsetParent !== null');
   });
 
   it('says how Stop is meant to be tested', () => {
@@ -3273,5 +3492,795 @@ describe('management page integration', () => {
     expect(NODE_ICONS.diagnostics).toBeUndefined();
     expect(lastScript()).not.toContain("classList.contains('node-diagnostics')");
     expect(readPage()).toContain("request('node-diagnostics', nodeId)");
+  });
+});
+
+describe('the Parameters section', () => {
+  const value = (over: Record<string, unknown> = {}) => ({
+    bitMask: null,
+    value: 1,
+    reportedAt: null,
+    label: null,
+    description: null,
+    unit: null,
+    min: null,
+    max: null,
+    defaultValue: null,
+    recommended: null,
+    states: null,
+    allowed: null,
+    format: null,
+    valueSize: null,
+    advanced: false,
+    requiresReInclusion: false,
+    destructive: false,
+    allowManualEntry: true,
+    fromConfig: false,
+    readable: true,
+    writable: true,
+    ...over,
+  });
+
+  const group = (over: Record<string, unknown> = {}) => ({
+    endpoint: 0,
+    parameter: 1,
+    partial: false,
+    values: [value()],
+    raw: 1,
+    ...over,
+  });
+
+  const payloadOf = (over: Record<string, unknown> = {}) => ({
+    nodeId: 10,
+    state: 'parameters',
+    listening: true,
+    groups: [group()],
+    refresh: { state: 'idle', requestedAt: null, waiting: [], asked: 0, canRequest: true },
+    ...over,
+  });
+
+  const sectionOf = (over: Record<string, unknown> = {}, state: Record<string, unknown> = {}) =>
+    describeParametersSection({ payload: payloadOf(over), ...state });
+
+  describe('where there is nothing to list', () => {
+    it('gives each reason its own wording', () => {
+      const text = (state: string) =>
+        describeParametersSection({ payload: { state, groups: [] } }).text;
+
+      expect(text('interviewing')).toBe("Available once the device's interview has finished.");
+      expect(text('unsupported')).toBe('This device does not expose configuration parameters.');
+      expect(text('none')).toBe(
+        'This device supports configuration, but no parameters are available.',
+      );
+    });
+
+    it('says it is reading before a payload has arrived, and reports a failure instead', () => {
+      expect(describeParametersSection({}).kind).toBe('loading');
+      expect(describeParametersSection({ error: 'No answer.' })).toEqual({
+        kind: 'error',
+        text: 'No answer.',
+      });
+    });
+  });
+
+  describe('what a parameter shows', () => {
+    it('lists a parameter the metadata says nothing about by its number and its value', () => {
+      const [only] = sectionOf().groups;
+
+      expect(only.number).toBe('Parameter 1');
+      expect(only.label).toBeNull();
+      expect(only.fields[0].value).toEqual({ text: '1', raw: null });
+      expect(only.fields[0].rows).toEqual([]);
+      expect(only.fields[0].marks).toEqual([]);
+    });
+
+    it('shows the name the metadata gives a value, and keeps the number beside it', () => {
+      /**
+       * The name is what the setting means; the number is what the manual, another controller
+       * and the device itself all speak in, so neither replaces the other.
+       */
+      const named = sectionOf({
+        groups: [group({ values: [value({ value: 2, states: { 0: 'Off', 2: 'Away' } })] })],
+      });
+
+      expect(named.groups[0].fields[0].value).toEqual({ text: 'Away', raw: '2' });
+    });
+
+    it('says a value the device has not reported is not reported', () => {
+      const none = sectionOf({ groups: [group({ values: [value({ value: null })] })] });
+
+      expect(none.groups[0].fields[0].value.text).toBe('Not reported');
+    });
+
+    it('carries the unit on the value and on the numbers the metadata compares it with', () => {
+      const seconds = sectionOf({
+        groups: [
+          group({
+            values: [
+              value({ value: 30, unit: 'seconds', defaultValue: 10, recommended: 20, min: 0, max: 60 }),
+            ],
+          }),
+        ],
+      });
+      const field = seconds.groups[0].fields[0];
+
+      expect(field.value.text).toBe('30 seconds');
+      expect(field.rows).toEqual([
+        { label: 'Default', value: '10 seconds' },
+        { label: 'Recommended', value: '20 seconds' },
+        { label: 'Range', value: '0 to 60 seconds' },
+      ]);
+    });
+
+    it('keeps an allowed set as its single values and its ranges, steps included', () => {
+      const allowed = sectionOf({
+        groups: [
+          group({
+            values: [
+              value({
+                allowed: [
+                  { kind: 'value', value: 0 },
+                  { kind: 'range', from: 5, to: 9, step: 2 },
+                  { kind: 'range', from: 20, to: 30, step: 1 },
+                ],
+              }),
+            ],
+          }),
+        ],
+      });
+
+      expect(allowed.groups[0].fields[0].rows).toEqual([
+        { label: 'Allowed values', value: '0, 5 to 9 in steps of 2, 20 to 30' },
+      ]);
+    });
+
+    describe('a permitted set that only repeats the range', () => {
+      const rowsOf = (over: Record<string, unknown>) =>
+        sectionOf({ groups: [group({ values: [value(over)] })] }).groups[0].fields[0].rows;
+
+      it('writes the bounds once where both say the same thing', () => {
+        /**
+         * The ZAC38 repeater on the live network reports every parameter this way: a range and a
+         * permitted set with the same bounds. Two rows saying the identical thing read as two
+         * facts, and a reader has to check that they agree.
+         */
+        const rows = rowsOf({
+          unit: '%',
+          min: 10,
+          max: 50,
+          allowed: [{ kind: 'range', from: 10, to: 50, step: null }],
+        });
+
+        expect(rows).toContainEqual({ label: 'Range', value: '10 to 50 %' });
+        expect(rows.map((row: { label: string }) => row.label)).not.toContain('Allowed values');
+      });
+
+      it('keeps a set that steps through the range, which the range does not say', () => {
+        const rows = rowsOf({
+          unit: '%',
+          min: 10,
+          max: 50,
+          allowed: [{ kind: 'range', from: 10, to: 50, step: 5 }],
+        });
+
+        expect(rows).toContainEqual({ label: 'Range', value: '10 to 50 %' });
+        expect(rows).toContainEqual({
+          label: 'Allowed values',
+          value: '10 to 50 % in steps of 5',
+        });
+      });
+
+      it('keeps a set that names more than the range does', () => {
+        const rows = rowsOf({
+          unit: '%',
+          min: 0,
+          max: 50,
+          allowed: [
+            { kind: 'value', value: 0 },
+            { kind: 'range', from: 10, to: 50, step: null },
+          ],
+        });
+
+        expect(rows).toContainEqual({ label: 'Range', value: '0 to 50 %' });
+        expect(rows).toContainEqual({
+          label: 'Allowed values',
+          value: '0 %, 10 to 50 %',
+        });
+      });
+
+      it('keeps a set of single values beside the range they sit in', () => {
+        const rows = rowsOf({
+          unit: 'seconds',
+          min: 0,
+          max: 60,
+          allowed: [
+            { kind: 'value', value: 0 },
+            { kind: 'value', value: 30 },
+          ],
+        });
+
+        expect(rows).toContainEqual({
+          label: 'Allowed values',
+          value: '0 seconds, 30 seconds',
+        });
+      });
+
+      it('keeps a set the parameter has no range to repeat', () => {
+        const rows = rowsOf({ allowed: [{ kind: 'value', value: 7 }] });
+
+        expect(rows).toContainEqual({ label: 'Allowed values', value: '7' });
+        expect(rows.map((row: { label: string }) => row.label)).not.toContain('Range');
+      });
+
+      it('writes both where the bounds differ at all', () => {
+        // The comparison is of the whole rendered line, so a set that stops one short of the
+        // range is a different statement and stays.
+        const rows = rowsOf({
+          unit: '%',
+          min: 10,
+          max: 50,
+          allowed: [{ kind: 'range', from: 10, to: 51, step: null }],
+        });
+
+        expect(rows).toContainEqual({ label: 'Range', value: '10 to 50 %' });
+        expect(rows).toContainEqual({ label: 'Allowed values', value: '10 to 51 %' });
+      });
+    });
+
+    it('gives every permitted number the unit the parameter is measured in', () => {
+      /**
+       * A permitted set is read against the value above it, which carries its unit. Numbers
+       * stated without it would be read as a different quantity.
+       */
+      const allowed = sectionOf({
+        groups: [
+          group({
+            values: [
+              value({
+                unit: 'seconds',
+                allowed: [
+                  { kind: 'value', value: 0 },
+                  { kind: 'range', from: 1, to: 9, step: 2 },
+                ],
+              }),
+            ],
+          }),
+        ],
+      });
+
+      expect(allowed.groups[0].fields[0].rows).toContainEqual({
+        label: 'Allowed values',
+        value: '0 seconds, 1 to 9 seconds in steps of 2',
+      });
+    });
+
+    it('writes a size in bytes, singular where there is one', () => {
+      const sizeOf = (valueSize: number) =>
+        sectionOf({ groups: [group({ values: [value({ valueSize })] })] }).groups[0].fields[0]
+          .rows[0].value;
+
+      expect(sizeOf(1)).toBe('1 byte');
+      expect(sizeOf(2)).toBe('2 bytes');
+    });
+
+    it('marks what a reader has to know before changing a parameter, each with its meaning', () => {
+      const marked = sectionOf(
+        {
+          groups: [
+            group({
+              values: [
+                value({
+                  advanced: true,
+                  writable: false,
+                  destructive: true,
+                  requiresReInclusion: true,
+                }),
+              ],
+            }),
+          ],
+        },
+        { showAdvanced: true },
+      );
+
+      expect(marked.groups[0].fields[0].marks).toEqual([
+        {
+          label: 'Advanced',
+          tone: 'neutral',
+          explanation: 'This setting is intended for advanced users.',
+        },
+        { label: 'Read-only', tone: 'neutral', explanation: 'This parameter cannot be changed.' },
+        {
+          label: 'Destructive',
+          tone: 'danger',
+          explanation: 'Changing this parameter may reset or erase device settings.',
+        },
+        {
+          label: 'Requires re-inclusion',
+          tone: 'caution',
+          explanation:
+            'Changing this parameter may require excluding and re-including the device.',
+        },
+      ]);
+    });
+
+    it('gives the two marks a reader has to act on a weight of their own', () => {
+      /**
+       * A parameter that can erase the device's settings, or leave it needing to be excluded
+       * and re-included, is not the same kind of fact as one meant for advanced users. Marks
+       * that all looked alike would leave the two that matter to be found by reading.
+       */
+      const every = sectionOf(
+        {
+          groups: [
+            group({
+              values: [
+                value({
+                  advanced: true,
+                  writable: false,
+                  readable: false,
+                  destructive: true,
+                  requiresReInclusion: true,
+                }),
+              ],
+            }),
+          ],
+        },
+        { showAdvanced: true },
+      );
+      const tones: Record<string, string> = {};
+      every.groups[0].fields[0].marks.forEach((mark: { label: string; tone: string }) => {
+        tones[mark.label] = mark.tone;
+      });
+
+      expect(tones).toEqual({
+        Advanced: 'neutral',
+        'Read-only': 'neutral',
+        'Not readable': 'neutral',
+        Destructive: 'danger',
+        'Requires re-inclusion': 'caution',
+      });
+    });
+
+    it('says when the device last reported a value, and says where it cannot say', () => {
+      /**
+       * A time the plugin does not have is reported as not being available, which is all it
+       * knows. Saying it was not recorded would describe the plugin as having lost something.
+       */
+      const at = Date.UTC(2026, 9, 31, 12, 0, 0);
+      const reported = sectionOf({ groups: [group({ values: [value({ reportedAt: at })] })] });
+      const never = sectionOf();
+
+      expect(reported.groups[0].fields[0].reportedAt).toMatch(
+        /^Last reported [A-Z][a-z]{2} \d{1,2}, \d{4} at \d{1,2}:\d{2}\s[AP]M$/,
+      );
+      expect(never.groups[0].fields[0].reportedAt).toBe('Last report time unavailable');
+    });
+
+    it('does not tell a reader a time was not recorded for a value never reported at all', () => {
+      /**
+       * A write-only parameter has no report to be missing. Saying none was recorded would read
+       * as something having gone wrong rather than as how the parameter is defined.
+       */
+      const writeOnly = sectionOf({
+        groups: [group({ values: [value({ readable: false, value: null })] })],
+      });
+      const field = writeOnly.groups[0].fields[0];
+
+      expect(field.reportedAt).toBeNull();
+      expect(field.marks).toEqual([
+        {
+          label: 'Not readable',
+          tone: 'neutral',
+          explanation: 'The device does not report a current value for this parameter.',
+        },
+      ]);
+    });
+  });
+
+  describe('a parameter divided into fields', () => {
+    const partials = () =>
+      group({
+        parameter: 7,
+        partial: true,
+        values: [
+          value({ bitMask: 0x0f, label: 'Fade time', value: 3 }),
+          value({ bitMask: 0xf0, value: 1 }),
+        ],
+      });
+
+    it('draws one group holding each field, never one parameter per field', () => {
+      const [only] = sectionOf({ groups: [partials()] }).groups;
+
+      expect(only.number).toBe('Parameter 7');
+      expect(only.fields.map((field: { label: string }) => field.label)).toEqual([
+        'Fade time',
+        'Bit mask 0xF0',
+      ]);
+    });
+
+    it('leaves a divided parameter without a label of its own', () => {
+      // The fields are separate settings sharing a number, so the first field's label is not
+      // the parameter's name.
+      expect(sectionOf({ groups: [partials()] }).groups[0].label).toBeNull();
+    });
+
+    it('names a group by its own parameter label where it has one value', () => {
+      const labelled = sectionOf({
+        groups: [group({ values: [value({ label: 'Motion timeout' })] })],
+      });
+
+      expect(labelled.groups[0].label).toBe('Motion timeout');
+    });
+
+    it("does not write an undivided parameter's label again on its value", () => {
+      /**
+       * The value is the parameter, so the group's name is its name. Carried on both, it is
+       * drawn twice, once under the other.
+       */
+      const labelled = sectionOf({
+        groups: [group({ values: [value({ label: 'Motion timeout' })] })],
+      });
+
+      expect(labelled.groups[0].fields[0].label).toBeNull();
+    });
+
+    it('says which endpoint a group belongs to, and says nothing for the root', () => {
+      const endpoints = sectionOf({
+        groups: [group({ endpoint: 0 }), group({ endpoint: 2 })],
+      });
+
+      expect(endpoints.groups.map((one: { endpoint: string }) => one.endpoint)).toEqual([
+        null,
+        'Endpoint 2',
+      ]);
+    });
+  });
+
+  describe('searching', () => {
+    const many = () => [
+      group({ parameter: 1, values: [value({ label: 'Motion timeout' })] }),
+      group({ parameter: 12, values: [value({ description: 'Reports the LED state' })] }),
+      group({
+        parameter: 30,
+        partial: true,
+        values: [value({ bitMask: 0x0f, label: 'Chime volume' }), value({ bitMask: 0xf0 })],
+      }),
+    ];
+
+    const found = (search: string) =>
+      sectionOf({ groups: many() }, { search }).groups.map(
+        (one: { parameter: number }) => one.parameter,
+      );
+
+    it('matches a parameter number, a label and a description', () => {
+      expect(found('12')).toEqual([12]);
+      expect(found('motion')).toEqual([1]);
+      expect(found('led state')).toEqual([12]);
+    });
+
+    it('matches a field label and keeps the whole parameter it belongs to', () => {
+      /** A field is part of a parameter, and a group shown without its siblings would be a
+       * parameter misdescribed. */
+      const kept = sectionOf({ groups: many() }, { search: 'chime' }).groups;
+
+      expect(kept).toHaveLength(1);
+      expect(kept[0].fields).toHaveLength(2);
+    });
+
+    it('ignores case and surrounding space, and keeps everything for an empty search', () => {
+      expect(found('  MOTION  ')).toEqual([1]);
+      expect(found('   ')).toEqual([1, 12, 30]);
+    });
+
+    it('counts parameters rather than fields, and says nothing while nothing is hidden', () => {
+      expect(sectionOf({ groups: many() }, { search: 'motion' }).search.count).toBe(
+        'Showing 1 of 3 parameters',
+      );
+      expect(sectionOf({ groups: many() }).search.count).toBeNull();
+    });
+
+    it('says so where a search matches nothing', () => {
+      const none = sectionOf({ groups: many() }, { search: 'zzz' });
+
+      expect(none.groups).toEqual([]);
+      expect(none.empty).toBe('No parameters match your search.');
+    });
+  });
+
+  describe('advanced parameters', () => {
+    const mixed = () => [
+      group({ parameter: 1, values: [value({ label: 'Motion timeout' })] }),
+      group({ parameter: 2, values: [value({ label: 'Calibration', advanced: true })] }),
+      group({
+        parameter: 3,
+        partial: true,
+        values: [
+          value({ bitMask: 0x0f, label: 'Chime volume' }),
+          value({ bitMask: 0xf0, label: 'Service bits', advanced: true }),
+        ],
+      }),
+    ];
+
+    it('hides a parameter whose every field is advanced', () => {
+      const shown = sectionOf({ groups: mixed() }).groups;
+
+      expect(shown.map((one: { parameter: number }) => one.parameter)).toEqual([1, 3]);
+    });
+
+    it('keeps a parameter that mixes ordinary and advanced fields, without its advanced ones', () => {
+      const [, divided] = sectionOf({ groups: mixed() }).groups;
+
+      expect(divided.fields.map((field: { label: string }) => field.label)).toEqual([
+        'Chime volume',
+      ]);
+    });
+
+    it('reveals every advanced field when the reader asks', () => {
+      const revealed = sectionOf({ groups: mixed() }, { showAdvanced: true }).groups;
+
+      expect(revealed.map((one: { parameter: number }) => one.parameter)).toEqual([1, 2, 3]);
+      expect(revealed[2].fields).toHaveLength(2);
+    });
+
+    it('counts the same advanced fields whether they are shown or hidden', () => {
+      /**
+       * The number is written on the control that reveals them. One counted from what is on
+       * screen would change the moment it was pressed, as though pressing it had found more.
+       */
+      expect(sectionOf({ groups: mixed() }).advanced).toEqual({
+        label: 'Show advanced (2)',
+        expanded: false,
+      });
+      expect(sectionOf({ groups: mixed() }, { showAdvanced: true }).advanced).toEqual({
+        label: 'Hide advanced (2)',
+        expanded: true,
+      });
+    });
+
+    it('counts only the advanced fields a search has kept', () => {
+      const searched = sectionOf({ groups: mixed() }, { search: 'calibration' });
+
+      expect(searched.advanced.label).toBe('Show advanced (1)');
+    });
+
+    it('offers nothing to reveal where no parameter is advanced', () => {
+      expect(sectionOf().advanced).toBeNull();
+    });
+
+    it('says why the list is empty where every parameter is advanced', () => {
+      const all = sectionOf({
+        groups: [group({ values: [value({ advanced: true })] })],
+      });
+
+      expect(all.empty).toBe('All parameters reported by this device are marked advanced.');
+    });
+
+    it('says a search found advanced parameters rather than that it found none', () => {
+      /**
+       * The search kept a parameter and the disclosure beside it offers to show what was kept.
+       * Reporting no match there would be contradicted by the control next to it.
+       */
+      const hidden = sectionOf({ groups: mixed() }, { search: 'calibration' });
+
+      expect(hidden.groups).toEqual([]);
+      expect(hidden.advanced.label).toBe('Show advanced (1)');
+      expect(hidden.empty).toBe(
+        'Matching advanced parameters are hidden. Select Show advanced to view them.',
+      );
+    });
+
+    it('still says a search found nothing where nothing matched at all', () => {
+      const none = sectionOf({ groups: mixed() }, { search: 'nothing here' });
+
+      expect(none.advanced).toBeNull();
+      expect(none.empty).toBe('No parameters match your search.');
+    });
+
+    it('lists what the search found once the advanced parameters are shown', () => {
+      const shown = sectionOf(
+        { groups: mixed() },
+        { search: 'calibration', showAdvanced: true },
+      );
+
+      expect(shown.groups).toHaveLength(1);
+      expect(shown.empty).toBeNull();
+    });
+  });
+
+  describe('asking the device for current values', () => {
+    const refreshOf = (over: Record<string, unknown>, listening = true) =>
+      describeParametersRefresh({
+        listening,
+        refresh: {
+          state: 'idle',
+          waiting: [],
+          asked: 0,
+          completedAt: null,
+          canRequest: true,
+          ...over,
+        },
+      });
+
+    it('offers nothing where the device reports no value a re-read could confirm', () => {
+      expect(refreshOf({ canRequest: false })).toEqual({
+        button: null,
+        status: 'This device does not report any configuration values that can be re-read.',
+      });
+    });
+
+    it('says what a re-read can promise for a device that is awake and one that is not', () => {
+      expect(refreshOf({}).button).toEqual({ label: 'Re-read values', disabled: false });
+      expect(refreshOf({}, false).button).toEqual({
+        label: 'Re-read when it wakes',
+        disabled: false,
+      });
+    });
+
+    it('refuses a second ask while one is running, and says what is being waited for', () => {
+      expect(refreshOf({ state: 'dispatching' })).toEqual({
+        button: { label: 'Re-read values', disabled: true },
+        status: 'Waiting for the device to report current values.',
+      });
+      expect(refreshOf({ state: 'dispatching' }, false).status).toBe(
+        'Re-read requested. Values will be confirmed when the device wakes.',
+      );
+    });
+
+    it('offers another attempt where one finished with values unreported', () => {
+      expect(refreshOf({ state: 'incomplete' })).toEqual({
+        button: { label: 'Try re-read again', disabled: false },
+        status: 'Some values have not been reported yet.',
+      });
+    });
+
+    it('offers a sleeping device the attempt its own wording describes', () => {
+      /**
+       * A device that is asleep has not failed to answer and has not been asked yet, so the
+       * retry says what it will wait for rather than inviting an immediate second try.
+       */
+      expect(refreshOf({ state: 'incomplete' }, false).button).toEqual({
+        label: 'Try re-read when it wakes',
+        disabled: false,
+      });
+    });
+
+    it('says what became of an attempt even where nothing can be asked again', () => {
+      /**
+       * A device whose values have all gone reports nothing a re-read could confirm, and it is
+       * the device with the most to explain. Whether a control is offered is the one thing the
+       * capability decides; what the section says is what happened.
+       */
+      expect(refreshOf({ state: 'unavailable', canRequest: false })).toEqual({
+        button: null,
+        status: 'Some values could not be confirmed because they are no longer available.',
+      });
+      expect(refreshOf({ state: 'dispatching', canRequest: false })).toEqual({
+        button: null,
+        status: 'Waiting for the device to report current values.',
+      });
+      expect(refreshOf({ state: 'incomplete', canRequest: false })).toEqual({
+        button: null,
+        status: 'Some values have not been reported yet.',
+      });
+      expect(refreshOf({ state: 'complete', completedAt: 1_000, canRequest: false }).button).toBeNull();
+    });
+
+    it('says values that have gone could not be confirmed, which is not a success', () => {
+      /**
+       * Nothing is outstanding and nothing can be. Said apart from values that have yet to
+       * answer, because another attempt can bring those and will never bring these.
+       */
+      expect(refreshOf({ state: 'unavailable' })).toEqual({
+        button: { label: 'Re-read values', disabled: false },
+        status: 'Some values could not be confirmed because they are no longer available.',
+      });
+      expect(refreshOf({ state: 'unavailable' }, false).button.label).toBe('Re-read when it wakes');
+    });
+
+    it('says a re-read finished only when every value it asked about answered', () => {
+      expect(refreshOf({ state: 'complete' }).button).toEqual({
+        label: 'Re-read values',
+        disabled: false,
+      });
+    });
+
+    it('dates the re-read it reports, so a success is not read as a recent one', () => {
+      /**
+       * The status stands for as long as the plugin holds the attempt. Undated, it would go on
+       * saying the values were re-read, and a reader returning days later would read that as
+       * having just happened.
+       */
+      const done = refreshOf({ state: 'complete', completedAt: Date.now() });
+
+      expect(done.status).toMatch(
+        /^Configuration values re-read [A-Z][a-z]{2} \d{1,2}, \d{4} at \d{1,2}:\d{2}\s[AP]M\.$/,
+      );
+    });
+
+    it('says the re-read finished without a time where none was recorded', () => {
+      expect(refreshOf({ state: 'complete' }).status).toBe('Configuration values re-read.');
+    });
+
+    it('marks the value that is being waited for, and only that one', () => {
+      const waiting = sectionOf({
+        groups: [
+          group({
+            parameter: 7,
+            partial: true,
+            values: [value({ bitMask: 0x0f }), value({ bitMask: 0xf0 })],
+          }),
+        ],
+        refresh: {
+          state: 'dispatching',
+          waiting: [{ endpoint: 0, parameter: 7, bitMask: 0xf0 }],
+          asked: 2,
+          canRequest: true,
+        },
+      });
+
+      expect(
+        waiting.groups[0].fields.map((field: { waiting: boolean }) => field.waiting),
+      ).toEqual([false, true]);
+    });
+
+    it('does not mark a value of another parameter that shares its bits', () => {
+      const waiting = sectionOf({
+        groups: [group({ parameter: 7 }), group({ parameter: 8 })],
+        refresh: {
+          state: 'dispatching',
+          waiting: [{ endpoint: 0, parameter: 8, bitMask: null }],
+          asked: 2,
+          canRequest: true,
+        },
+      });
+
+      expect(waiting.groups.map((one: { fields: { waiting: boolean }[] }) => one.fields[0].waiting))
+        .toEqual([false, true]);
+    });
+
+    it('keeps re-reading while an attempt is running and not once it has settled', () => {
+      /**
+       * Settling says the attempt finished, never that a value answered, so what it ends is the
+       * reason to keep looking and not the question itself.
+       */
+      expect(parametersRefreshRunning(payloadOf({ refresh: { state: 'dispatching' } }))).toBe(true);
+      expect(parametersRefreshRunning(payloadOf({ refresh: { state: 'incomplete' } }))).toBe(false);
+      expect(parametersRefreshRunning(payloadOf({ refresh: { state: 'complete' } }))).toBe(false);
+      expect(parametersRefreshRunning(null)).toBe(false);
+    });
+  });
+
+  describe('the count beside the tab', () => {
+    it('counts the parameters a device reported', () => {
+      expect(parametersTabCount(payloadOf({ groups: [group(), group({ parameter: 2 })] }))).toBe(2);
+    });
+
+    it('counts nothing where the device has no parameters to count', () => {
+      expect(parametersTabCount({ state: 'none', groups: [] })).toBeNull();
+      expect(parametersTabCount({ state: 'interviewing', groups: [] })).toBeNull();
+      expect(parametersTabCount(null)).toBeNull();
+    });
+  });
+
+  describe('text the device supplied', () => {
+    it('passes a label through as the device wrote it, for the page to render as text', () => {
+      const hostile = '<img src=x onerror=alert(1)>';
+      const marked = sectionOf({
+        groups: [group({ values: [value({ label: hostile, description: hostile })] })],
+      });
+
+      expect(marked.groups[0].label).toBe(hostile);
+      expect(marked.groups[0].fields[0].description).toBe(hostile);
+      expect(escapeHtml(hostile)).toBe('&lt;img src=x onerror=alert(1)&gt;');
+    });
+
+    it('searches the text the device supplied rather than markup around it', () => {
+      const found = sectionOf(
+        { groups: [group({ values: [value({ label: '<b>Chime</b>' })] })] },
+        { search: 'b>chime' },
+      );
+
+      expect(found.groups).toHaveLength(1);
+    });
   });
 });

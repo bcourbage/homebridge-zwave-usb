@@ -11,10 +11,12 @@ import { CommandClasses } from '@zwave-js/core';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import { randomUUID } from 'crypto';
 import { buildNodeParametersPayload, type NodeParametersPayload } from './NodeParametersPayload';
 import {
   baselinesFor,
   canRefresh,
+  isComplete,
   reconcilePending,
   refreshStatus,
   shouldDispatch,
@@ -100,6 +102,17 @@ interface TypeWriteBody {
   observationId: string;
 }
 
+/**
+ * A parameters payload as the page receives it.
+ *
+ * It carries the name of the node it was built from, so that a page holding it can tell that the
+ * number it read under now belongs to a different device.
+ */
+export type NodeParametersView = NodeParametersPayload & {
+  identity: string;
+  refresh: RefreshStatus;
+};
+
 /** What a type write did, which the panels redraw from. */
 export interface TypeWriteOutcome {
   payload: NodeTypePayload | null;
@@ -114,6 +127,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   public readonly accessories: PlatformAccessory[] = [];
   /** The refresh each node has running or has lately run, held so returning to the page finds it. */
   private readonly parameterRefreshes = new Map<number, RefreshToken>();
+
+  private readonly nodeIdentities = new WeakMap<IZWaveNode, string>();
   /** Whether the one-time Matter cache sweep has run for this session. */
   private matterCacheSwept = false;
   private matterSweepTimeout?: NodeJS.Timeout;
@@ -292,6 +307,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
             refreshState: this.refreshStates.get(node.nodeId),
             homekitState: this.getHomeKitPublicationState(node),
             battery: this.readBatteryState(node),
+            identity: this.nodeIdentity(node),
             ...this.typeSummaryFor(node),
           }));
           return sendJson(nodes);
@@ -542,12 +558,35 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           normalizedUrl.endsWith('/parameters/refresh') &&
           method === 'POST'
         ) {
-          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
-          const payload = this.requestParameterRefresh(nodeId);
+          let body = '';
+          req.on('data', (chunk) => (body += chunk));
+          req.on('end', () => {
+            const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
 
-          return payload
-            ? sendJson(payload)
-            : sendJson({ error: `Node ${nodeId} is not in the network` }, 404);
+            try {
+              /**
+               * The caller says which device it means to ask, and one that does not say is
+               * refused rather than answered about whichever device holds the number: a re-read
+               * puts commands on the network, and a node number can change hands between the
+               * list a caller read and the request it made from it.
+               */
+              const { identity } = JSON.parse(body || '{}');
+
+              if (typeof identity !== 'string' || identity.length === 0) {
+                return sendJson({ error: 'A re-read must name the device it is for.' }, 400);
+              }
+
+              const payload = this.requestParameterRefresh(nodeId, identity);
+
+              return payload
+                ? sendJson(payload)
+                : sendJson({ error: `Node ${nodeId} is not in the network` }, 404);
+            } catch (err) {
+              this.log.error(`Configuration-value re-read rejected: ${err}`);
+              return sendJson({ error: err instanceof Error ? err.message : String(err) }, 400);
+            }
+          });
+          return;
         }
 
         if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type')) {
@@ -867,6 +906,30 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     return accessory ? this.matterAccessories.publishes(accessory.UUID) : false;
   }
 
+  /**
+   * A name for this node that is never given to another, which the page reads the way the
+   * refresh reads the node itself.
+   *
+   * Z-Wave gives a node number away again, and a replacement can report the same hardware as the
+   * device that had the number before, or report none at all while that one reported none
+   * either. Neither the number nor the fingerprint tells those apart, so the name is minted for
+   * the node and held against it: the page can then see that what it read describes a device
+   * that is no longer there, instead of drawing one device's settings under another's name.
+   *
+   * Weakly held, so a name lasts exactly as long as the node it names.
+   */
+  private nodeIdentity(node: IZWaveNode): string {
+    const held = this.nodeIdentities.get(node);
+    if (held) {
+      return held;
+    }
+
+    const minted = randomUUID();
+    this.nodeIdentities.set(node, minted);
+
+    return minted;
+  }
+
   /** This node's hardware as the records name it, or none when it has not reported any. */
   private fingerprintKeyOf(node: IZWaveNode): string | null {
     const fingerprint = TypeOverrideResolver.fingerprintOf(node);
@@ -896,9 +959,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   }
 
   /** Everything the parameters section draws, or none when the node has left the network. */
-  public nodeParametersPayload(
-    nodeId: number,
-  ): (NodeParametersPayload & { refresh: RefreshStatus }) | undefined {
+  public nodeParametersPayload(nodeId: number): NodeParametersView | undefined {
     const node = this.zwaveController?.nodes.get(nodeId);
     if (!node) {
       return undefined;
@@ -907,10 +968,30 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const payload = buildNodeParametersPayload(node);
     const token = this.parameterRefreshFor(node);
     if (token) {
-      reconcilePending(token, payload);
+      this.observeParameterRefresh(token, payload);
     }
 
-    return { ...payload, refresh: refreshStatus(token, payload) };
+    return {
+      ...payload,
+      identity: this.nodeIdentity(node),
+      refresh: refreshStatus(token, payload),
+    };
+  }
+
+  /**
+   * Narrows what the attempt is still waiting on, and records when it is first seen to have
+   * finished with every value answered.
+   *
+   * The moment is taken where the completion is seen, which is as close to it as anything here
+   * can get: a device answers when it answers, and nothing announces that the last value has
+   * arrived. It is not taken from the request, which a sleeping device can answer hours later.
+   */
+  private observeParameterRefresh(token: RefreshToken, payload: NodeParametersPayload): void {
+    reconcilePending(token, payload);
+
+    if (isComplete(token) && token.completedAt === null) {
+      token.completedAt = Date.now();
+    }
   }
 
   /**
@@ -942,20 +1023,28 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    * A request arriving while an attempt is running is that same attempt: its baselines are not
    * replaced and nothing further is dispatched, because a baseline taken from a timestamp the
    * running refresh has already advanced would wait for a move it will not make again.
+   *
+   * The caller names the device it means to ask, and a caller naming another one is answered
+   * about the device that holds the number now with nothing put on the network for it: the
+   * reader asked for the device they were looking at, and a number can have changed hands since
+   * they looked.
    */
   public requestParameterRefresh(
     nodeId: number,
-  ): (NodeParametersPayload & { refresh: RefreshStatus }) | undefined {
+    expectedIdentity: string,
+  ): NodeParametersView | undefined {
     const node = this.zwaveController?.nodes.get(nodeId);
     if (!node) {
       return undefined;
     }
 
     const payload = buildNodeParametersPayload(node);
+    const identity = this.nodeIdentity(node);
     const fingerprint = this.fingerprintKeyOf(node);
     const existing = this.parameterRefreshFor(node);
+    const meant = expectedIdentity === identity;
 
-    if (canRefresh(payload) && shouldDispatch(existing)) {
+    if (meant && canRefresh(payload) && shouldDispatch(existing)) {
       const baselines = baselinesFor(payload);
       const token: RefreshToken = {
         nodeId,
@@ -964,6 +1053,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
         requestedAt: Date.now(),
         dispatching: true,
         asked: baselines.length,
+        retired: 0,
+        completedAt: null,
         pending: baselines,
       };
       this.parameterRefreshes.set(nodeId, token);
@@ -972,10 +1063,10 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
 
     const token = this.parameterRefreshFor(node);
     if (token) {
-      reconcilePending(token, payload);
+      this.observeParameterRefresh(token, payload);
     }
 
-    return { ...payload, refresh: refreshStatus(token, payload) };
+    return { ...payload, identity, refresh: refreshStatus(token, payload) };
   }
 
   /**
@@ -988,8 +1079,21 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
    */
   private dispatchParameterRefresh(node: IZWaveNode, token: RefreshToken): void {
     const settle = () => {
-      if (this.parameterRefreshes.get(token.nodeId) === token) {
-        token.dispatching = false;
+      if (this.parameterRefreshes.get(token.nodeId) !== token) {
+        return;
+      }
+
+      token.dispatching = false;
+
+      /**
+       * Read here as well as on the next request, so that an attempt that finishes while nobody
+       * is looking is recorded as having finished then. Reading a device that has just left the
+       * network can throw, and this is not inside a request that would answer for it.
+       */
+      try {
+        this.observeParameterRefresh(token, buildNodeParametersPayload(node));
+      } catch (err) {
+        this.log.debug(`Node ${token.nodeId}: configuration values unreadable on settling: ${err}`);
       }
     };
 

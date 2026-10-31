@@ -1541,6 +1541,456 @@
     };
   }
 
+  /** What the Parameters section says where there is nothing to list, one wording per reason. */
+  const PARAMETER_STATES = {
+    interviewing: "Available once the device's interview has finished.",
+    unsupported: 'This device does not expose configuration parameters.',
+    none: 'This device supports configuration, but no parameters are available.',
+  };
+
+  /**
+   * The marks a value can carry, in the order they are shown, each with the sentence that says
+   * what it means and the weight the section gives it.
+   *
+   * Read-only and Not readable are different facts about different directions: one cannot be
+   * changed, the other is never reported. A device can carry either, both, or neither.
+   *
+   * The tone separates what a reader should know from what a reader has to act on. A parameter
+   * that can erase the device's settings, or leave it needing to be excluded and re-included,
+   * is not the same kind of fact as one meant for advanced users, and marks that all looked
+   * alike would leave the two that matter to be found by reading.
+   */
+  const PARAMETER_MARKS = [
+    {
+      label: 'Advanced',
+      tone: 'neutral',
+      explanation: 'This setting is intended for advanced users.',
+      holds: (value) => value.advanced === true,
+    },
+    {
+      label: 'Read-only',
+      tone: 'neutral',
+      explanation: 'This parameter cannot be changed.',
+      holds: (value) => value.writable === false,
+    },
+    {
+      label: 'Not readable',
+      tone: 'neutral',
+      explanation: 'The device does not report a current value for this parameter.',
+      holds: (value) => value.readable === false,
+    },
+    {
+      label: 'Destructive',
+      tone: 'danger',
+      explanation: 'Changing this parameter may reset or erase device settings.',
+      holds: (value) => value.destructive === true,
+    },
+    {
+      label: 'Requires re-inclusion',
+      tone: 'caution',
+      explanation:
+        'Changing this parameter may require excluding and re-including the device.',
+      holds: (value) => value.requiresReInclusion === true,
+    },
+  ];
+
+  /** The one name a value is known by across a payload and the refresh that asked about it. */
+  function parameterValueKey(endpoint, parameter, bitMask) {
+    return `${endpoint}:${parameter}:${bitMask === null || bitMask === undefined ? '' : bitMask}`;
+  }
+
+  /** "30 seconds" where the metadata names a unit, "30" where it does not. */
+  function withParameterUnit(text, unit) {
+    return unit ? `${text} ${unit}` : text;
+  }
+
+  const isNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
+  /** "1 byte", "2 bytes". */
+  function parameterSizeText(valueSize) {
+    if (!isNumber(valueSize)) {
+      return null;
+    }
+
+    return valueSize === 1 ? '1 byte' : `${valueSize} bytes`;
+  }
+
+  /**
+   * A permitted set as the device describes it: single values and ranges, with a range's step
+   * kept rather than flattened into the numbers it would produce, which for a wide range would
+   * be a list no one could read.
+   *
+   * Each entry carries the parameter's unit, as every other number in the section does. A
+   * permitted set is read against the value above it, and numbers stated without the unit that
+   * one carries would be read as a different quantity.
+   */
+  function allowedValuesText(allowed, unit) {
+    if (!Array.isArray(allowed) || allowed.length === 0) {
+      return null;
+    }
+
+    const parts = allowed
+      .map((entry) => {
+        if (entry.kind === 'value') {
+          return withParameterUnit(String(entry.value), unit);
+        }
+        const span = withParameterUnit(`${entry.from} to ${entry.to}`, unit);
+
+        return isNumber(entry.step) && entry.step !== 1 ? `${span} in steps of ${entry.step}` : span;
+      })
+      .filter(Boolean);
+
+    return parts.length > 0 ? parts.join(', ') : null;
+  }
+
+  /** "Oct 30, 2026 at 7:05 AM", or none where there is no moment to name. */
+  function parameterMomentText(at) {
+    const when = isNumber(at) ? new Date(at) : null;
+    if (!when || Number.isNaN(when.getTime())) {
+      return null;
+    }
+
+    const date = when.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric',
+    });
+
+    return `${date} at ${when.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' })}`;
+  }
+
+  /**
+   * When the device last reported a value.
+   *
+   * A value it does not report has no time to show and is not said to be missing one: the mark
+   * already says the device never reports it, and a line about the time beside that would read
+   * as a fault rather than as how the parameter is defined.
+   */
+  function parameterReportedText(value) {
+    if (value.readable === false) {
+      return null;
+    }
+
+    const moment = parameterMomentText(value.reportedAt);
+
+    return moment ? `Last reported ${moment}` : 'Last report time unavailable';
+  }
+
+  /**
+   * What one value is set to.
+   *
+   * Where the metadata names the number, the name is shown and the number is kept beside it: the
+   * name is what the setting means, and the number is what a manual, another controller and the
+   * device itself all speak in.
+   */
+  function parameterValueText(value) {
+    if (!isNumber(value.value)) {
+      return { text: 'Not reported', raw: null };
+    }
+
+    const named = value.states ? lookup(value.states, String(value.value)) : undefined;
+    if (named) {
+      return { text: String(named), raw: String(value.value) };
+    }
+
+    return { text: withParameterUnit(String(value.value), value.unit), raw: null };
+  }
+
+  /** The rows under a value, each one left out where the metadata does not have it. */
+  function parameterDetailRows(value) {
+    const rows = [];
+    const add = (label, text) => {
+      if (text !== null && text !== undefined && text !== '') rows.push({ label, value: text });
+    };
+
+    const range =
+      isNumber(value.min) && isNumber(value.max)
+        ? withParameterUnit(`${value.min} to ${value.max}`, value.unit)
+        : null;
+    const allowed = allowedValuesText(value.allowed, value.unit);
+
+    add('Default', isNumber(value.defaultValue)
+      ? withParameterUnit(String(value.defaultValue), value.unit)
+      : null);
+    add('Recommended', isNumber(value.recommended)
+      ? withParameterUnit(String(value.recommended), value.unit)
+      : null);
+    add('Range', range);
+    /**
+     * The permitted set goes only where it is the range written out a second time, which is what
+     * a device reporting both as the same bounds produces. Two rows saying the identical thing
+     * read as two facts, and a reader comparing them has to check that they agree.
+     *
+     * Compared as the reader would see them, unit and all: a set that steps through the range, or
+     * that names anything the range does not, says something the range does not say and stays.
+     * Nothing is dropped from the payload, which item 16 writes against.
+     */
+    add('Allowed values', allowed === range ? null : allowed);
+    add('Size', parameterSizeText(value.valueSize));
+
+    return rows;
+  }
+
+  /**
+   * One value of a group, as the section draws it.
+   *
+   * Only a partial carries a label. The fields of one parameter are separate settings sharing a
+   * number, and one with no label of its own is named by the bits it occupies, which is the only
+   * thing that tells it apart from its siblings. An ordinary value is the parameter, and its
+   * label belongs to the group: carried here as well it would be written twice, once under the
+   * other.
+   */
+  function describeParameterField(group, value, waiting) {
+    const key = parameterValueKey(group.endpoint, group.parameter, value.bitMask);
+    const partial = value.bitMask !== null && value.bitMask !== undefined;
+    const marks = PARAMETER_MARKS.filter((mark) => mark.holds(value)).map((mark) => ({
+      label: mark.label,
+      tone: mark.tone,
+      explanation: mark.explanation,
+    }));
+
+    return {
+      key,
+      label: partial
+        ? value.label || `Bit mask 0x${value.bitMask.toString(16).toUpperCase()}`
+        : null,
+      description: value.description || null,
+      value: parameterValueText(value),
+      rows: parameterDetailRows(value),
+      marks,
+      reportedAt: parameterReportedText(value),
+      waiting: waiting.has(key),
+      advanced: value.advanced === true,
+    };
+  }
+
+  /**
+   * One parameter number on one endpoint. Its fields are the one value it holds, or the several
+   * a partial parameter divides it into, and both are drawn inside the one group so that a
+   * parameter is never read as several, nor one of its fields as the whole of it.
+   */
+  function describeParameterGroup(group, waiting) {
+    const values = group.values || [];
+    const fields = values.map((value) => describeParameterField(group, value, waiting));
+
+    return {
+      key: `${group.endpoint}:${group.parameter}`,
+      number: `Parameter ${group.parameter}`,
+      parameter: group.parameter,
+      label: group.partial ? null : (values[0] && values[0].label) || null,
+      endpoint: group.endpoint > 0 ? `Endpoint ${group.endpoint}` : null,
+      fields,
+    };
+  }
+
+  /**
+   * Whether a search keeps a group.
+   *
+   * A match anywhere in a group keeps the whole of it, fields included: a field is part of a
+   * parameter, and a group shown with its siblings removed would be a parameter misdescribed.
+   */
+  function parameterGroupMatches(group, text) {
+    const needle = String(text || '').trim().toLowerCase();
+    if (!needle) {
+      return true;
+    }
+    if (String(group.parameter).includes(needle)) {
+      return true;
+    }
+    if ((group.label || '').toLowerCase().includes(needle)) {
+      return true;
+    }
+
+    return group.fields.some(
+      (field) =>
+        (field.label || '').toLowerCase().includes(needle) ||
+        (field.description || '').toLowerCase().includes(needle),
+    );
+  }
+
+  /**
+   * The re-read control and what it says about the attempt.
+   *
+   * What happened is said first and the control follows it. Whether the device has anything a
+   * re-read could confirm decides whether a control is offered at all, and never what the
+   * section says: an attempt that is running, or that ended with its values gone, is a thing
+   * that happened to this device, and a device with nothing left to ask about is exactly the
+   * device that has most to explain.
+   *
+   * While an attempt is running the control is refused rather than removed, so the reader can
+   * see that the thing they asked for is what is happening.
+   */
+  function describeParametersRefresh(payload) {
+    const refresh = (payload && payload.refresh) || {};
+    const sleeping = payload && payload.listening === false;
+    const label = sleeping ? 'Re-read when it wakes' : 'Re-read values';
+    /** A control only where one could do something, which is the one thing capability decides. */
+    const control = (text, disabled) =>
+      refresh.canRequest ? { label: text, disabled: Boolean(disabled) } : null;
+
+    if (refresh.state === 'dispatching') {
+      return {
+        button: control(label, true),
+        status: sleeping
+          ? 'Re-read requested. Values will be confirmed when the device wakes.'
+          : 'Waiting for the device to report current values.',
+      };
+    }
+
+    if (refresh.state === 'incomplete') {
+      /**
+       * A device that is asleep has not failed to answer, it has not been asked yet, and the
+       * control says so rather than offering a retry that would wait on the same sleep.
+       */
+      return {
+        button: control(sleeping ? 'Try re-read when it wakes' : 'Try re-read again'),
+        status: 'Some values have not been reported yet.',
+      };
+    }
+
+    if (refresh.state === 'unavailable') {
+      /**
+       * Nothing is outstanding and nothing can be: what the refresh asked about is not there
+       * any more. Said apart from the values that have yet to answer, because another attempt
+       * can bring those and will never bring these.
+       */
+      return {
+        button: control(label),
+        status: 'Some values could not be confirmed because they are no longer available.',
+      };
+    }
+
+    if (refresh.state === 'complete') {
+      /**
+       * Dated, because what the section is for is how current the values are. A success with no
+       * time on it goes on saying the values were re-read for as long as the plugin holds the
+       * attempt, and a reader coming back days later would read it as having just happened.
+       */
+      const when = parameterMomentText(refresh.completedAt);
+
+      return {
+        button: control(label),
+        status: when ? `Configuration values re-read ${when}.` : 'Configuration values re-read.',
+      };
+    }
+
+    // Nothing has been asked, so the only thing to say is where nothing can be.
+    return refresh.canRequest
+      ? { button: { label, disabled: false }, status: null }
+      : {
+          button: null,
+          status: 'This device does not report any configuration values that can be re-read.',
+        };
+  }
+
+  /**
+   * Why there is nothing listed, which is three different things.
+   *
+   * A search that kept no parameter matched none of them. A search that kept parameters whose
+   * every shown field is advanced did match, and saying it did not would be contradicted by the
+   * control beside it offering to show what it found. With nothing typed, what is hidden is
+   * everything the device reports.
+   */
+  function parametersEmptyText(listed, matched, search) {
+    if (listed > 0) {
+      return null;
+    }
+    if (matched === 0) {
+      return 'No parameters match your search.';
+    }
+
+    return search.trim()
+      ? 'Matching advanced parameters are hidden. Select Show advanced to view them.'
+      : 'All parameters reported by this device are marked advanced.';
+  }
+
+  /**
+   * What the Parameters section draws.
+   *
+   * The search text and the advanced disclosure are the reader's and are passed in rather than
+   * read from the payload, which is replaced underneath them every five seconds while a refresh
+   * is running.
+   *
+   * Advanced parameters are hidden rather than dropped, and a group goes only when every field
+   * it would show is advanced: a parameter that mixes ordinary and advanced fields is still a
+   * parameter the reader is looking for.
+   */
+  function describeParametersSection(state) {
+    const current = state || {};
+
+    if (current.error) {
+      return { kind: 'error', text: current.error };
+    }
+    if (!current.payload) {
+      return { kind: 'loading' };
+    }
+
+    const payload = current.payload;
+    const stateText = lookup(PARAMETER_STATES, payload.state);
+    if (stateText) {
+      return { kind: 'empty', text: stateText };
+    }
+
+    const waiting = new Set(
+      ((payload.refresh && payload.refresh.waiting) || []).map((one) =>
+        parameterValueKey(one.endpoint, one.parameter, one.bitMask),
+      ),
+    );
+    const search = String(current.search || '');
+    const showAdvanced = current.showAdvanced === true;
+    const matched = (payload.groups || [])
+      .map((group) => describeParameterGroup(group, waiting))
+      .filter((group) => parameterGroupMatches(group, search));
+
+    const groups = [];
+    matched.forEach((group) => {
+      const fields = showAdvanced ? group.fields : group.fields.filter((field) => !field.advanced);
+      if (fields.length > 0) {
+        groups.push(Object.assign({}, group, { fields }));
+      }
+    });
+
+    /**
+     * Counted across what the search kept rather than across what is on screen, so pressing the
+     * control does not change the number written on it.
+     */
+    const advancedCount = matched.reduce(
+      (total, group) => total + group.fields.filter((field) => field.advanced).length,
+      0,
+    );
+    const total = (payload.groups || []).length;
+
+    return {
+      kind: 'parameters',
+      search: {
+        value: search,
+        placeholder: 'Search by name or number',
+        count: groups.length === total ? null : `Showing ${groups.length} of ${total} parameters`,
+      },
+      advanced:
+        advancedCount > 0
+          ? {
+              label: `${showAdvanced ? 'Hide' : 'Show'} advanced (${advancedCount})`,
+              expanded: showAdvanced,
+            }
+          : null,
+      refresh: describeParametersRefresh(payload),
+      groups,
+      empty: parametersEmptyText(groups.length, matched.length, search),
+    };
+  }
+
+  /** The number beside the tab's name, or none where the device has no parameters to count. */
+  function parametersTabCount(payload) {
+    return payload && payload.state === 'parameters' ? (payload.groups || []).length : null;
+  }
+
+  /** Whether the page has reason to keep re-reading: an attempt is running and nothing else. */
+  function parametersRefreshRunning(payload) {
+    return Boolean(payload && payload.refresh && payload.refresh.state === 'dispatching');
+  }
+
+
   return {
     SECURITY_KEY_FIELDS,
     normalizeSecurityKey,
@@ -1580,5 +2030,12 @@
     TYPE_NAMES,
     typeName,
     listNodeNumbers,
+    describeParametersSection,
+    describeParametersRefresh,
+    describeParameterGroup,
+    parameterGroupMatches,
+    parameterValueKey,
+    parametersTabCount,
+    parametersRefreshRunning,
   };
 });

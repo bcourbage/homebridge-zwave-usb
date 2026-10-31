@@ -2731,6 +2731,18 @@ describe('ZWaveUsbPlatform', () => {
       };
     };
 
+    /**
+     * A re-read as the page makes it, naming the device that holds the number. The route
+     * requires that name, so a test that left it out would be testing the refusal.
+     */
+    const askRefresh = (platform: any, nodeId = 10) => {
+      const node = platform.zwaveController.nodes.get(nodeId);
+
+      return driveRoute(platform, `/nodes/${nodeId}/parameters/refresh`, 'POST', {
+        identity: node ? platform.nodeIdentity(node) : 'a device that is not in the network',
+      });
+    };
+
     it('reads the parameters without asking the device anything', async () => {
       const { node } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
@@ -2749,7 +2761,7 @@ describe('ZWaveUsbPlatform', () => {
       const platform = newPlatform(new Map([[10, node]]));
 
       await driveRoute(platform, '/nodes/10/parameters', 'GET');
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
 
       expect(node.setValue).not.toHaveBeenCalled();
     });
@@ -2759,7 +2771,7 @@ describe('ZWaveUsbPlatform', () => {
 
       expect((await driveRoute(platform, '/nodes/99/parameters', 'GET')).status).toBe(404);
       expect(
-        (await driveRoute(platform, '/nodes/99/parameters/refresh', 'POST', {})).status,
+        (await askRefresh(platform, 99)).status,
       ).toBe(404);
     });
 
@@ -2771,18 +2783,22 @@ describe('ZWaveUsbPlatform', () => {
       const { node } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const { body } = await askRefresh(platform);
 
       expect(node.refreshCCValues).toHaveBeenCalledWith(CommandClasses.Configuration);
-      expect(body.refresh).toMatchObject({ state: 'dispatching', asked: 1, pending: 1 });
+      expect(body.refresh).toMatchObject({
+        state: 'dispatching',
+        asked: 1,
+        waiting: [{ endpoint: 0, parameter: 1, bitMask: null }],
+      });
     });
 
     it('treats a request made while one is running as that same request', async () => {
       const { node, dispatches } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      const first = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
-      const second = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const first = await askRefresh(platform);
+      const second = await askRefresh(platform);
 
       expect(dispatches).toHaveLength(1);
       expect(second.body.refresh.requestedAt).toBe(first.body.refresh.requestedAt);
@@ -2797,34 +2813,34 @@ describe('ZWaveUsbPlatform', () => {
       const { node, settleAttempt } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       await settleAttempt();
 
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
 
-      expect(body.refresh).toMatchObject({ state: 'incomplete', pending: 1 });
+      expect(body.refresh).toMatchObject({ state: 'incomplete', waiting: [expect.anything()] });
     });
 
     it('reports completion when the device answers', async () => {
       const { node, settleAttempt, answer } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       answer(2_000);
       await settleAttempt();
 
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
 
-      expect(body.refresh).toMatchObject({ state: 'complete', pending: 0 });
+      expect(body.refresh).toMatchObject({ state: 'complete', waiting: [] });
     });
 
     it('lets an attempt that fell short be tried again, and that one dispatches', async () => {
       const { node, dispatches, settleAttempt } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       await settleAttempt();
-      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const { body } = await askRefresh(platform);
 
       expect(dispatches).toHaveLength(2);
       expect(body.refresh.state).toBe('dispatching');
@@ -2834,7 +2850,7 @@ describe('ZWaveUsbPlatform', () => {
       const { node, dispatches } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
 
       expect(dispatches).toHaveLength(1);
@@ -2846,7 +2862,7 @@ describe('ZWaveUsbPlatform', () => {
       const { node } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       node.productId = 0x99;
 
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
@@ -2863,7 +2879,7 @@ describe('ZWaveUsbPlatform', () => {
       const first = paramNode();
       const platform = newPlatform(new Map([[10, first.node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       expect(first.dispatches).toHaveLength(1);
 
       const second = paramNode();
@@ -2872,7 +2888,7 @@ describe('ZWaveUsbPlatform', () => {
       const read = await driveRoute(platform, '/nodes/10/parameters', 'GET');
       expect(read.body.refresh.state).toBe('idle');
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       expect(second.dispatches).toHaveLength(1);
     });
 
@@ -2882,12 +2898,12 @@ describe('ZWaveUsbPlatform', () => {
       const first = paramNode(unknown);
       const platform = newPlatform(new Map([[10, first.node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
 
       const second = paramNode(unknown);
       platform.zwaveController.nodes = new Map([[10, second.node]]);
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
 
       expect(second.dispatches).toHaveLength(1);
     });
@@ -2896,7 +2912,7 @@ describe('ZWaveUsbPlatform', () => {
       const { node } = paramNode();
       const platform = newPlatform(new Map([[10, node]]));
 
-      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await askRefresh(platform);
       expect(platform.parameterRefreshes.has(10)).toBe(true);
 
       platform.handleNodeRemoved(node);
@@ -2910,10 +2926,241 @@ describe('ZWaveUsbPlatform', () => {
       });
       const platform = newPlatform(new Map([[10, node]]));
 
-      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const { body } = await askRefresh(platform);
 
       expect(node.refreshCCValues).not.toHaveBeenCalled();
       expect(body.refresh).toMatchObject({ state: 'idle', canRequest: false });
+    });
+
+    it('does not call a re-read successful when the values it asked about went', async () => {
+      /**
+       * A value that is no longer there did not answer. Reading the empty waiting list as a
+       * success would tell a reader the device had just confirmed settings it no longer has.
+       */
+      const ids = [
+        { commandClass: CommandClasses.Configuration, endpoint: 0, property: 1 },
+        { commandClass: CommandClasses.Configuration, endpoint: 0, property: 2 },
+      ];
+      const { node, settleAttempt, answer } = paramNode({ getDefinedValueIDs: () => ids });
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await askRefresh(platform);
+      answer(2_000);
+      ids.splice(1, 1);
+      await settleAttempt();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({
+        state: 'unavailable',
+        waiting: [],
+        asked: 2,
+        completedAt: null,
+      });
+    });
+
+    it('does not call a re-read successful when a value stopped being readable', async () => {
+      const ids = [
+        { commandClass: CommandClasses.Configuration, endpoint: 0, property: 1 },
+        { commandClass: CommandClasses.Configuration, endpoint: 0, property: 2 },
+      ];
+      let readable = true;
+      const { node, settleAttempt, answer } = paramNode({
+        getDefinedValueIDs: () => ids,
+        getValueMetadata: (valueId: { property: unknown }) => ({
+          type: 'number',
+          readable: valueId.property === 2 ? readable : true,
+          writeable: true,
+          label: 'Hold',
+        }),
+      });
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await askRefresh(platform);
+      answer(2_000);
+      readable = false;
+      await settleAttempt();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'unavailable', completedAt: null });
+    });
+
+    it('refuses a re-read that does not name the device it is for', async () => {
+      /**
+       * A re-read puts commands on the network. A caller that does not say which device it
+       * means cannot be answered about whichever device holds the number now, and a name that
+       * is not a name is not one.
+       */
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const missing = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const notAName = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {
+        identity: 7,
+      });
+      const empty = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {
+        identity: '',
+      });
+
+      expect([missing.status, notAName.status, empty.status]).toEqual([400, 400, 400]);
+      expect(node.refreshCCValues).not.toHaveBeenCalled();
+    });
+
+    it('does not ask a device the page did not mean to ask', async () => {
+      /**
+       * A re-read puts commands on the network. A node number can change hands between the list
+       * the page read and the request it made from it, and the reader asked for the device they
+       * were looking at.
+       */
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {
+        identity: 'the-device-that-had-the-number',
+      });
+
+      expect(node.refreshCCValues).not.toHaveBeenCalled();
+      expect(body.refresh.state).toBe('idle');
+      expect(body.identity).not.toBe('the-device-that-had-the-number');
+    });
+
+    it('asks when the page named the device that holds the number now', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+      const read = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {
+        identity: read.body.identity,
+      });
+
+      expect(node.refreshCCValues).toHaveBeenCalledWith(CommandClasses.Configuration);
+      expect(body.refresh.state).toBe('dispatching');
+    });
+
+    it('names the node a payload was built from, the same name the list gives it', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const listed = await driveRoute(platform, '/nodes', 'GET');
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(typeof body.identity).toBe('string');
+      expect(body.identity).toBe(listed.body[0].identity);
+    });
+
+    it('keeps that name for as long as the node holds the number', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const first = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+      const second = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(second.body.identity).toBe(first.body.identity);
+    });
+
+    it('names a replacement differently, though the number never went missing', async () => {
+      /**
+       * Nothing announces that a node was replaced: the number is the same, the hardware can be
+       * the same, and a page that never saw the number absent would go on drawing what it read
+       * for the device that had it before.
+       */
+      const platform = newPlatform(new Map([[10, paramNode().node]]));
+      const before = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      platform.zwaveController.nodes = new Map([[10, paramNode().node]]);
+      const after = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(after.body.nodeId).toBe(10);
+      expect(after.body.identity).not.toBe(before.body.identity);
+    });
+
+    it('names a replacement differently where neither reports any hardware', async () => {
+      // Two unknown devices are not one device, and the fingerprint cannot tell them apart.
+      const unknown = { manufacturerId: undefined, productType: undefined, productId: undefined };
+      const platform = newPlatform(new Map([[10, paramNode(unknown).node]]));
+      const before = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      platform.zwaveController.nodes = new Map([[10, paramNode(unknown).node]]);
+      const after = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(after.body.identity).not.toBe(before.body.identity);
+    });
+
+    it('records the completion where it happened, not where it was next read', async () => {
+      /**
+       * A page that was closed while the device answered must not have its reopening dated as
+       * the moment the values were confirmed, and the request is no better a stand-in: a
+       * sleeping device can answer hours after it was asked.
+       */
+      const { node, settleAttempt, answer } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+      const clock = jest.spyOn(Date, 'now');
+
+      clock.mockReturnValue(1_000);
+      await askRefresh(platform);
+      answer(2_000);
+      clock.mockReturnValue(5_000);
+      await settleAttempt();
+      clock.mockReturnValue(9_000);
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({
+        state: 'complete',
+        requestedAt: 1_000,
+        completedAt: 5_000,
+      });
+    });
+
+    it('dates no completion while the attempt is still running', async () => {
+      // A value can answer before the attempt stops, and what finishes is the attempt.
+      const { node, settleAttempt, answer } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+      const clock = jest.spyOn(Date, 'now');
+
+      clock.mockReturnValue(1_000);
+      await askRefresh(platform);
+      answer(2_000);
+      clock.mockReturnValue(3_000);
+      const mid = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(mid.body.refresh).toMatchObject({ state: 'dispatching', completedAt: null });
+
+      clock.mockReturnValue(6_000);
+      await settleAttempt();
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'complete', completedAt: 6_000 });
+    });
+
+    it('dates a completion that only a later reading could see', async () => {
+      // A value the device reports of its own accord answers the question the refresh asked.
+      const { node, settleAttempt, answer } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+      const clock = jest.spyOn(Date, 'now');
+
+      clock.mockReturnValue(1_000);
+      await askRefresh(platform);
+      await settleAttempt();
+      answer(3_000);
+      clock.mockReturnValue(8_000);
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'complete', completedAt: 8_000 });
+    });
+
+    it('records no completion for an attempt that finished with values unanswered', async () => {
+      const { node, settleAttempt } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await askRefresh(platform);
+      await settleAttempt();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'incomplete', completedAt: null });
     });
 
     it('refuses a type saved for the controller, however the request arrives', async () => {

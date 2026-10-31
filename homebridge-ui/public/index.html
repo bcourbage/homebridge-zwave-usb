@@ -175,6 +175,47 @@
       .type-row-label { margin-bottom: 2px; }
     }
     .node-section:focus { outline: none; }
+    /*
+     * The controls wrap rather than compress: at the width the plugin's page is given, a search
+     * field and two buttons on one line would leave the field too narrow to read what is in it.
+     */
+    .parameters-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .parameters-controls .parameters-search { flex: 1 1 200px; min-width: 0; }
+    .parameter-group { padding: 10px 0; border-top: 1px solid rgba(127, 127, 127, 0.25); }
+    .parameter-group:first-child { border-top: none; }
+    .parameter-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+    .parameter-field { margin-top: 8px; }
+    .parameter-group .parameter-field:first-of-type { margin-top: 4px; }
+    .parameter-field-divided { padding-left: 12px; border-left: 2px solid rgba(127, 127, 127, 0.25); }
+    /* Long labels and descriptions wrap; nothing here may widen the page. */
+    .parameter-group, .parameter-field { overflow-wrap: break-word; min-width: 0; }
+    .parameter-value { font-weight: 600; }
+    .parameter-raw { font-weight: 400; opacity: 0.75; margin-left: 6px; }
+    .parameter-rows { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 2px; }
+    .parameter-marks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    /*
+     * Mark colors, measured against the card each theme puts this page on: #fff under the
+     * light themes and #2b2b2b under the dark ones. The two a reader has to act on carry their
+     * own color, and the rest stay in the muted text color, so a parameter that can erase the
+     * device's settings or leave it needing re-inclusion is seen rather than read for.
+     *
+     * The chip is drawn in its own color rather than filled, so the label sits on the card and
+     * one measurement holds for every mark. A neutral mark takes the chip's own color, which is
+     * why only the two that depart from it have a rule of their own. Light 4.69:1, 6.80:1,
+     * 7.36:1. Dark 6.82:1, 6.57:1, 5.60:1. Re-measure if the host changes the card background.
+     */
+    .parameter-mark {
+      font-weight: 500;
+      background-color: transparent;
+      border: 1px solid currentColor;
+      /* This page forces white text on every badge, which a chip that is not filled is not. */
+      color: #6c757d !important;
+    }
+    .parameter-mark-caution { color: #8a4b00 !important; }
+    .parameter-mark-danger { color: #a71d2a !important; }
+    body.dark-mode #maintenance .parameter-mark { color: #adb5bd !important; }
+    body.dark-mode #maintenance .parameter-mark-caution { color: #e8a33d !important; }
+    body.dark-mode #maintenance .parameter-mark-danger { color: #ea868f !important; }
     .node-detail-actions .ico { margin-right: 5px; vertical-align: -2px; }
 
     /* The gap the paired buttons in this page's dialogs already sit at. */
@@ -391,6 +432,12 @@
                 aria-controls="nodeSectionType" aria-selected="true" tabindex="0">Device type</a>
             </li>
             <li class="nav-item" role="presentation">
+              <a class="nav-link" href="#nodeSectionParameters" id="nodeSectionParametersTab"
+                role="tab" aria-controls="nodeSectionParameters" aria-selected="false"
+                tabindex="-1">Parameters<span class="badge badge-light type-chip"
+                  id="parametersTabCount" style="display: none;"></span></a>
+            </li>
+            <li class="nav-item" role="presentation">
               <a class="nav-link" href="#nodeSectionDiagnostics" id="nodeSectionDiagnosticsTab"
                 role="tab" aria-controls="nodeSectionDiagnostics" aria-selected="false"
                 tabindex="-1">Diagnostics</a>
@@ -401,6 +448,26 @@
             <div id="typePanelRows"></div>
             <div id="typeFormHost"></div>
           </div>
+          <!--
+            The controls are written once and kept, so a payload arriving while the reader is
+            typing cannot take the search text, the caret or the keyboard away from them. Only
+            the list below is redrawn.
+          -->
+          <div class="node-section mt-3" id="nodeSectionParameters" role="tabpanel"
+            aria-labelledby="nodeSectionParametersTab" style="display: none;">
+            <div class="parameters-controls" id="parametersControls">
+              <input type="search" class="form-control form-control-sm parameters-search"
+                id="parameterSearch" placeholder="Search by name or number"
+                aria-label="Search by name or number" autocomplete="off">
+              <button type="button" class="btn btn-sm btn-outline-secondary" id="parametersAdvanced"
+                aria-expanded="false" aria-controls="parametersList" style="display: none;"></button>
+              <button type="button" class="btn btn-sm btn-outline-primary" id="parametersReread"
+                style="display: none;"></button>
+            </div>
+            <div class="small text-muted mt-2" id="parametersStatus"></div>
+            <div class="small text-muted" id="parametersCount"></div>
+            <div id="parametersList" class="mt-2"></div>
+          </div>
           <div class="node-section mt-3" id="nodeSectionDiagnostics" role="tabpanel"
             aria-labelledby="nodeSectionDiagnosticsTab" style="display: none;"></div>
           <!--
@@ -409,6 +476,7 @@
             announce a sentence that had not changed.
           -->
           <div id="typeAnnounce" class="sr-only" role="status" aria-live="polite"></div>
+          <div id="parametersAnnounce" class="sr-only" role="status" aria-live="polite"></div>
         </div>
       </div>
     </div>
@@ -837,10 +905,24 @@
         renderNodeDetail();
         typePanelDrawn = null;
         typeFormDrawn = null;
+        parametersDrawn = null;
         clearTypeAnnounce();
+        clearParametersAnnounce();
         typeDrafts.delete(String(nodeId));
+        /**
+         * The filter and the disclosure belong to the reading, not to the device, so another
+         * node's page starts with neither. The field is cleared along with them: it is written
+         * once and kept, so what was typed on the last node would still be in it.
+         */
+        parametersSearch = '';
+        parametersShowAdvanced = false;
+        document.getElementById('parameterSearch').value = '';
         selectNodeSection('type');
         renderDiagnosticsSection();
+        // Read here rather than on entering the section, so the tab carries its count before a
+        // reader has any reason to open it. The read sends no command to the device.
+        renderParametersTab();
+        loadParametersSection();
         /**
          * The control that was clicked is inside the list that has just been put away, so the
          * keyboard would be left on the document body. The back link takes it: it is the first
@@ -878,6 +960,7 @@
       /** The sections a node's page carries, in the order the strip draws them. */
       const NODE_SECTIONS = [
         { name: 'type', tab: 'nodeSectionTypeTab', panel: 'nodeSectionType' },
+        { name: 'parameters', tab: 'nodeSectionParametersTab', panel: 'nodeSectionParameters' },
         { name: 'diagnostics', tab: 'nodeSectionDiagnosticsTab', panel: 'nodeSectionDiagnostics' },
       ];
 
@@ -919,7 +1002,9 @@
           diagnosticsDrawn = null;
           typePanelDrawn = null;
           typeFormDrawn = null;
+          parametersDrawn = null;
           clearTypeAnnounce();
+          clearParametersAnnounce();
         }
       };
 
@@ -952,6 +1037,9 @@
         if (name === 'type') {
           loadTypeSection();
         }
+        if (name === 'parameters') {
+          loadParametersSection();
+        }
       };
 
       /**
@@ -980,8 +1068,16 @@
       const PANEL_FOCUSABLE =
         'a[href], button:not([disabled]), select:not([disabled]), input:not([disabled]), textarea:not([disabled])';
 
+      /**
+       * A control that is not displayed cannot take the keyboard, so it cannot stand in for the
+       * panel either: the Parameters section puts its controls away in the states that list
+       * nothing, and a panel left unfocusable by them would be a section a reader tabbing out
+       * of the strip went straight past.
+       */
+      const isDisplayed = (element) => Boolean(element && element.offsetParent !== null);
+
       const settlePanelFocus = (panel) => {
-        panel.tabIndex = panel.querySelector(PANEL_FOCUSABLE) ? -1 : 0;
+        panel.tabIndex = [...panel.querySelectorAll(PANEL_FOCUSABLE)].some(isDisplayed) ? -1 : 0;
       };
 
       const coveringControlsHtml = (nodeId, controls) => {
@@ -1482,6 +1578,324 @@
       };
 
       /**
+       * What the Parameters section knows about each node: the payload it read, or the failure
+       * instead, and whether a read is running. The payload is read from the plugin's cache and
+       * sends no Z-Wave command, so it is also read when the page opens, to count the tab.
+       */
+      const parametersState = new Map();
+
+      /** The name the plugin gives the device holding this number, while it lists one. */
+      const nodeIdentityOf = (nodeId) => {
+        const node = lastNodes.find((n) => String(n.nodeId) === String(nodeId));
+
+        return node ? node.identity : undefined;
+      };
+
+      /**
+       * What the section knows about this node, emptied where the number has changed hands.
+       *
+       * Z-Wave gives a node number away again. A payload read for the device that had the number
+       * before describes that device, and drawing it under the name of the one that has it now
+       * would report another device's settings as this device's. The plugin names every node it
+       * lists, and an entry whose name is not the one the list now gives is replaced rather than
+       * read, so the section fills again from the device that is there.
+       *
+       * A list that says nothing about the number says nothing about a change either, so the
+       * entry stands: a node that has left the network is emptied by the refresh instead.
+       */
+      const parametersFor = (nodeId) => {
+        const key = String(nodeId);
+        const identity = nodeIdentityOf(nodeId);
+        const held = parametersState.get(key);
+
+        if (held && (identity === undefined || held.identity === identity)) {
+          return held;
+        }
+
+        const fresh = { identity };
+        parametersState.set(key, fresh);
+
+        return fresh;
+      };
+
+      /**
+       * What the reader has typed and whether they have asked for the advanced parameters.
+       *
+       * Held here rather than taken from the payload, which is replaced underneath them every
+       * five seconds while a re-read is running. A filter that a refresh could clear would drop
+       * a reader out of what they were reading without their having touched anything.
+       */
+      let parametersSearch = '';
+      let parametersShowAdvanced = false;
+
+      /** Set between asking for a re-read and the answer, which refuses the control meanwhile. */
+      let parametersAsking = false;
+
+      /** What the list is showing, so a re-read that changes nothing leaves it alone. */
+      let parametersDrawn = null;
+
+      /**
+       * The sentence the Parameters live region last said, or null before the section's first
+       * draw for a node. The first is remembered rather than said: it is already on screen, and
+       * only a sentence that changes under the reader is news.
+       */
+      let parametersStatusSaid = null;
+
+      const clearParametersAnnounce = () => {
+        const region = document.getElementById('parametersAnnounce');
+        if (region) region.textContent = '';
+        parametersStatusSaid = null;
+      };
+
+      /**
+       * The marks a value carries, and under them what each one means. The explanation is
+       * written out rather than hidden behind the mark, because a badge carrying its meaning
+       * only in a tooltip says nothing to a reader who cannot hover.
+       */
+      const parameterMarksHtml = (marks) =>
+        marks.length === 0
+          ? ''
+          : `<div class="parameter-marks">${marks
+              .map(
+                (mark) =>
+                  `<span class="badge parameter-mark parameter-mark-${uiHelpers.escapeHtml(
+                    mark.tone,
+                  )}">${uiHelpers.escapeHtml(mark.label)}</span>`,
+              )
+              .join('')}</div>
+             <div class="small text-muted">${marks
+               .map((mark) => uiHelpers.escapeHtml(mark.explanation))
+               .join(' ')}</div>`;
+
+      const parameterFieldHtml = (field, divided) => `
+        <div class="parameter-field${divided ? ' parameter-field-divided' : ''}">
+          ${
+            field.label
+              ? `<div class="small font-weight-bold">${uiHelpers.escapeHtml(field.label)}</div>`
+              : ''
+          }
+          <div><span class="parameter-value">${uiHelpers.escapeHtml(field.value.text)}</span>${
+            field.value.raw
+              ? `<span class="parameter-raw">(${uiHelpers.escapeHtml(field.value.raw)})</span>`
+              : ''
+          }</div>
+          ${
+            field.description
+              ? `<div class="small text-muted">${uiHelpers.escapeHtml(field.description)}</div>`
+              : ''
+          }
+          ${
+            field.rows.length > 0
+              ? `<div class="parameter-rows small text-muted">${field.rows
+                  .map(
+                    (row) =>
+                      `<span>${uiHelpers.escapeHtml(row.label)}: ${uiHelpers.escapeHtml(
+                        row.value,
+                      )}</span>`,
+                  )
+                  .join('')}</div>`
+              : ''
+          }
+          ${parameterMarksHtml(field.marks)}
+          ${
+            field.reportedAt
+              ? `<div class="small text-muted">${uiHelpers.escapeHtml(field.reportedAt)}</div>`
+              : ''
+          }
+          ${
+            field.waiting
+              ? '<div class="small text-muted">Waiting for the device to report this value.</div>'
+              : ''
+          }
+        </div>`;
+
+      /**
+       * One parameter, with its fields inside it. A parameter divided into fields draws each one
+       * set in from the number they share, so a reader can see that they are parts of one
+       * setting rather than settings of their own.
+       */
+      const parameterGroupHtml = (group) => `
+        <div class="parameter-group">
+          <div class="parameter-head">
+            <span class="font-weight-bold">${uiHelpers.escapeHtml(group.number)}</span>
+            ${group.label ? `<span>${uiHelpers.escapeHtml(group.label)}</span>` : ''}
+            ${
+              group.endpoint
+                ? `<span class="badge parameter-mark">${uiHelpers.escapeHtml(
+                    group.endpoint,
+                  )}</span>`
+                : ''
+            }
+          </div>
+          ${group.fields
+            .map((field) => parameterFieldHtml(field, group.fields.length > 1))
+            .join('')}
+        </div>`;
+
+      const renderParametersSection = () => {
+        const panel = document.getElementById('nodeSectionParameters');
+        const list = document.getElementById('parametersList');
+        if (!panel || !list || detailNodeId === null || detailGone) return;
+
+        const view = uiHelpers.describeParametersSection(
+          Object.assign(
+            { search: parametersSearch, showAdvanced: parametersShowAdvanced },
+            parametersFor(detailNodeId),
+          ),
+        );
+        const listed = view.kind === 'parameters';
+        const advanced = document.getElementById('parametersAdvanced');
+        const reread = document.getElementById('parametersReread');
+
+        /**
+         * The controls are written to rather than rewritten. The search field is the reader's:
+         * replacing it would take what they had typed, and the caret with it.
+         */
+        document.getElementById('parametersControls').style.display = listed ? '' : 'none';
+        advanced.style.display = listed && view.advanced ? '' : 'none';
+        reread.style.display = listed && view.refresh.button ? '' : 'none';
+
+        if (listed && view.advanced) {
+          advanced.textContent = view.advanced.label;
+          advanced.setAttribute('aria-expanded', view.advanced.expanded ? 'true' : 'false');
+        }
+        if (listed && view.refresh.button) {
+          reread.textContent = view.refresh.button.label;
+          reread.disabled = view.refresh.button.disabled || parametersAsking;
+        }
+
+        const status = listed ? view.refresh.status || '' : '';
+        document.getElementById('parametersStatus').textContent = status;
+        document.getElementById('parametersCount').textContent = listed
+          ? view.search.count || ''
+          : '';
+
+        const signature = `${detailNodeId}:${JSON.stringify(view)}`;
+        if (signature !== parametersDrawn) {
+          parametersDrawn = signature;
+
+          if (view.kind === 'loading') {
+            list.innerHTML = '<p class="small text-muted">Loading configuration parameters...</p>';
+          } else if (view.kind === 'error') {
+            list.innerHTML = `<p class="small text-danger">${uiHelpers.escapeHtml(view.text)}</p>`;
+          } else if (view.kind === 'empty') {
+            list.innerHTML = `<p class="small text-muted">${uiHelpers.escapeHtml(view.text)}</p>`;
+          } else if (view.empty) {
+            list.innerHTML = `<p class="small text-muted">${uiHelpers.escapeHtml(view.empty)}</p>`;
+          } else {
+            list.innerHTML = view.groups.map(parameterGroupHtml).join('');
+          }
+        }
+
+        if (parametersStatusSaid === null) {
+          parametersStatusSaid = status;
+        } else if (status !== parametersStatusSaid) {
+          document.getElementById('parametersAnnounce').textContent = status;
+          parametersStatusSaid = status;
+        }
+
+        settlePanelFocus(panel);
+      };
+
+      /** The count beside the tab's name, which a device with no parameters does not carry. */
+      const renderParametersTab = () => {
+        const badge = document.getElementById('parametersTabCount');
+        if (!badge || detailNodeId === null) return;
+
+        const count = uiHelpers.parametersTabCount(parametersFor(detailNodeId).payload);
+
+        badge.style.display = count === null ? 'none' : '';
+        badge.textContent = count === null ? '' : String(count);
+      };
+
+      /**
+       * Whether an answer is about the device that was asked, and about the one the page holds
+       * the number for now.
+       *
+       * The list is read every five seconds and a payload is read on demand, so the plugin can
+       * answer for the device that has the number now while the page still has the one that had
+       * it when it asked. An answer that is not about the device in hand is dropped rather than
+       * drawn under its name, and the section is read again once the list has caught up.
+       *
+       * An entry the list has not named yet has nothing to be measured against, so it takes the
+       * name the answer carries rather than refusing every answer until the list arrives.
+       */
+      const parametersAnswerFits = (nodeId, asked, payload) => {
+        if (!payload || parametersFor(nodeId) !== asked) {
+          return false;
+        }
+
+        return asked.identity === undefined || payload.identity === asked.identity;
+      };
+
+      /**
+       * Reads what the plugin already holds. It sends no command to the device, which is why it
+       * can be read when the page opens, to count the tab, and again on the refresh cadence
+       * while a re-read is running.
+       */
+      const loadParametersSection = async () => {
+        if (detailNodeId === null) return;
+
+        const nodeId = detailNodeId;
+        const state = parametersFor(nodeId);
+
+        if (state.loading) return;
+
+        state.loading = true;
+        renderParametersSection();
+
+        try {
+          const payload = await window.homebridge.request('get-node-parameters', nodeId);
+          if (!parametersAnswerFits(nodeId, state, payload)) return;
+
+          state.identity = payload.identity;
+          state.payload = payload;
+          state.error = null;
+        } catch (err) {
+          state.error = err.message;
+        } finally {
+          state.loading = false;
+          renderParametersSection();
+          renderParametersTab();
+        }
+      };
+
+      /**
+       * Asks the device for its current values. The plugin answers with the request it is
+       * already running where there is one, so pressing this twice asks once.
+       *
+       * The request names the device the reader is looking at. A re-read puts commands on the
+       * network, and the number may have been given to another device since the list was read.
+       */
+      const requestParametersRefresh = async () => {
+        if (detailNodeId === null || parametersAsking) return;
+
+        const nodeId = detailNodeId;
+        const state = parametersFor(nodeId);
+
+        parametersAsking = true;
+        renderParametersSection();
+
+        try {
+          const payload = await window.homebridge.request('refresh-node-parameters', {
+            nodeId,
+            identity: state.identity,
+          });
+          if (!parametersAnswerFits(nodeId, state, payload)) return;
+
+          state.identity = payload.identity;
+          state.payload = payload;
+          state.error = null;
+        } catch (err) {
+          state.error = err.message;
+        } finally {
+          parametersAsking = false;
+          renderParametersSection();
+          renderParametersTab();
+        }
+      };
+
+      /**
        * A refresh that failed, said on the node's own page. The list can give its rows over to
        * the message, but the page is showing one node and has nothing to give, so it keeps what
        * it has and says above it that this is no longer current.
@@ -1526,6 +1940,9 @@
           typeGenerations.forEach((generation, key) => {
             if (!present.has(key)) typeGenerations.delete(key);
           });
+          parametersState.forEach((state, key) => {
+            if (!present.has(key)) parametersState.delete(key);
+          });
           nodes.forEach((node) => {
             if (node.firmwareProgress) firmwareRecords.delete(String(node.nodeId));
           });
@@ -1546,6 +1963,22 @@
            */
           if (detailNodeId !== null && !detailGone && nodeSection === 'type') {
             loadTypeSection();
+          }
+
+          /**
+           * The parameters payload is read again while a re-read is running, which is the one
+           * time it changes without anyone asking, and where the open section has nothing to
+           * draw, which is what a node number changing hands leaves behind. Settling ends the
+           * reason to keep looking: it says the attempt finished, never that a value answered,
+           * and what answered is read from the timestamps in the payload it ends on.
+           */
+          if (detailNodeId !== null && !detailGone && nodeSection === 'parameters') {
+            const state = parametersFor(detailNodeId);
+            const unread = state.payload === undefined && state.error === undefined;
+
+            if (unread || uiHelpers.parametersRefreshRunning(state.payload)) {
+              loadParametersSection();
+            }
           }
         } catch (err) {
           const tbody = document.getElementById('nodeTableBody');
@@ -1914,6 +2347,31 @@
        * It is also not bumped when the reader leaves the node, so a move started here is still
        * reported on their return rather than quietly dropped.
        */
+      /**
+       * Delegated on the panel, which outlives every redraw of what is inside it, and bound at
+       * page load rather than when a node is opened, so opening one twice does not leave two
+       * listeners answering one press.
+       */
+      document.getElementById('nodeSectionParameters').addEventListener('input', (e) => {
+        if (e.target.id !== 'parameterSearch') return;
+
+        parametersSearch = e.target.value;
+        renderParametersSection();
+      });
+
+      document.getElementById('nodeSectionParameters').addEventListener('click', (e) => {
+        const target = e.target.closest('button');
+        if (!target) return;
+
+        if (target.id === 'parametersAdvanced') {
+          parametersShowAdvanced = !parametersShowAdvanced;
+          renderParametersSection();
+        }
+        if (target.id === 'parametersReread') {
+          requestParametersRefresh();
+        }
+      });
+
       document.getElementById('nodeSectionDiagnostics').addEventListener('click', async (e) => {
         const button = e.target.closest('.section-test-position, .section-stop-covering');
         if (!button) return;

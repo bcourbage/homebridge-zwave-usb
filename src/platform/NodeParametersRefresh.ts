@@ -21,6 +21,22 @@ export interface RefreshToken {
   /** How many values it asked about, which does not change as they answer. */
   asked: number;
   /**
+   * How many it will never hear about, because they went or stopped being readable.
+   *
+   * Counted apart from the ones that answered. Both leave the waiting list, and a list that is
+   * empty because every value went is not a refresh that confirmed anything: reading the two as
+   * one would report a device that has lost its parameters as a device that has just been read.
+   */
+  retired: number;
+  /**
+   * When every value it asked about had answered, or null while any is still outstanding.
+   *
+   * Stamped where the completion is seen rather than taken from `requestedAt`: a sleeping device
+   * can answer hours after it was asked, and a reader told the time of the request would read it
+   * as the time the values were confirmed.
+   */
+  completedAt: number | null;
+  /**
    * The ones that have not answered, which only ever shrinks.
    *
    * Recomputing this from the original list each time would let a value that has answered, or
@@ -30,15 +46,30 @@ export interface RefreshToken {
   pending: RefreshBaseline[];
 }
 
-export type RefreshState = 'idle' | 'dispatching' | 'incomplete' | 'complete';
+export type RefreshState = 'idle' | 'dispatching' | 'incomplete' | 'unavailable' | 'complete';
+
+/** One value a refresh is still waiting on, named so the section can mark that value itself. */
+export interface WaitingValue {
+  endpoint: number;
+  parameter: number;
+  bitMask: number | null;
+}
 
 export interface RefreshStatus {
   state: RefreshState;
   requestedAt: number | null;
-  /** How many of the values it asked about have not answered yet. */
-  pending: number;
+  /**
+   * The values it asked about that have not answered.
+   *
+   * Named rather than counted, because the section says which value is waiting beside that value.
+   * A count could say how many are outstanding but not which, and a reader looking at one
+   * parameter would have no way to tell whether it is one of them.
+   */
+  waiting: WaitingValue[];
   /** How many it asked about at all. */
   asked: number;
+  /** When the attempt was seen to have finished with every value answered, or null. */
+  completedAt: number | null;
   /** False where the device has nothing a refresh could confirm. */
   canRequest: boolean;
 }
@@ -83,11 +114,12 @@ export function baselinesFor(payload: NodeParametersPayload): RefreshBaseline[] 
 }
 
 /**
- * Narrows what a token is still waiting on, and keeps what it has stopped waiting on retired.
+ * Narrows what a token is still waiting on, counting what it has stopped waiting on and why.
  *
  * A value has answered when its timestamp becomes known having been unknown, or moves past the one
  * it carried at dispatch. A value that has disappeared, or that has turned unreadable, is retired
- * rather than held open: neither will ever answer.
+ * rather than held open: neither will ever answer. The two are counted apart, because a value
+ * that went is not a value that was confirmed.
  *
  * Retirement is permanent, which is why this narrows the pending set rather than deciding it
  * afresh. A parameter that goes and comes back with the timestamp it had before has not answered
@@ -99,15 +131,6 @@ export function reconcilePending(
   token: RefreshToken,
   payload: NodeParametersPayload,
 ): RefreshBaseline[] {
-  token.pending = stillPending(token.pending, payload);
-
-  return token.pending;
-}
-
-function stillPending(
-  waiting: RefreshBaseline[],
-  payload: NodeParametersPayload,
-): RefreshBaseline[] {
   const current = new Map<string, ParameterValue>();
 
   for (const group of payload.groups) {
@@ -116,21 +139,35 @@ function stillPending(
     }
   }
 
-  return waiting.filter((baseline) => {
+  const waiting: RefreshBaseline[] = [];
+
+  for (const baseline of token.pending) {
     const value = current.get(keyOf(baseline.endpoint, baseline.parameter, baseline.bitMask));
 
     if (!value || !value.readable) {
-      return false;
+      token.retired += 1;
+    } else if (value.reportedAt === null) {
+      waiting.push(baseline);
+    } else if (baseline.reportedAt !== null && value.reportedAt <= baseline.reportedAt) {
+      waiting.push(baseline);
     }
-    if (value.reportedAt === null) {
-      return true;
-    }
-    if (baseline.reportedAt === null) {
-      return false;
-    }
+  }
 
-    return value.reportedAt <= baseline.reportedAt;
-  });
+  token.pending = waiting;
+
+  return token.pending;
+}
+
+/**
+ * Whether the attempt has finished and every value it asked about has answered.
+ *
+ * A value that went is not one that answered, so an attempt holding one has not completed
+ * however empty the waiting list is. Read both by the status and by the caller that stamps the
+ * completion, so the moment recorded is the moment the section is told about, and not a second
+ * judgment that could differ from it.
+ */
+export function isComplete(token: RefreshToken): boolean {
+  return !token.dispatching && token.pending.length === 0 && token.retired === 0;
 }
 
 /**
@@ -139,6 +176,10 @@ function stillPending(
  * `dispatching` and `incomplete` are different things. While the attempt runs there is reason to
  * keep looking; once it has settled with values still unanswered there is not, and the reader is
  * offered another attempt instead of a wait that will not end.
+ *
+ * `unavailable` is a third thing again: nothing is outstanding, and nothing can be, because the
+ * values the refresh asked about are not there any more. A value that is still expected outranks
+ * one that has gone, since another attempt can bring the first and will never bring the second.
  */
 export function refreshStatus(
   token: RefreshToken | null,
@@ -147,7 +188,14 @@ export function refreshStatus(
   const available = canRefresh(payload);
 
   if (!token) {
-    return { state: 'idle', requestedAt: null, pending: 0, asked: 0, canRequest: available };
+    return {
+      state: 'idle',
+      requestedAt: null,
+      waiting: [],
+      asked: 0,
+      completedAt: null,
+      canRequest: available,
+    };
   }
 
   const pending = token.pending;
@@ -155,13 +203,16 @@ export function refreshStatus(
     ? 'dispatching'
     : pending.length > 0
       ? 'incomplete'
-      : 'complete';
+      : isComplete(token)
+        ? 'complete'
+        : 'unavailable';
 
   return {
     state,
     requestedAt: token.requestedAt,
-    pending: pending.length,
+    waiting: pending.map(({ endpoint, parameter, bitMask }) => ({ endpoint, parameter, bitMask })),
     asked: token.asked,
+    completedAt: token.completedAt,
     canRequest: available,
   };
 }

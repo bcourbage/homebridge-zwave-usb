@@ -1,6 +1,7 @@
 import {
   baselinesFor,
   canRefresh,
+  isComplete,
   reconcilePending,
   refreshStatus,
   shouldDispatch,
@@ -61,6 +62,8 @@ const tokenOf = (payload: NodeParametersPayload, over: Partial<RefreshToken> = {
     requestedAt: 5_000,
     dispatching: true,
     asked: baselines.length,
+    retired: 0,
+    completedAt: null,
     pending: baselines,
     ...over,
   };
@@ -142,6 +145,54 @@ describe('asking a device for its current configuration values', () => {
       ]);
 
       expect(reconcilePending(token, after).map((baseline) => baseline.parameter)).toEqual([2]);
+    });
+
+    it('counts a value that has gone apart from one that answered', () => {
+      /**
+       * Both leave the waiting list, and only one of them says anything about the device. A
+       * list that is empty because every value went is not a refresh that confirmed something.
+       */
+      const before = payloadOf([
+        { parameter: 1, values: [value({ reportedAt: 1_000 })] },
+        { parameter: 2, values: [value({ reportedAt: 1_000 })] },
+      ]);
+      const token = tokenOf(before, { dispatching: false });
+
+      reconcilePending(
+        token,
+        payloadOf([{ parameter: 1, values: [value({ reportedAt: 5_000 })] }]),
+      );
+
+      expect(token.pending).toHaveLength(0);
+      expect(token.retired).toBe(1);
+      expect(isComplete(token)).toBe(false);
+      expect(refreshStatus(token, before).state).toBe('unavailable');
+    });
+
+    it('counts a value that turned unreadable as one that will never answer', () => {
+      const before = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]);
+      const token = tokenOf(before, { dispatching: false });
+
+      reconcilePending(
+        token,
+        payloadOf([{ parameter: 1, values: [value({ readable: false })] }]),
+      );
+
+      expect(token.retired).toBe(1);
+      expect(refreshStatus(token, before).state).toBe('unavailable');
+    });
+
+    it('counts a value once, however often it is reconciled', () => {
+      // Retirement is permanent, and a count that grew on every reading would be a count of
+      // readings rather than of values.
+      const before = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]);
+      const token = tokenOf(before, { dispatching: false });
+
+      reconcilePending(token, payloadOf([]));
+      reconcilePending(token, payloadOf([]));
+      reconcilePending(token, before);
+
+      expect(token.retired).toBe(1);
     });
 
     it('stops waiting on a value that has gone', () => {
@@ -256,7 +307,7 @@ describe('asking a device for its current configuration values', () => {
       expect(refreshStatus(null, payload)).toMatchObject({
         state: 'idle',
         asked: 0,
-        pending: 0,
+        waiting: [],
         canRequest: true,
       });
     });
@@ -266,7 +317,10 @@ describe('asking a device for its current configuration values', () => {
 
       reconcilePending(token, payload);
 
-      expect(refreshStatus(token, payload)).toMatchObject({ asked: 1, pending: 1 });
+      expect(refreshStatus(token, payload)).toMatchObject({
+        asked: 1,
+        waiting: [{ endpoint: 0, parameter: 1, bitMask: null }],
+      });
     });
 
     it('separates an attempt that is running from one that finished short', () => {
@@ -286,7 +340,100 @@ describe('asking a device for its current configuration values', () => {
 
       reconcilePending(token, answered);
 
-      expect(refreshStatus(token, answered)).toMatchObject({ state: 'complete', pending: 0 });
+      expect(refreshStatus(token, answered)).toMatchObject({ state: 'complete', waiting: [] });
+    });
+
+    it('does not call an attempt complete because the values it asked about went', () => {
+      /**
+       * A value that is no longer there did not answer. Reading an empty waiting list as a
+       * success would tell a reader the device had just confirmed settings it no longer has.
+       */
+      const two = payloadOf([
+        { parameter: 1, values: [value({ reportedAt: 1_000 })] },
+        { parameter: 2, values: [value({ reportedAt: 1_000 })] },
+      ]);
+      const token = tokenOf(two, { dispatching: false });
+
+      reconcilePending(token, payloadOf([]));
+
+      expect(refreshStatus(token, two)).toMatchObject({
+        state: 'unavailable',
+        waiting: [],
+        asked: 2,
+        completedAt: null,
+      });
+    });
+
+    it('says what is still expected before what has gone, since only one can still arrive', () => {
+      const two = payloadOf([
+        { parameter: 1, values: [value({ reportedAt: 1_000 })] },
+        { parameter: 2, values: [value({ reportedAt: 1_000 })] },
+      ]);
+      const token = tokenOf(two, { dispatching: false });
+
+      reconcilePending(
+        token,
+        payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]),
+      );
+
+      expect(token.retired).toBe(1);
+      expect(refreshStatus(token, two)).toMatchObject({
+        state: 'incomplete',
+        waiting: [{ endpoint: 0, parameter: 1, bitMask: null }],
+      });
+    });
+
+    it('names each value it is waiting on, so the section can mark that value', () => {
+      /**
+       * A count says how many are outstanding and not which. A reader looking at one field of a
+       * parameter would have no way to tell whether that field is one of them.
+       */
+      const partials = payloadOf([
+        { parameter: 7, values: [value({ bitMask: 0x0f }), value({ bitMask: 0xf0 })] },
+      ]);
+      const token = tokenOf(partials);
+
+      reconcilePending(
+        token,
+        payloadOf([
+          {
+            parameter: 7,
+            values: [value({ bitMask: 0x0f, reportedAt: 9_000 }), value({ bitMask: 0xf0 })],
+          },
+        ]),
+      );
+
+      expect(refreshStatus(token, partials).waiting).toEqual([
+        { endpoint: 0, parameter: 7, bitMask: 0xf0 },
+      ]);
+    });
+
+    it('is finished only once it has settled with nothing left outstanding', () => {
+      /**
+       * A value can answer while the refresh is still running, which empties the waiting list
+       * without the attempt having finished. What finishes is the attempt.
+       */
+      const running = tokenOf(payload);
+
+      expect(isComplete(running)).toBe(false);
+      expect(isComplete({ ...running, pending: [] })).toBe(false);
+      expect(isComplete({ ...running, dispatching: false })).toBe(false);
+      expect(isComplete({ ...running, dispatching: false, pending: [], retired: 1 })).toBe(false);
+      expect(isComplete({ ...running, dispatching: false, pending: [] })).toBe(true);
+    });
+
+    it('carries the completion it was given, which is what dates the success', () => {
+      const done = tokenOf(payload, { dispatching: false, pending: [], completedAt: 7_000 });
+
+      expect(refreshStatus(done, payload)).toMatchObject({
+        state: 'complete',
+        completedAt: 7_000,
+      });
+    });
+
+    it('has no completion to carry while an attempt runs, or where none was made', () => {
+      expect(refreshStatus(tokenOf(payload), payload).completedAt).toBeNull();
+      expect(refreshStatus(null, payload).completedAt).toBeNull();
     });
 
     it('says a device with nothing readable cannot be asked', () => {
