@@ -1,7 +1,7 @@
 import {
   baselinesFor,
   canRefresh,
-  pendingOf,
+  reconcilePending,
   refreshStatus,
   shouldDispatch,
   type RefreshToken,
@@ -49,14 +49,22 @@ const payloadOf = (
   })),
 });
 
-const tokenOf = (payload: NodeParametersPayload, over: Partial<RefreshToken> = {}): RefreshToken => ({
-  nodeId: 10,
-  fingerprint: 'abc',
-  requestedAt: 5_000,
-  dispatching: true,
-  baselines: baselinesFor(payload),
-  ...over,
-});
+const owner = { nodeId: 10 };
+
+const tokenOf = (payload: NodeParametersPayload, over: Partial<RefreshToken> = {}): RefreshToken => {
+  const baselines = baselinesFor(payload);
+
+  return {
+    nodeId: 10,
+    owner,
+    fingerprint: 'abc',
+    requestedAt: 5_000,
+    dispatching: true,
+    asked: baselines.length,
+    pending: baselines,
+    ...over,
+  };
+};
 
 describe('asking a device for its current configuration values', () => {
   describe('what a refresh can confirm', () => {
@@ -97,8 +105,8 @@ describe('asking a device for its current configuration values', () => {
       const token = tokenOf(before);
       const after = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_001 })] }]);
 
-      expect(pendingOf(token, before)).toHaveLength(1);
-      expect(pendingOf(token, after)).toHaveLength(0);
+      expect(reconcilePending(token, before)).toHaveLength(1);
+      expect(reconcilePending(token, after)).toHaveLength(0);
     });
 
     it('counts a value that had no timestamp and now has one', () => {
@@ -106,15 +114,15 @@ describe('asking a device for its current configuration values', () => {
       const token = tokenOf(before);
       const after = payloadOf([{ parameter: 1, values: [value({ reportedAt: 7 })] }]);
 
-      expect(pendingOf(token, before)).toHaveLength(1);
-      expect(pendingOf(token, after)).toHaveLength(0);
+      expect(reconcilePending(token, before)).toHaveLength(1);
+      expect(reconcilePending(token, after)).toHaveLength(0);
     });
 
     it('does not count a timestamp that merely equals the baseline', () => {
       // The same reading is not a new one, however recently the cache was read.
       const before = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]);
 
-      expect(pendingOf(tokenOf(before), before)).toHaveLength(1);
+      expect(reconcilePending(tokenOf(before), before)).toHaveLength(1);
     });
 
     it('compares each value against its own baseline, not against one instant', () => {
@@ -133,7 +141,7 @@ describe('asking a device for its current configuration values', () => {
         { parameter: 2, values: [value({ reportedAt: 9_000 })] },
       ]);
 
-      expect(pendingOf(token, after).map((baseline) => baseline.parameter)).toEqual([2]);
+      expect(reconcilePending(token, after).map((baseline) => baseline.parameter)).toEqual([2]);
     });
 
     it('stops waiting on a value that has gone', () => {
@@ -144,7 +152,7 @@ describe('asking a device for its current configuration values', () => {
       const token = tokenOf(before);
       const after = payloadOf([{ parameter: 1, values: [value()] }]);
 
-      expect(pendingOf(token, after).map((baseline) => baseline.parameter)).toEqual([1]);
+      expect(reconcilePending(token, after).map((baseline) => baseline.parameter)).toEqual([1]);
     });
 
     it('stops waiting on a value that has turned unreadable', () => {
@@ -152,7 +160,54 @@ describe('asking a device for its current configuration values', () => {
       const token = tokenOf(before);
       const after = payloadOf([{ parameter: 1, values: [value({ readable: false })] }]);
 
-      expect(pendingOf(token, after)).toHaveLength(0);
+      expect(reconcilePending(token, after)).toHaveLength(0);
+    });
+
+    it('does not wait on a value again because it came back', () => {
+      /**
+       * Retirement is permanent. A parameter that disappears and returns carrying the timestamp
+       * it had before has still not answered, and taking it up again on the strength of its
+       * return would leave a question that never ends.
+       */
+      const before = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]);
+      const token = tokenOf(before);
+
+      reconcilePending(token, payloadOf([]));
+      expect(token.pending).toHaveLength(0);
+
+      reconcilePending(token, before);
+      expect(token.pending).toHaveLength(0);
+      expect(token.asked).toBe(1);
+    });
+
+    it('does not wait on a value again because it turned readable', () => {
+      const before = payloadOf([{ parameter: 1, values: [value({ reportedAt: 1_000 })] }]);
+      const token = tokenOf(before);
+
+      reconcilePending(token, payloadOf([{ parameter: 1, values: [value({ readable: false })] }]));
+      expect(token.pending).toHaveLength(0);
+
+      reconcilePending(token, before);
+      expect(token.pending).toHaveLength(0);
+    });
+
+    it('keeps what it asked about even as the waiting list empties', () => {
+      const before = payloadOf([
+        { parameter: 1, values: [value({ reportedAt: 1_000 })] },
+        { parameter: 2, values: [value({ reportedAt: 1_000 })] },
+      ]);
+      const token = tokenOf(before);
+
+      reconcilePending(
+        token,
+        payloadOf([
+          { parameter: 1, values: [value({ reportedAt: 2_000 })] },
+          { parameter: 2, values: [value({ reportedAt: 1_000 })] },
+        ]),
+      );
+
+      expect(token.asked).toBe(2);
+      expect(token.pending).toHaveLength(1);
     });
 
     it('never waits on a value that appeared after it asked', () => {
@@ -164,7 +219,7 @@ describe('asking a device for its current configuration values', () => {
         { parameter: 9, values: [value({ reportedAt: null })] },
       ]);
 
-      expect(pendingOf(token, after).map((baseline) => baseline.parameter)).toEqual([1]);
+      expect(reconcilePending(token, after).map((baseline) => baseline.parameter)).toEqual([1]);
     });
 
     it('tells a field apart from another field of the same parameter', () => {
@@ -176,7 +231,7 @@ describe('asking a device for its current configuration values', () => {
         { parameter: 1, values: [value({ bitMask: 0x0f, reportedAt: 2 }), value({ bitMask: 0xf0, reportedAt: 1 })] },
       ]);
 
-      expect(pendingOf(token, after).map((baseline) => baseline.bitMask)).toEqual([0xf0]);
+      expect(reconcilePending(token, after).map((baseline) => baseline.bitMask)).toEqual([0xf0]);
     });
 
     it('tells two endpoints using one parameter number apart', () => {
@@ -190,7 +245,7 @@ describe('asking a device for its current configuration values', () => {
         { endpoint: 2, parameter: 1, values: [value({ reportedAt: 1 })] },
       ]);
 
-      expect(pendingOf(token, after).map((baseline) => baseline.endpoint)).toEqual([2]);
+      expect(reconcilePending(token, after).map((baseline) => baseline.endpoint)).toEqual([2]);
     });
   });
 
@@ -204,6 +259,14 @@ describe('asking a device for its current configuration values', () => {
         pending: 0,
         canRequest: true,
       });
+    });
+
+    it('reports what it is still waiting on, which the caller has narrowed', () => {
+      const token = tokenOf(payload);
+
+      reconcilePending(token, payload);
+
+      expect(refreshStatus(token, payload)).toMatchObject({ asked: 1, pending: 1 });
     });
 
     it('separates an attempt that is running from one that finished short', () => {
@@ -221,6 +284,8 @@ describe('asking a device for its current configuration values', () => {
       const token = tokenOf(payload, { dispatching: false });
       const answered = payloadOf([{ parameter: 1, values: [value({ reportedAt: 2_000 })] }]);
 
+      reconcilePending(token, answered);
+
       expect(refreshStatus(token, answered)).toMatchObject({ state: 'complete', pending: 0 });
     });
 
@@ -235,7 +300,7 @@ describe('asking a device for its current configuration values', () => {
     const payload = payloadOf([{ parameter: 1, values: [value()] }]);
 
     it('dispatches when nothing is running', () => {
-      expect(shouldDispatch(null, 'abc')).toBe(true);
+      expect(shouldDispatch(null)).toBe(true);
     });
 
     it('does not dispatch again while an attempt is running', () => {
@@ -243,16 +308,11 @@ describe('asking a device for its current configuration values', () => {
        * A second dispatch would take its baselines from timestamps the running refresh has
        * already advanced, and then wait for a move it will never make again.
        */
-      expect(shouldDispatch(tokenOf(payload), 'abc')).toBe(false);
+      expect(shouldDispatch(tokenOf(payload))).toBe(false);
     });
 
     it('dispatches again once the attempt has settled', () => {
-      expect(shouldDispatch(tokenOf(payload, { dispatching: false }), 'abc')).toBe(true);
-    });
-
-    it('dispatches for different hardware on the same node number', () => {
-      // Z-Wave gives a node number away again; a token for the old device answers for nothing.
-      expect(shouldDispatch(tokenOf(payload), 'different')).toBe(true);
+      expect(shouldDispatch(tokenOf(payload, { dispatching: false }))).toBe(true);
     });
   });
 });

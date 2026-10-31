@@ -15,6 +15,7 @@ import { buildNodeParametersPayload, type NodeParametersPayload } from './NodePa
 import {
   baselinesFor,
   canRefresh,
+  reconcilePending,
   refreshStatus,
   shouldDispatch,
   type RefreshStatus,
@@ -905,15 +906,21 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
 
     const payload = buildNodeParametersPayload(node);
     const token = this.parameterRefreshFor(node);
+    if (token) {
+      reconcilePending(token, payload);
+    }
 
     return { ...payload, refresh: refreshStatus(token, payload) };
   }
 
   /**
-   * The refresh this node has, discarded where it was asked of different hardware.
+   * The refresh this node has, discarded where it was not this node that was asked.
    *
-   * Z-Wave gives a node number away again, so a token kept against the number alone would report
-   * the progress of a question put to a device that is no longer there.
+   * The node itself is the identity, not its number and not its fingerprint. Z-Wave gives a node
+   * number away again, and the replacement can report the same hardware, or report none at all
+   * while the one before it also reported none. Either way a question put to the device that has
+   * gone would be read as the progress of one put to the device that is here, and would go on
+   * suppressing a real request for as long as its promise stayed unsettled.
    */
   private parameterRefreshFor(node: IZWaveNode): RefreshToken | null {
     const token = this.parameterRefreshes.get(node.nodeId);
@@ -921,7 +928,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       return null;
     }
 
-    if (token.fingerprint !== this.fingerprintKeyOf(node)) {
+    if (token.owner !== node || token.fingerprint !== this.fingerprintKeyOf(node)) {
       this.parameterRefreshes.delete(node.nodeId);
       return null;
     }
@@ -948,19 +955,25 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const fingerprint = this.fingerprintKeyOf(node);
     const existing = this.parameterRefreshFor(node);
 
-    if (canRefresh(payload) && shouldDispatch(existing, fingerprint)) {
+    if (canRefresh(payload) && shouldDispatch(existing)) {
+      const baselines = baselinesFor(payload);
       const token: RefreshToken = {
         nodeId,
+        owner: node,
         fingerprint,
         requestedAt: Date.now(),
         dispatching: true,
-        baselines: baselinesFor(payload),
+        asked: baselines.length,
+        pending: baselines,
       };
       this.parameterRefreshes.set(nodeId, token);
       this.dispatchParameterRefresh(node, token);
     }
 
     const token = this.parameterRefreshFor(node);
+    if (token) {
+      reconcilePending(token, payload);
+    }
 
     return { ...payload, refresh: refreshStatus(token, payload) };
   }
@@ -984,9 +997,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       .refreshCCValues(CommandClasses.Configuration)
       .then(settle)
       .catch((err) => {
-        this.log.debug(
-          `Node ${token.nodeId}: asking for configuration values failed before it could start: ${err}`,
-        );
+        this.log.debug(`Node ${token.nodeId}: configuration-value refresh failed: ${err}`);
         settle();
       });
   }
@@ -1836,6 +1847,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     staleNodeIds.forEach((nodeId) => {
       this.zwaveAccessories.delete(nodeId);
       this.rebuildFailures.delete(nodeId);
+      this.parameterRefreshes.delete(nodeId);
     });
 
     return staleAccessories.length;
@@ -1844,6 +1856,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   private handleNodeRemoved(node: IZWaveNode) {
     this.refreshStates.delete(node.nodeId);
     this.rebuildFailures.delete(node.nodeId);
+    this.parameterRefreshes.delete(node.nodeId);
     this.log.info(`Node ${node.nodeId} removed`);
 
     const homeId = this.zwaveController?.homeId;

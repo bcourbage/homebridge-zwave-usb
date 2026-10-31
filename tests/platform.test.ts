@@ -764,6 +764,10 @@ describe('ZWaveUsbPlatform', () => {
     };
     (platform as any).accessories.push(staleAccessory, liveAccessory);
     (platform as any).zwaveAccessories.set(99, { platformAccessory: staleAccessory });
+    // A question put to each node, so pruning is shown to drop the departed node's and keep the
+    // other one's rather than simply emptying the map.
+    (platform as any).parameterRefreshes.set(99, { nodeId: 99, owner: {}, dispatching: false });
+    (platform as any).parameterRefreshes.set(2, { nodeId: 2, owner: {}, dispatching: false });
 
     const fakeServer = new EventEmitter() as EventEmitter & {
       listen: jest.Mock;
@@ -798,6 +802,8 @@ describe('ZWaveUsbPlatform', () => {
       );
       expect((platform as any).accessories).toEqual([liveAccessory]);
       expect((platform as any).zwaveAccessories.has(99)).toBe(false);
+      expect((platform as any).parameterRefreshes.has(99)).toBe(false);
+      expect((platform as any).parameterRefreshes.has(2)).toBe(true);
     } finally {
       createServerSpy.mockRestore();
     }
@@ -2846,6 +2852,56 @@ describe('ZWaveUsbPlatform', () => {
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
 
       expect(body.refresh.state).toBe('idle');
+    });
+
+    it('does not pass a request to a replacement that reports the same hardware', async () => {
+      /**
+       * Matching on number and fingerprint alone hands the new device the question put to the
+       * old one, and an attempt whose promise never settles would suppress a real request for
+       * as long as the page stayed open.
+       */
+      const first = paramNode();
+      const platform = newPlatform(new Map([[10, first.node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      expect(first.dispatches).toHaveLength(1);
+
+      const second = paramNode();
+      platform.zwaveController.nodes = new Map([[10, second.node]]);
+
+      const read = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+      expect(read.body.refresh.state).toBe('idle');
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      expect(second.dispatches).toHaveLength(1);
+    });
+
+    it('does not pass a request to a replacement when neither reports hardware', async () => {
+      // Two unknown devices are not the same device, and nothing about them says otherwise.
+      const unknown = { manufacturerId: undefined, productType: undefined, productId: undefined };
+      const first = paramNode(unknown);
+      const platform = newPlatform(new Map([[10, first.node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      const second = paramNode(unknown);
+      platform.zwaveController.nodes = new Map([[10, second.node]]);
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(second.dispatches).toHaveLength(1);
+    });
+
+    it('forgets a request when the node is removed', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      expect(platform.parameterRefreshes.has(10)).toBe(true);
+
+      platform.handleNodeRemoved(node);
+
+      expect(platform.parameterRefreshes.has(10)).toBe(false);
     });
 
     it('does not offer a refresh where nothing could answer', async () => {

@@ -11,12 +11,23 @@ export interface RefreshBaseline {
 
 export interface RefreshToken {
   nodeId: number;
+  /** The node the question was put to, which is its identity: a number is given away again. */
+  owner: unknown;
   /** The hardware it was dispatched for, so it cannot outlive a device swap on the same number. */
   fingerprint: string | null;
   requestedAt: number;
   /** True until the attempt settles. Settling says the attempt finished, never that a value came. */
   dispatching: boolean;
-  baselines: RefreshBaseline[];
+  /** How many values it asked about, which does not change as they answer. */
+  asked: number;
+  /**
+   * The ones that have not answered, which only ever shrinks.
+   *
+   * Recomputing this from the original list each time would let a value that has answered, or
+   * gone, come back to being waited on: a parameter that disappears and returns carrying the
+   * timestamp it had before would look unanswered again, and the question would never close.
+   */
+  pending: RefreshBaseline[];
 }
 
 export type RefreshState = 'idle' | 'dispatching' | 'incomplete' | 'complete';
@@ -72,17 +83,31 @@ export function baselinesFor(payload: NodeParametersPayload): RefreshBaseline[] 
 }
 
 /**
- * Which of a token's values have still not answered.
+ * Narrows what a token is still waiting on, and keeps what it has stopped waiting on retired.
  *
  * A value has answered when its timestamp becomes known having been unknown, or moves past the one
- * it carried at dispatch. A value that has since disappeared, or that has turned unreadable, is
- * dropped rather than held open: neither will ever answer, and a pending set that cannot empty
- * would leave the section waiting for ever.
+ * it carried at dispatch. A value that has disappeared, or that has turned unreadable, is retired
+ * rather than held open: neither will ever answer.
  *
- * A value that appeared after the dispatch is not here at all, because the refresh never asked
- * about it.
+ * Retirement is permanent, which is why this narrows the pending set rather than deciding it
+ * afresh. A parameter that goes and comes back with the timestamp it had before has not answered
+ * the question, and asking it again on the strength of its return would leave one that never ends.
+ *
+ * A value that appeared after the dispatch is not here at all: the refresh never asked about it.
  */
-export function pendingOf(token: RefreshToken, payload: NodeParametersPayload): RefreshBaseline[] {
+export function reconcilePending(
+  token: RefreshToken,
+  payload: NodeParametersPayload,
+): RefreshBaseline[] {
+  token.pending = stillPending(token.pending, payload);
+
+  return token.pending;
+}
+
+function stillPending(
+  waiting: RefreshBaseline[],
+  payload: NodeParametersPayload,
+): RefreshBaseline[] {
   const current = new Map<string, ParameterValue>();
 
   for (const group of payload.groups) {
@@ -91,7 +116,7 @@ export function pendingOf(token: RefreshToken, payload: NodeParametersPayload): 
     }
   }
 
-  return token.baselines.filter((baseline) => {
+  return waiting.filter((baseline) => {
     const value = current.get(keyOf(baseline.endpoint, baseline.parameter, baseline.bitMask));
 
     if (!value || !value.readable) {
@@ -125,7 +150,7 @@ export function refreshStatus(
     return { state: 'idle', requestedAt: null, pending: 0, asked: 0, canRequest: available };
   }
 
-  const pending = pendingOf(token, payload);
+  const pending = token.pending;
   const state: RefreshState = token.dispatching
     ? 'dispatching'
     : pending.length > 0
@@ -136,7 +161,7 @@ export function refreshStatus(
     state,
     requestedAt: token.requestedAt,
     pending: pending.length,
-    asked: token.baselines.length,
+    asked: token.asked,
     canRequest: available,
   };
 }
@@ -149,11 +174,8 @@ export function refreshStatus(
  * timestamp waits for a move the refresh will not make again. So a request arriving while one is
  * running is the same request, and only a settled attempt can be retried.
  */
-export function shouldDispatch(token: RefreshToken | null, fingerprint: string | null): boolean {
+export function shouldDispatch(token: RefreshToken | null): boolean {
   if (!token) {
-    return true;
-  }
-  if (token.fingerprint !== fingerprint) {
     return true;
   }
 
