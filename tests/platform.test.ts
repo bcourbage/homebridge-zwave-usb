@@ -2673,6 +2673,193 @@ describe('ZWaveUsbPlatform', () => {
       expect(platform.zwaveAccessories.get(10)).toBe(rebuilt);
     });
 
+    /**
+     * A node whose configuration values answer on command, so the routes can be driven through
+     * the states a real device moves between: nothing asked, asking, answered, and asked again
+     * after an attempt that fell short.
+     */
+    const paramNode = (over: Record<string, unknown> = {}) => {
+      const reported = new Map<string, number>([['1', 1_000]]);
+      let settle: () => void = () => undefined;
+      const dispatches: number[] = [];
+
+      const node: Record<string, unknown> = {
+        nodeId: 10,
+        ready: true,
+        isListening: true,
+        status: 4,
+        manufacturerId: 0x026e,
+        productType: 2,
+        productId: 16,
+        setValue: jest.fn(),
+        supportsCC: (cc: number) => cc === CommandClasses.Configuration,
+        getAllEndpoints: () => [{ index: 0, supportsCC: () => true }],
+        getDefinedValueIDs: () => [
+          { commandClass: CommandClasses.Configuration, endpoint: 0, property: 1 },
+        ],
+        getValue: () => 5,
+        getValueTimestamp: (valueId: { property: unknown }) => reported.get(String(valueId.property)),
+        getValueMetadata: () => ({ type: 'number', readable: true, writeable: true, label: 'Hold' }),
+        refreshCCValues: jest.fn().mockImplementation(() => {
+          dispatches.push(1);
+          return new Promise<void>((resolve) => {
+            settle = resolve;
+          });
+        }),
+        on: () => node,
+        off: () => node,
+        ...over,
+      };
+
+      return {
+        node,
+        dispatches,
+        /** Lets the attempt finish, which says only that zwave-js stopped trying. */
+        settleAttempt: async () => {
+          settle();
+          await Promise.resolve();
+          await Promise.resolve();
+        },
+        /** Lets the device answer, which is the only thing that confirms a value. */
+        answer: (at: number) => reported.set('1', at),
+      };
+    };
+
+    it('reads the parameters without asking the device anything', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.state).toBe('parameters');
+      expect(body.groups[0]).toMatchObject({ parameter: 1 });
+      expect(node.refreshCCValues).not.toHaveBeenCalled();
+      expect(node.setValue).not.toHaveBeenCalled();
+      expect(body.refresh).toMatchObject({ state: 'idle', canRequest: true });
+    });
+
+    it('never writes to the device, whichever parameter route is called', async () => {
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters', 'GET');
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(node.setValue).not.toHaveBeenCalled();
+    });
+
+    it('answers with nothing for a node that is not in the network', async () => {
+      const platform = newPlatform(new Map([[10, paramNode().node]]));
+
+      expect((await driveRoute(platform, '/nodes/99/parameters', 'GET')).status).toBe(404);
+      expect(
+        (await driveRoute(platform, '/nodes/99/parameters/refresh', 'POST', {})).status,
+      ).toBe(404);
+    });
+
+    it('returns before the attempt it started has settled', async () => {
+      /**
+       * zwave-js says not to await the refresh, and the route must not: a sleeping device would
+       * hold the request open for as long as it sleeps.
+       */
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(node.refreshCCValues).toHaveBeenCalledWith(CommandClasses.Configuration);
+      expect(body.refresh).toMatchObject({ state: 'dispatching', asked: 1, pending: 1 });
+    });
+
+    it('treats a request made while one is running as that same request', async () => {
+      const { node, dispatches } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const first = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const second = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(dispatches).toHaveLength(1);
+      expect(second.body.refresh.requestedAt).toBe(first.body.refresh.requestedAt);
+      expect(second.body.refresh.state).toBe('dispatching');
+    });
+
+    it('does not confirm a value because the attempt finished', async () => {
+      /**
+       * `refreshCCValues` resolves even where every endpoint failed, because it catches and logs
+       * each one. Its settling says the attempt stopped, never that the device answered.
+       */
+      const { node, settleAttempt } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await settleAttempt();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'incomplete', pending: 1 });
+    });
+
+    it('reports completion when the device answers', async () => {
+      const { node, settleAttempt, answer } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      answer(2_000);
+      await settleAttempt();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh).toMatchObject({ state: 'complete', pending: 0 });
+    });
+
+    it('lets an attempt that fell short be tried again, and that one dispatches', async () => {
+      const { node, dispatches, settleAttempt } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      await settleAttempt();
+      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(dispatches).toHaveLength(2);
+      expect(body.refresh.state).toBe('dispatching');
+    });
+
+    it('holds the request so returning to the page finds it rather than starting another', async () => {
+      const { node, dispatches } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(dispatches).toHaveLength(1);
+      expect(body.refresh.state).toBe('dispatching');
+    });
+
+    it('discards a request made of hardware the node no longer reports', async () => {
+      // Z-Wave gives a node number away again, and the old question answers for nothing.
+      const { node } = paramNode();
+      const platform = newPlatform(new Map([[10, node]]));
+
+      await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+      node.productId = 0x99;
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh.state).toBe('idle');
+    });
+
+    it('does not offer a refresh where nothing could answer', async () => {
+      const { node } = paramNode({
+        getValueMetadata: () => ({ type: 'number', readable: false, writeable: true }),
+      });
+      const platform = newPlatform(new Map([[10, node]]));
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters/refresh', 'POST', {});
+
+      expect(node.refreshCCValues).not.toHaveBeenCalled();
+      expect(body.refresh).toMatchObject({ state: 'idle', canRequest: false });
+    });
+
     it('refuses a type saved for the controller, however the request arrives', async () => {
       /**
        * The sync never builds a generic accessory for Node 1, so a decision saved for it would

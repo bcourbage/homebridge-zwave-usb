@@ -11,6 +11,15 @@ import { CommandClasses } from '@zwave-js/core';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
+import { buildNodeParametersPayload, type NodeParametersPayload } from './NodeParametersPayload';
+import {
+  baselinesFor,
+  canRefresh,
+  refreshStatus,
+  shouldDispatch,
+  type RefreshStatus,
+  type RefreshToken,
+} from './NodeParametersRefresh';
 import { ZWaveController } from '../zwave/ZWaveController';
 import { IZWaveController, IZWaveNode, ZWaveValueEvent } from '../zwave/interfaces';
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
@@ -102,6 +111,8 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   public readonly Service: typeof Service;
   public readonly Characteristic: typeof Characteristic;
   public readonly accessories: PlatformAccessory[] = [];
+  /** The refresh each node has running or has lately run, held so returning to the page finds it. */
+  private readonly parameterRefreshes = new Map<number, RefreshToken>();
   /** Whether the one-time Matter cache sweep has run for this session. */
   private matterCacheSwept = false;
   private matterSweepTimeout?: NodeJS.Timeout;
@@ -516,6 +527,28 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
+        if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/parameters')) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          const payload = this.nodeParametersPayload(nodeId);
+
+          return payload
+            ? sendJson(payload)
+            : sendJson({ error: `Node ${nodeId} is not in the network` }, 404);
+        }
+
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/parameters/refresh') &&
+          method === 'POST'
+        ) {
+          const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+          const payload = this.requestParameterRefresh(nodeId);
+
+          return payload
+            ? sendJson(payload)
+            : sendJson({ error: `Node ${nodeId} is not in the network` }, 404);
+        }
+
         if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type')) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
 
@@ -859,6 +892,103 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     }
 
     return current === failure.fingerprint ? failure.error : null;
+  }
+
+  /** Everything the parameters section draws, or none when the node has left the network. */
+  public nodeParametersPayload(
+    nodeId: number,
+  ): (NodeParametersPayload & { refresh: RefreshStatus }) | undefined {
+    const node = this.zwaveController?.nodes.get(nodeId);
+    if (!node) {
+      return undefined;
+    }
+
+    const payload = buildNodeParametersPayload(node);
+    const token = this.parameterRefreshFor(node);
+
+    return { ...payload, refresh: refreshStatus(token, payload) };
+  }
+
+  /**
+   * The refresh this node has, discarded where it was asked of different hardware.
+   *
+   * Z-Wave gives a node number away again, so a token kept against the number alone would report
+   * the progress of a question put to a device that is no longer there.
+   */
+  private parameterRefreshFor(node: IZWaveNode): RefreshToken | null {
+    const token = this.parameterRefreshes.get(node.nodeId);
+    if (!token) {
+      return null;
+    }
+
+    if (token.fingerprint !== this.fingerprintKeyOf(node)) {
+      this.parameterRefreshes.delete(node.nodeId);
+      return null;
+    }
+
+    return token;
+  }
+
+  /**
+   * Asks a device for its current configuration values.
+   *
+   * A request arriving while an attempt is running is that same attempt: its baselines are not
+   * replaced and nothing further is dispatched, because a baseline taken from a timestamp the
+   * running refresh has already advanced would wait for a move it will not make again.
+   */
+  public requestParameterRefresh(
+    nodeId: number,
+  ): (NodeParametersPayload & { refresh: RefreshStatus }) | undefined {
+    const node = this.zwaveController?.nodes.get(nodeId);
+    if (!node) {
+      return undefined;
+    }
+
+    const payload = buildNodeParametersPayload(node);
+    const fingerprint = this.fingerprintKeyOf(node);
+    const existing = this.parameterRefreshFor(node);
+
+    if (canRefresh(payload) && shouldDispatch(existing, fingerprint)) {
+      const token: RefreshToken = {
+        nodeId,
+        fingerprint,
+        requestedAt: Date.now(),
+        dispatching: true,
+        baselines: baselinesFor(payload),
+      };
+      this.parameterRefreshes.set(nodeId, token);
+      this.dispatchParameterRefresh(node, token);
+    }
+
+    const token = this.parameterRefreshFor(node);
+
+    return { ...payload, refresh: refreshStatus(token, payload) };
+  }
+
+  /**
+   * Sends the refresh and stops waiting on it.
+   *
+   * zwave-js's own documentation says not to await `refreshCCValues`, and it resolves even where
+   * every endpoint failed, because it catches and logs each one. Settling is therefore recorded as
+   * the attempt having finished and nothing more: whether any value answered is read from the
+   * timestamps. The handlers are here so that not awaiting it cannot leave a rejection unhandled.
+   */
+  private dispatchParameterRefresh(node: IZWaveNode, token: RefreshToken): void {
+    const settle = () => {
+      if (this.parameterRefreshes.get(token.nodeId) === token) {
+        token.dispatching = false;
+      }
+    };
+
+    void node
+      .refreshCCValues(CommandClasses.Configuration)
+      .then(settle)
+      .catch((err) => {
+        this.log.debug(
+          `Node ${token.nodeId}: asking for configuration values failed before it could start: ${err}`,
+        );
+        settle();
+      });
   }
 
   /** Everything the node's type panel draws, or none when the node has left the network. */
