@@ -88,6 +88,10 @@ export function buildNode(device: RealisticDevice, identity: NodeIdentity = {}):
     getDefinedValueIDs: () => device.values,
     getValueMetadata: () => (device.sceneStates ? { states: { 1: 'Scene 1' } } : undefined),
     getValue: () => undefined,
+    // Both are part of the node contract, so a fixture that omitted them would quietly turn
+    // freshness into nothing and a refresh into a call that is never made.
+    getValueTimestamp: () => undefined,
+    refreshCCValues: async () => undefined,
   } as unknown as IZWaveNode;
 }
 
