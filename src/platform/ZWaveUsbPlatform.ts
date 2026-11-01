@@ -7,7 +7,9 @@ import {
   Service,
   Characteristic,
 } from 'homebridge';
-import { CommandClasses } from '@zwave-js/core';
+import { CommandClasses, MessagePriority } from '@zwave-js/core';
+import { SetValueStatus, type SetValueResult, type ValueID } from 'zwave-js';
+import { describeSetValueResult } from '../zwave/setValueResult';
 import http from 'http';
 import path from 'path';
 import fs from 'fs';
@@ -23,6 +25,22 @@ import {
   type RefreshStatus,
   type RefreshToken,
 } from './NodeParametersRefresh';
+import {
+  checkParameterWrite,
+  confirmAfterMs,
+  isSettled,
+  noteDelivery,
+  notePoll,
+  noteWorkingElapsed,
+  blocksReReading,
+  openWrite,
+  writeStatus,
+  type Delivery,
+  type ParameterWriteRequest,
+  type PreflightRefusal,
+  type WriteStatus,
+  type WriteToken,
+} from './NodeParametersWrite';
 import { ZWaveController } from '../zwave/ZWaveController';
 import { IZWaveController, IZWaveNode, ZWaveValueEvent } from '../zwave/interfaces';
 import { ZWaveAccessory } from '../accessories/ZWaveAccessory';
@@ -111,6 +129,10 @@ interface TypeWriteBody {
 export type NodeParametersView = NodeParametersPayload & {
   identity: string;
   refresh: RefreshStatus;
+  /** The change this node has in hand, whatever a request was just told about its own. */
+  write: WriteStatus;
+  /** Why the change just asked for was not begun, where one was asked for and was not. */
+  refusal?: PreflightRefusal;
 };
 
 /** What a type write did, which the panels redraw from. */
@@ -127,6 +149,13 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   public readonly accessories: PlatformAccessory[] = [];
   /** The refresh each node has running or has lately run, held so returning to the page finds it. */
   private readonly parameterRefreshes = new Map<number, RefreshToken>();
+
+  private readonly parameterWrites = new Map<number, WriteToken>();
+
+  private readonly pendingWaits = new Map<
+    WriteToken,
+    { timer: ReturnType<typeof setTimeout>; resolve: () => void }
+  >();
 
   private readonly nodeIdentities = new WeakMap<IZWaveNode, string>();
   /** Whether the one-time Matter cache sweep has run for this session. */
@@ -589,6 +618,38 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
           return;
         }
 
+        if (
+          normalizedUrl.startsWith('/nodes/') &&
+          normalizedUrl.endsWith('/parameters/value') &&
+          method === 'POST'
+        ) {
+          let body = '';
+          req.on('data', (chunk) => (body += chunk));
+          req.on('end', () => {
+            const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
+
+            try {
+              const parsed: unknown = JSON.parse(body || '{}');
+
+              if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+                // Parsed JSON can be null, a number or a list. None of them names a device.
+                return sendJson({ error: 'A change must be an object.', code: 'malformed' }, 400);
+              }
+
+              const answer = this.requestParameterWrite(
+                nodeId,
+                parsed as ParameterWriteRequest & { identity?: unknown },
+              );
+
+              return sendJson(answer.body, answer.status);
+            } catch (err) {
+              this.log.error(`Configuration write rejected: ${err}`);
+              return sendJson({ error: err instanceof Error ? err.message : String(err) }, 400);
+            }
+          });
+          return;
+        }
+
         if (normalizedUrl.startsWith('/nodes/') && normalizedUrl.endsWith('/type')) {
           const nodeId = parseInt(normalizedUrl.split('/')[2], 10);
 
@@ -975,6 +1036,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       ...payload,
       identity: this.nodeIdentity(node),
       refresh: refreshStatus(token, payload),
+      write: writeStatus(this.parameterWriteFor(node)),
     };
   }
 
@@ -1043,8 +1105,15 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     const fingerprint = this.fingerprintKeyOf(node);
     const existing = this.parameterRefreshFor(node);
     const meant = expectedIdentity === identity;
+    /**
+     * A change that is queued, going out, or still being applied has not reached the device's
+     * answer yet, and Gets interleaved with that Set would be read against baselines the
+     * driver's own optimistic cache write can satisfy. Once the change is being confirmed the
+     * Set is already out, and more Gets can only help.
+     */
+    const changing = blocksReReading(this.parameterWriteFor(node));
 
-    if (meant && canRefresh(payload) && shouldDispatch(existing)) {
+    if (meant && !changing && canRefresh(payload) && shouldDispatch(existing)) {
       const baselines = baselinesFor(payload);
       const token: RefreshToken = {
         nodeId,
@@ -1066,7 +1135,269 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       this.observeParameterRefresh(token, payload);
     }
 
-    return { ...payload, identity, refresh: refreshStatus(token, payload) };
+    return {
+      ...payload,
+      identity,
+      refresh: refreshStatus(token, payload),
+      write: writeStatus(this.parameterWriteFor(node)),
+    };
+  }
+
+  /**
+   * The change this node has in hand, discarded where it was not this node that was changed.
+   *
+   * The same rule as the refresh, for the same reason: a node number is given away again, and a
+   * change sent to the device that has gone must not be read as the progress of one sent to the
+   * device that is here.
+   */
+  private parameterWriteFor(node: IZWaveNode): WriteToken | null {
+    const token = this.parameterWrites.get(node.nodeId);
+    if (!token) {
+      return null;
+    }
+
+    if (token.owner !== node || token.fingerprint !== this.fingerprintKeyOf(node)) {
+      this.discardWrite(node.nodeId);
+      return null;
+    }
+
+    return token;
+  }
+
+  /**
+   * Whether a change that was started is still the change this node has in hand.
+   *
+   * Asked again after every wait and before every step, because the steps are spread across a
+   * send, a wait and a question, and a node can leave or change hands inside any of them. A timer
+   * that fires for a token the map has let go must not put a Get on the network for a device
+   * nobody asked, nor write its answer into a token that has been replaced.
+   */
+  private stillWriting(token: WriteToken): boolean {
+    if (this.parameterWrites.get(token.nodeId) !== token) {
+      return false;
+    }
+
+    const node = this.zwaveController?.nodes.get(token.nodeId);
+
+    return (
+      node !== undefined &&
+      token.owner === node &&
+      token.fingerprint === this.fingerprintKeyOf(node)
+    );
+  }
+
+  /**
+   * Waits, in a way that can be given up on.
+   *
+   * A device may ask for as much as two hours of applying time. A change discarded meanwhile,
+   * because its node left or changed hands, must not leave a timer holding that node, its token
+   * and the whole closure until the time runs out, and must never be the reason a child bridge
+   * stays up. The timer is unreferenced for the second and canceled for the first, and
+   * canceling resolves rather than abandons, so the waiting runner wakes, finds the change is
+   * no longer the node's, and stops.
+   *
+   * Overridable so a test can let a wait pass without passing the time.
+   */
+  protected pause(ms: number, token?: WriteToken): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (token) {
+          this.pendingWaits.delete(token);
+        }
+        resolve();
+      }, ms);
+
+      timer.unref?.();
+
+      if (token) {
+        this.pendingWaits.set(token, { timer, resolve });
+      }
+    });
+  }
+
+  /** Lets go of a change, and of anything still waiting on it. */
+  private discardWrite(nodeId: number): void {
+    const token = this.parameterWrites.get(nodeId);
+    const waiting = token ? this.pendingWaits.get(token) : undefined;
+
+    if (token && waiting) {
+      clearTimeout(waiting.timer);
+      this.pendingWaits.delete(token);
+      waiting.resolve();
+    }
+
+    this.parameterWrites.delete(nodeId);
+  }
+
+  /** What the driver made of the command, in the three outcomes the write states are built on. */
+  private deliveryOf(result: SetValueResult | undefined, token: WriteToken): Delivery {
+    const outcome = describeSetValueResult(result);
+
+    if (!outcome.accepted) {
+      const rejected =
+        result?.status === SetValueStatus.Fail || result?.status === SetValueStatus.NoDeviceSupport;
+
+      /**
+       * The page is given a code it has a sentence for. The driver's own account of the refusal
+       * is the only thing that explains it, and it goes where someone reading the log will find
+       * it rather than where it would have to be escaped.
+       */
+      this.log.error(
+        `Node ${token.nodeId}: parameter ${token.parameter} was not set: ${outcome.description}`,
+      );
+
+      return { kind: 'refused', code: rejected ? 'device-rejected' : 'send-failed' };
+    }
+
+    if (result?.status === SetValueStatus.Working) {
+      return { kind: 'working', remainingMs: result.remainingDuration?.toMilliseconds() ?? null };
+    }
+
+    return { kind: 'accepted' };
+  }
+
+  /**
+   * Changes one value and then finds out what the device made of it.
+   *
+   * Nothing here is awaited by the request that started it: a sleeping device can hold the Set in
+   * its wakeup queue for hours, and the reader is told what is happening rather than kept waiting
+   * for it. Each step asks again whether this is still the change the node has in hand.
+   */
+  private async runParameterWrite(
+    node: IZWaveNode,
+    token: WriteToken,
+    valueId: ValueID,
+  ): Promise<void> {
+    let delivery: Delivery;
+
+    try {
+      delivery = this.deliveryOf(await node.setValue(valueId, token.wrote), token);
+    } catch (err) {
+      this.log.error(`Node ${token.nodeId}: parameter ${token.parameter} could not be set: ${err}`);
+      delivery = { kind: 'refused', code: 'send-failed' };
+    }
+
+    if (!this.stillWriting(token)) {
+      return;
+    }
+    noteDelivery(token, delivery, Date.now());
+
+    if (token.state === 'working') {
+      await this.pause(confirmAfterMs(token), token);
+
+      if (!this.stillWriting(token)) {
+        return;
+      }
+      noteWorkingElapsed(token, Date.now());
+    }
+
+    if (token.state !== 'confirming') {
+      return;
+    }
+
+    let answered: unknown;
+
+    try {
+      answered = await node.pollValue(valueId, {
+        priority: MessagePriority.NodeQuery,
+        maxSendAttempts: 3,
+      });
+    } catch (err) {
+      this.log.debug(`Node ${token.nodeId}: parameter ${token.parameter} did not answer: ${err}`);
+      answered = undefined;
+    }
+
+    if (!this.stillWriting(token)) {
+      return;
+    }
+    notePoll(token, typeof answered === 'number' ? answered : undefined, Date.now());
+  }
+
+  /**
+   * Changes one configuration value, or says why it will not.
+   *
+   * Everything refused here is refused before anything reaches the network. The caller names the
+   * device it means, the device says what it will take, and a change already in hand is not
+   * replaced by another.
+   */
+  public requestParameterWrite(
+    nodeId: number,
+    request: ParameterWriteRequest & { identity?: unknown },
+  ): { status: number; body: unknown } {
+    const node = this.zwaveController?.nodes.get(nodeId);
+    if (!node) {
+      return { status: 404, body: { error: `Node ${nodeId} is not in the network` } };
+    }
+
+    /**
+     * A refusal the plugin expects is an answer, not an error: the UI server turns an error
+     * response into a bare message, which would leave the page with a sentence it did not choose
+     * and no code to choose one by.
+     *
+     * It travels beside the payload rather than inside the write status. A change refused for
+     * being too soon is refused because another change is still running, and saying so by
+     * replacing that change's state with `refused` would tell the page the running one had
+     * finished and let it offer the controls again.
+     */
+    const refuse = (code: PreflightRefusal) => ({
+      status: 200,
+      body: { ...this.nodeParametersPayload(nodeId), refusal: code },
+    });
+
+    if (typeof request.identity !== 'string' || request.identity.length === 0) {
+      return refuse('no-identity');
+    }
+    if (request.identity !== this.nodeIdentity(node)) {
+      return refuse('wrong-device');
+    }
+
+    const held = this.parameterWriteFor(node);
+    if (held && !isSettled(held.state)) {
+      return refuse('busy');
+    }
+    if (this.parameterRefreshFor(node)?.dispatching) {
+      // A different thing from another change, and the page says so differently.
+      return refuse('busy-rereading');
+    }
+
+    const payload = buildNodeParametersPayload(node);
+    const check = checkParameterWrite(payload, request);
+    if (!check.ok) {
+      return refuse(check.code);
+    }
+
+    /**
+     * A re-read that settled short still holds a baseline for every value that never answered,
+     * and the driver advances one of those timestamps itself the moment it accepts this Set. The
+     * next reading would take that move for the device finally answering and report the old
+     * re-read complete on the strength of this plugin's own write.
+     *
+     * It is discarded here, where the change is certain to go out. A refused change leaves it
+     * alone, because nothing will move.
+     */
+    this.parameterRefreshes.delete(nodeId);
+
+    const token = openWrite({
+      nodeId,
+      owner: node,
+      fingerprint: this.fingerprintKeyOf(node),
+      endpoint: request.endpoint,
+      parameter: request.parameter,
+      bitMask: request.bitMask,
+      wrote: request.value,
+      readable: check.value.readable,
+      listening: payload.listening,
+    });
+
+    this.parameterWrites.set(nodeId, token);
+    void this.runParameterWrite(node, token, {
+      commandClass: CommandClasses.Configuration,
+      endpoint: request.endpoint,
+      property: request.parameter,
+      ...(request.bitMask === null ? {} : { propertyKey: request.bitMask }),
+    }).catch((err) => this.log.error(`Node ${nodeId}: the change could not be followed: ${err}`));
+
+    return { status: 200, body: this.nodeParametersPayload(nodeId) };
   }
 
   /**
@@ -1952,6 +2283,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
       this.zwaveAccessories.delete(nodeId);
       this.rebuildFailures.delete(nodeId);
       this.parameterRefreshes.delete(nodeId);
+      this.discardWrite(nodeId);
     });
 
     return staleAccessories.length;
@@ -1961,6 +2293,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
     this.refreshStates.delete(node.nodeId);
     this.rebuildFailures.delete(node.nodeId);
     this.parameterRefreshes.delete(node.nodeId);
+    this.discardWrite(node.nodeId);
     this.log.info(`Node ${node.nodeId} removed`);
 
     const homeId = this.zwaveController?.homeId;

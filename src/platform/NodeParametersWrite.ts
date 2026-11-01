@@ -236,19 +236,31 @@ export type WriteInFlight = 'queued' | 'sending' | 'working' | 'confirming';
 export type WriteSettled = 'sent' | 'confirmed' | 'different' | 'unconfirmed' | 'refused';
 export type WriteState = 'idle' | WriteInFlight | WriteSettled;
 
-/** Why a write failed somewhere other than the rules above. */
-export type WriteFailure =
+/** Why the plugin would not begin a change, for reasons the rules above do not cover. */
+export type WriteBlock =
   | 'no-identity'
   | 'wrong-device'
+  /** Another change to this device is still in flight. */
   | 'busy'
-  | 'send-failed'
-  | 'device-rejected';
+  /** A re-read is running, whose baselines an optimistic write would satisfy. */
+  | 'busy-rereading';
 
-export type WriteCode = WriteRefusal | WriteFailure;
+/**
+ * Everything that stops a change before it begins. It is reported beside the payload, never as
+ * the state of a write, because no write started: whatever change the node already had is
+ * untouched and still has to be reported as it stands.
+ */
+export type PreflightRefusal = WriteRefusal | WriteBlock;
+
+/**
+ * Why a change that did begin was turned away. Only these two can reach a write's own status,
+ * which is what makes `refused` mean one thing: the device or the driver said no.
+ */
+export type DeliveryFailure = 'send-failed' | 'device-rejected';
 
 /** What the driver said about delivery, in the three outcomes that change the state. */
 export type Delivery =
-  | { kind: 'refused'; code: WriteFailure }
+  | { kind: 'refused'; code: DeliveryFailure }
   | { kind: 'accepted' }
   | { kind: 'working'; remainingMs: number | null };
 
@@ -268,11 +280,16 @@ export interface WriteToken {
   settledAt: number | null;
   remainingMs: number | null;
   reported: number | null;
-  code: WriteCode | null;
+  code: DeliveryFailure | null;
 }
 
 /** What the section is told about a change, carrying no word the driver wrote. */
 export interface WriteStatus {
+  /**
+   * `refused` is a change that started and was turned away by the driver or the device. A change
+   * the plugin would not begin is not one of these: it never became a write, the write this node
+   * already has is still whatever it was, and the reason travels beside the payload instead.
+   */
   state: WriteState;
   endpoint: number | null;
   parameter: number | null;
@@ -282,7 +299,7 @@ export interface WriteStatus {
   sentAt: number | null;
   settledAt: number | null;
   remainingMs: number | null;
-  code: WriteCode | null;
+  code: DeliveryFailure | null;
 }
 
 const SETTLED: ReadonlySet<WriteState> = new Set<WriteState>([
@@ -345,8 +362,9 @@ export function openWrite(params: {
  *
  * Acceptance is delivery and nothing more, so it never settles a value that can be read back: the
  * device is asked, and what it answers decides. A value the device does not report has nothing
- * that could ask, and for it delivery is the end: it cannot be confirmed, and calling it
- * unconfirmed would describe a silence that was never going to be broken.
+ * that could ask, and for it delivery is the end unless the device says it is still applying the
+ * change: it cannot be confirmed, and calling it unconfirmed would describe a silence that was
+ * never going to be broken. A device still working on it is finished with by the wait, not here.
  */
 export function noteDelivery(token: WriteToken, delivery: Delivery, now: number): WriteToken {
   if (delivery.kind === 'refused') {
@@ -449,6 +467,11 @@ export function notePoll(
   token.state = answered === token.wrote ? 'confirmed' : 'different';
 
   return token;
+}
+
+/** Whether a change is far enough along that reading the device cannot confuse it. */
+export function blocksReReading(token: WriteToken | null): boolean {
+  return token !== null && (token.state === 'queued' || token.state === 'sending' || token.state === 'working');
 }
 
 /** What the section is told, which is nothing at all before anything has been asked for. */

@@ -9,7 +9,8 @@ import fs from 'fs';
 import path from 'path';
 import http from 'http';
 import { EventEmitter } from 'events';
-import { CommandClasses } from '@zwave-js/core';
+import { CommandClasses, MessagePriority } from '@zwave-js/core';
+import { SetValueStatus } from 'zwave-js';
 import { STALL_WINDOW_MS as COVERING_STALL_WINDOW_MS } from '../src/zwave/coveringController';
 
 /** Mirrors the platform's own grace period before the stall clock starts. */
@@ -3161,6 +3162,470 @@ describe('ZWaveUsbPlatform', () => {
       const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
 
       expect(body.refresh).toMatchObject({ state: 'incomplete', completedAt: null });
+    });
+
+    /**
+     * A device that can be written to, with the Set and the Get held open so a test can decide
+     * when each answers and what it says.
+     */
+    const writable = (over: Record<string, unknown> = {}) => {
+      const sets: { valueId: Record<string, unknown>; value: unknown }[] = [];
+      const polls: { valueId: Record<string, unknown>; options: unknown }[] = [];
+      let settleSet: (result: unknown) => void = () => undefined;
+      let answerPoll: (value: unknown) => void = () => undefined;
+      let failPoll: (err: unknown) => void = () => undefined;
+
+      const made = paramNode({
+        setValue: jest.fn().mockImplementation((valueId: Record<string, unknown>, value: unknown) => {
+          sets.push({ valueId, value });
+          return new Promise((resolve) => {
+            settleSet = resolve;
+          });
+        }),
+        pollValue: jest.fn().mockImplementation(
+          (valueId: Record<string, unknown>, options: unknown) => {
+            polls.push({ valueId, options });
+            return new Promise((resolve, reject) => {
+              answerPoll = resolve;
+              failPoll = reject;
+            });
+          },
+        ),
+        ...over,
+      });
+
+      return {
+        ...made,
+        sets,
+        polls,
+        accept: (result: unknown = { status: SetValueStatus.SuccessUnsupervised }) => settleSet(result),
+        /** Answers the Get. `answer` stays the fixture's own, which moves a value's timestamp. */
+        reply: (value: unknown) => answerPoll(value),
+        failPoll: (err: unknown) => failPoll(err),
+      };
+    };
+
+    /** Lets every pending microtask run, which is all the lifecycle ever waits on here. */
+    const settled = async () => {
+      for (let turn = 0; turn < 10; turn += 1) {
+        await Promise.resolve();
+      }
+    };
+
+    const change = (platform: any, node: any, over: Record<string, unknown> = {}) =>
+      driveRoute(platform, '/nodes/10/parameters/value', 'POST', {
+        identity: platform.nodeIdentity(node),
+        endpoint: 0,
+        parameter: 1,
+        bitMask: null,
+        value: 7,
+        expectedValueSize: null,
+        expectedFormat: null,
+        acknowledgeDestructive: false,
+        acknowledgeRequiresReInclusion: false,
+        ...over,
+      });
+
+    /** A platform whose waits pass at once, so a duration does not hold a test up. */
+    const writingPlatform = (node: any) => {
+      const platform = newPlatform(new Map([[10, node]]));
+      platform.pause = jest.fn().mockResolvedValue(undefined);
+
+      return platform;
+    };
+
+    it('answers before the device has, and never waits for the Set', async () => {
+      /**
+       * A sleeping node can leave the Set in its wakeup queue for hours. The request says what is
+       * happening and returns; nothing about it waits for the device.
+       */
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      const { status, body } = await change(platform, device.node);
+
+      expect(status).toBe(200);
+      expect(body.write).toMatchObject({ state: 'sending', wrote: 7, parameter: 1 });
+      expect(device.sets).toHaveLength(1);
+      expect(device.sets[0].value).toBe(7);
+      expect(device.polls).toHaveLength(0);
+    });
+
+    it('asks the device what it holds now, as a query rather than a background poll', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      device.accept();
+      await settled();
+
+      expect(device.polls).toHaveLength(1);
+      expect(device.polls[0].valueId).toMatchObject({
+        commandClass: CommandClasses.Configuration,
+        endpoint: 0,
+        property: 1,
+      });
+      expect(device.polls[0].options).toEqual({
+        priority: MessagePriority.NodeQuery,
+        maxSendAttempts: 3,
+      });
+    });
+
+    it('reads the four answers a device can give as four different outcomes', async () => {
+      const outcomes: Record<string, unknown> = {};
+
+      for (const [name, answer] of [
+        ['confirmed', 7],
+        ['different', 5],
+        ['missing', undefined],
+        ['thrown', 'throw'],
+      ] as [string, unknown][]) {
+        const device = writable();
+        const platform = writingPlatform(device.node);
+
+        await change(platform, device.node);
+        device.accept();
+        await settled();
+
+        if (answer === 'throw') {
+          device.failPoll(new Error('no answer'));
+        } else {
+          device.reply(answer);
+        }
+        await settled();
+
+        outcomes[name] = (await driveRoute(platform, '/nodes/10/parameters', 'GET')).body.write;
+      }
+
+      expect(outcomes.confirmed).toMatchObject({ state: 'confirmed', reported: 7 });
+      expect(outcomes.different).toMatchObject({ state: 'different', reported: 5 });
+      expect(outcomes.missing).toMatchObject({ state: 'unconfirmed', reported: null });
+      expect(outcomes.thrown).toMatchObject({ state: 'unconfirmed', reported: null });
+    });
+
+    it('waits out a device that says it is still applying the change', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      device.accept({
+        status: SetValueStatus.Working,
+        remainingDuration: { toMilliseconds: () => 4_000 },
+      });
+      await settled();
+
+      // The token itself, so the wait can be given up on when the change is let go of.
+      expect(platform.pause).toHaveBeenCalledWith(4_000, platform.parameterWrites.get(10));
+      expect(device.polls).toHaveLength(1);
+    });
+
+    it('says what the driver said about a refusal in the log, and a code to the page', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      device.accept({ status: SetValueStatus.Fail });
+      await settled();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.write).toMatchObject({ state: 'refused', code: 'device-rejected' });
+      expect(device.polls).toHaveLength(0);
+      expect(platform.log.error).toHaveBeenCalledWith(
+        expect.stringContaining('parameter 1 was not set: Fail'),
+      );
+    });
+
+    it('refuses a change it will not begin without touching the change it is making', async () => {
+      /**
+       * A second change is refused because the first is still running. Reporting that by calling
+       * the first refused would tell the page it had finished and let it offer the controls
+       * again.
+       */
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      const second = await change(platform, device.node, { value: 9 });
+
+      expect(second.status).toBe(200);
+      expect(second.body.refusal).toBe('busy');
+      expect(second.body.write).toMatchObject({ state: 'sending', wrote: 7 });
+      expect(device.sets).toHaveLength(1);
+    });
+
+    it('tells a change refused for a re-read apart from one refused for a change', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await askRefresh(platform);
+      const refused = await change(platform, device.node);
+
+      expect(refused.body.refusal).toBe('busy-rereading');
+      expect(device.sets).toHaveLength(0);
+    });
+
+    it('refuses a change that names no device, or another one, and sends nothing', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      const nameless = await change(platform, device.node, { identity: undefined });
+      const other = await change(platform, device.node, { identity: 'someone else' });
+
+      expect(nameless.body.refusal).toBe('no-identity');
+      expect(other.body.refusal).toBe('wrong-device');
+      expect(device.sets).toHaveLength(0);
+    });
+
+    it('refuses a value the device would not take, and sends nothing', async () => {
+      const device = writable({
+        getValueMetadata: () => ({
+          type: 'number',
+          readable: true,
+          writeable: true,
+          label: 'Hold',
+          min: 0,
+          max: 5,
+        }),
+      });
+      const platform = writingPlatform(device.node);
+
+      const { body } = await change(platform, device.node, { value: 9 });
+
+      expect(body.refusal).toBe('out-of-range');
+      expect(device.sets).toHaveLength(0);
+    });
+
+    it('refuses a body that is not an object, once, and sends nothing', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      const bare = await driveRoute(platform, '/nodes/10/parameters/value', 'POST', null);
+      const listed = await driveRoute(platform, '/nodes/10/parameters/value', 'POST', [1, 2]);
+      const counted = await driveRoute(platform, '/nodes/10/parameters/value', 'POST', 7);
+      const worded = await driveRoute(platform, '/nodes/10/parameters/value', 'POST', '"a change"');
+
+      expect([bare.status, listed.status, counted.status, worded.status]).toEqual([
+        400, 400, 400, 400,
+      ]);
+      expect(bare.body.code).toBe('malformed');
+      expect(device.sets).toHaveLength(0);
+    });
+
+    it('leaves no refusal behind on the readings that follow', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node, { identity: 'someone else' });
+      const later = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(later.body.refusal).toBeUndefined();
+    });
+
+    it('does not read the device while a change is on its way to it', async () => {
+      /**
+       * Gets interleaved with the Set would be read against baselines the driver's own optimistic
+       * cache write can satisfy. Once the change is being confirmed the Set is out, and more Gets
+       * can only help.
+       */
+      const counts: Record<string, number> = {};
+      const stages: [string, (d: ReturnType<typeof writable>) => Promise<void>][] = [
+        ['queued', async () => undefined],
+        ['sending', async () => undefined],
+        [
+          'working',
+          async (d) => {
+            d.accept({
+              status: SetValueStatus.Working,
+              remainingDuration: { toMilliseconds: () => 4_000 },
+            });
+            await settled();
+          },
+        ],
+        [
+          'confirming',
+          async (d) => {
+            d.accept();
+            await settled();
+          },
+        ],
+        [
+          'settled',
+          async (d) => {
+            d.accept();
+            await settled();
+            d.reply(7);
+            await settled();
+          },
+        ],
+      ];
+
+      for (const [name, reach] of stages) {
+        const device = writable(
+          name === 'queued' ? { isListening: false, isFrequentListening: false } : {},
+        );
+        const platform = newPlatform(new Map([[10, device.node]]));
+        platform.pause = jest.fn().mockImplementation(() => new Promise(() => undefined));
+
+        await change(platform, device.node);
+        await reach(device);
+        await askRefresh(platform);
+
+        counts[name] = device.node.refreshCCValues.mock.calls.length;
+      }
+
+      expect(counts).toEqual({ queued: 0, sending: 0, working: 0, confirming: 1, settled: 1 });
+    });
+
+    it('asks nothing of a device that was replaced while it was applying a change', async () => {
+      /**
+       * The wait is a timer, and the node can be given away while it runs. A timer that fires for
+       * a change the node no longer has must not put a Get on the network, nor write its answer
+       * into the change that replaced it.
+       */
+      const first = writable();
+      const platform = newPlatform(new Map([[10, first.node]]));
+      let release: () => void = () => undefined;
+      platform.pause = jest
+        .fn()
+        .mockImplementation(() => new Promise<void>((resolve) => {
+          release = resolve;
+        }));
+
+      await change(platform, first.node);
+      first.accept({
+        status: SetValueStatus.Working,
+        remainingDuration: { toMilliseconds: () => 4_000 },
+      });
+      await settled();
+
+      const second = writable();
+      platform.zwaveController.nodes = new Map([[10, second.node]]);
+      await change(platform, second.node);
+
+      release();
+      await settled();
+
+      expect(first.polls).toHaveLength(0);
+      expect(second.polls).toHaveLength(0);
+      expect((await driveRoute(platform, '/nodes/10/parameters', 'GET')).body.write).toMatchObject({
+        state: 'sending',
+        wrote: 7,
+      });
+    });
+
+    it('records nothing for a device that was replaced while the Set was in flight', async () => {
+      /**
+       * The runner spans a send, a wait and a question, and the node can be given away inside any
+       * of them. A Set that settles for the device that has gone must not advance the change, nor
+       * put a Get on the network for the device that is there now.
+       */
+      const first = writable();
+      const platform = writingPlatform(first.node);
+
+      await change(platform, first.node);
+      const stale = platform.parameterWrites.get(10);
+      expect(stale.state).toBe('sending');
+
+      platform.zwaveController.nodes = new Map([[10, writable().node]]);
+      first.accept();
+      await settled();
+
+      expect(stale.state).toBe('sending');
+      expect(first.polls).toHaveLength(0);
+    });
+
+    it('keeps a late answer out of a change the node no longer has', async () => {
+      const first = writable();
+      const platform = writingPlatform(first.node);
+
+      await change(platform, first.node);
+      first.accept();
+      await settled();
+
+      const stale = platform.parameterWrites.get(10);
+      expect(stale.state).toBe('confirming');
+
+      platform.zwaveController.nodes = new Map([[10, writable().node]]);
+      first.reply(7);
+      await settled();
+
+      expect(stale.state).toBe('confirming');
+      expect(stale.reported).toBeNull();
+    });
+
+    it('cannot finish an old re-read by writing to the value it was waiting for', async () => {
+      /**
+       * A re-read that settled short keeps a baseline for the value that never answered. The
+       * driver writes its own optimistic answer into the cache when a Set is accepted, which
+       * advances that value's timestamp, and the next reading would read the move as the device
+       * finally answering: a re-read reported complete on the strength of the plugin's own write.
+       */
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await askRefresh(platform);
+      await device.settleAttempt();
+      expect((await driveRoute(platform, '/nodes/10/parameters', 'GET')).body.refresh).toMatchObject(
+        { state: 'incomplete' },
+      );
+
+      await change(platform, device.node);
+      device.answer(5_000);
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(body.refresh.state).not.toBe('complete');
+      expect(body.refresh.completedAt).toBeNull();
+    });
+
+    it('forgets a change when the node is removed', async () => {
+      const device = writable();
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      expect(platform.parameterWrites.has(10)).toBe(true);
+
+      platform.handleNodeRemoved(device.node);
+
+      expect(platform.parameterWrites.has(10)).toBe(false);
+    });
+
+    it('lets go of a wait when it lets go of the change', async () => {
+      /**
+       * A device may ask for as much as two hours of applying time. A change whose node has gone
+       * must not leave a timer holding that node and its token until the time runs out.
+       */
+      const device = writable();
+      const platform = newPlatform(new Map([[10, device.node]]));
+
+      await change(platform, device.node);
+      device.accept({
+        status: SetValueStatus.Working,
+        remainingDuration: { toMilliseconds: () => 7_200_000 },
+      });
+      await settled();
+
+      expect(platform.pendingWaits.size).toBe(1);
+
+      /**
+       * Unreferenced, so even an uncanceled wait could never be why a bridge stays up. The timer
+       * goes whatever the assertion does: a referenced two-hour timer left behind by a failure
+       * would keep this process alive and hang the run rather than fail it.
+       */
+      const [waiting] = [...platform.pendingWaits.values()];
+
+      try {
+        expect(waiting.timer.hasRef()).toBe(false);
+      } finally {
+        clearTimeout(waiting.timer);
+      }
+
+      platform.handleNodeRemoved(device.node);
+      await settled();
+
+      expect(platform.pendingWaits.size).toBe(0);
+      expect(device.polls).toHaveLength(0);
     });
 
     it('refuses a type saved for the controller, however the request arrives', async () => {
