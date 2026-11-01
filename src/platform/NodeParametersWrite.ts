@@ -229,3 +229,255 @@ export function checkParameterWrite(
 
   return { ok: true, group, value };
 }
+
+/** The plugin is still doing something about this write. */
+export type WriteInFlight = 'queued' | 'sending' | 'working' | 'confirming';
+/** Nothing further will happen to it, and the next write for the node replaces it. */
+export type WriteSettled = 'sent' | 'confirmed' | 'different' | 'unconfirmed' | 'refused';
+export type WriteState = 'idle' | WriteInFlight | WriteSettled;
+
+/** Why a write failed somewhere other than the rules above. */
+export type WriteFailure =
+  | 'no-identity'
+  | 'wrong-device'
+  | 'busy'
+  | 'send-failed'
+  | 'device-rejected';
+
+export type WriteCode = WriteRefusal | WriteFailure;
+
+/** What the driver said about delivery, in the three outcomes that change the state. */
+export type Delivery =
+  | { kind: 'refused'; code: WriteFailure }
+  | { kind: 'accepted' }
+  | { kind: 'working'; remainingMs: number | null };
+
+export interface WriteToken {
+  nodeId: number;
+  /** The node the change was sent to, which is its identity: a number is given away again. */
+  owner: unknown;
+  fingerprint: string | null;
+  endpoint: number;
+  parameter: number;
+  bitMask: number | null;
+  wrote: number;
+  /** False where nothing can confirm it, which makes `sent` the end of the story. */
+  readable: boolean;
+  state: WriteState;
+  sentAt: number | null;
+  settledAt: number | null;
+  remainingMs: number | null;
+  reported: number | null;
+  code: WriteCode | null;
+}
+
+/** What the section is told about a change, carrying no word the driver wrote. */
+export interface WriteStatus {
+  state: WriteState;
+  endpoint: number | null;
+  parameter: number | null;
+  bitMask: number | null;
+  wrote: number | null;
+  reported: number | null;
+  sentAt: number | null;
+  settledAt: number | null;
+  remainingMs: number | null;
+  code: WriteCode | null;
+}
+
+const SETTLED: ReadonlySet<WriteState> = new Set<WriteState>([
+  'sent',
+  'confirmed',
+  'different',
+  'unconfirmed',
+  'refused',
+]);
+
+export function isSettled(state: WriteState): boolean {
+  return SETTLED.has(state);
+}
+
+/**
+ * Where the five-second wait comes from when the device says it is still working but not for how
+ * long. Configuration changes are instant in zwave-js's own words, so a device that reports no
+ * duration is not expected to need one.
+ */
+export const UNKNOWN_DURATION_WAIT_MS = 5_000;
+
+/**
+ * Opens a write, before anything has been sent.
+ *
+ * A device that is asleep has the command waiting in its wakeup queue, which is a different thing
+ * from one in flight and is said differently: nothing is on the network yet and may not be for
+ * hours.
+ */
+export function openWrite(params: {
+  nodeId: number;
+  owner: unknown;
+  fingerprint: string | null;
+  endpoint: number;
+  parameter: number;
+  bitMask: number | null;
+  wrote: number;
+  readable: boolean;
+  listening: boolean;
+}): WriteToken {
+  return {
+    nodeId: params.nodeId,
+    owner: params.owner,
+    fingerprint: params.fingerprint,
+    endpoint: params.endpoint,
+    parameter: params.parameter,
+    bitMask: params.bitMask,
+    wrote: params.wrote,
+    readable: params.readable,
+    state: params.listening ? 'sending' : 'queued',
+    sentAt: null,
+    settledAt: null,
+    remainingMs: null,
+    reported: null,
+    code: null,
+  };
+}
+
+/**
+ * Records what the driver made of the command.
+ *
+ * Acceptance is delivery and nothing more, so it never settles a value that can be read back: the
+ * device is asked, and what it answers decides. A value the device does not report has nothing
+ * that could ask, and for it delivery is the end: it cannot be confirmed, and calling it
+ * unconfirmed would describe a silence that was never going to be broken.
+ */
+export function noteDelivery(token: WriteToken, delivery: Delivery, now: number): WriteToken {
+  if (delivery.kind === 'refused') {
+    token.state = 'refused';
+    token.code = delivery.code;
+    token.settledAt = now;
+
+    return token;
+  }
+
+  token.sentAt = now;
+
+  /**
+   * A device still applying the change is not finished with it, whether or not the value can be
+   * read back. Ending here would settle the write while the device is working on it, and a
+   * settled write is one the next write may replace: a second change could go out while the
+   * first was still being applied.
+   */
+  if (delivery.kind === 'working') {
+    token.state = 'working';
+    token.remainingMs = delivery.remainingMs;
+
+    return token;
+  }
+
+  if (!token.readable) {
+    token.state = 'sent';
+    token.settledAt = now;
+
+    return token;
+  }
+
+  token.state = 'confirming';
+
+  return token;
+}
+
+/** How long to leave a device that is still applying the change before asking it. */
+export function confirmAfterMs(token: WriteToken): number {
+  return token.state === 'working' && isInteger(token.remainingMs) && token.remainingMs > 0
+    ? token.remainingMs
+    : UNKNOWN_DURATION_WAIT_MS;
+}
+
+/**
+ * The device has had the time it asked for.
+ *
+ * A value that can be read back is now asked about. One that cannot has nothing to ask and
+ * nothing left to wait for, so this is where it ends: the change was sent, the device said it had
+ * finished applying it, and no report will ever say more than that.
+ */
+export function noteWorkingElapsed(token: WriteToken, now: number): WriteToken {
+  if (token.state !== 'working') {
+    return token;
+  }
+
+  token.remainingMs = null;
+
+  if (!token.readable) {
+    token.state = 'sent';
+    token.settledAt = now;
+
+    return token;
+  }
+
+  token.state = 'confirming';
+
+  return token;
+}
+
+/**
+ * Records what the device answered when it was asked.
+ *
+ * The number it reports is the only evidence there is. The driver writes its own optimistic
+ * answer into the cache after an accepted write and nothing marks it as the driver's, so a value
+ * read from there would confirm the plugin's own guess. This reads the answer to a Get.
+ *
+ * A device that answers with another number has said something, and saying so is better than
+ * reporting silence: what it reports is carried for the section to show. Nothing here says the
+ * device applied it, only that it reported it.
+ */
+export function notePoll(
+  token: WriteToken,
+  answered: number | null | undefined,
+  now: number,
+): WriteToken {
+  if (token.state !== 'confirming') {
+    return token;
+  }
+
+  token.settledAt = now;
+
+  if (!isInteger(answered)) {
+    token.state = 'unconfirmed';
+
+    return token;
+  }
+
+  token.reported = answered;
+  token.state = answered === token.wrote ? 'confirmed' : 'different';
+
+  return token;
+}
+
+/** What the section is told, which is nothing at all before anything has been asked for. */
+export function writeStatus(token: WriteToken | null): WriteStatus {
+  if (!token) {
+    return {
+      state: 'idle',
+      endpoint: null,
+      parameter: null,
+      bitMask: null,
+      wrote: null,
+      reported: null,
+      sentAt: null,
+      settledAt: null,
+      remainingMs: null,
+      code: null,
+    };
+  }
+
+  return {
+    state: token.state,
+    endpoint: token.endpoint,
+    parameter: token.parameter,
+    bitMask: token.bitMask,
+    wrote: token.wrote,
+    reported: token.reported,
+    sentAt: token.sentAt,
+    settledAt: token.settledAt,
+    remainingMs: token.remainingMs,
+    code: token.code,
+  };
+}
