@@ -139,6 +139,34 @@ describe('ZWaveUsbPlatform', () => {
     expect(platform).toBeInstanceOf(ZWaveUsbPlatform);
   });
 
+  it('says nothing ordinary about skipping the controller node', () => {
+    /**
+     * Node 1 is the controller and is published by its own accessory, so the generic path always
+     * skips it. Two handlers reach that skip during a single startup, so saying it at info
+     * reported an internal decision twice, to a reader who can do nothing about it.
+     */
+    const log = {
+      debug: jest.fn(),
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    } as any;
+    const config: PlatformConfig = {
+      platform: PLATFORM_NAME,
+      name: 'Z-Wave USB',
+      serialPort: '/dev/null',
+    };
+    const platform = new ZWaveUsbPlatform(log, config, api);
+
+    (platform as any).syncNodeAccessory({ nodeId: 1 });
+    (platform as any).syncNodeAccessory({ nodeId: 1 });
+
+    const said = (level: jest.Mock) =>
+      level.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+    expect(said(log.info)).not.toContain('Skipping generic accessory creation');
+    expect(said(log.debug)).toContain('Skipping generic accessory creation');
+  });
+
   it('should initialize the IPC server', (done) => {
     const log = {
       debug: jest.fn(),

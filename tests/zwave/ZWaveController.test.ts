@@ -1110,4 +1110,109 @@ describe('ZWaveController (Direct Mode)', () => {
       );
     });
   });
+
+  describe('what startup writes to the log', () => {
+    const infoText = () => log.info.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+
+    const addNode = (over: Record<string, unknown> = {}) => {
+      const node = new EventEmitter() as any;
+      node.nodeId = 4;
+      node.status = 0; // Unknown, which is what every node reports before it is interviewed
+      node.interviewStage = 5;
+      node.ready = false;
+      Object.assign(node, over);
+      mockDriver.controller.emit('node added', node);
+
+      return node;
+    };
+
+    it('gives the Home ID in both bases, so it can be matched to the driver cache', async () => {
+      mockDriver.controller.homeId = 3563963922;
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+
+      await controller.start();
+
+      expect(infoText()).toContain('Controller Home ID: 3563963922 (0xd46dc612)');
+    });
+
+    it('gives what it has when the Home ID is not known yet', async () => {
+      /**
+       * The driver reports the Home ID as MaybeNotKnown, so the line can be written before
+       * there is one. Converting it to a base would throw inside the driver-ready handler,
+       * which is also where every other controller listener is registered, so one missing
+       * number would cost the inclusion and node events rather than a single log line.
+       */
+      mockDriver.controller.homeId = undefined;
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+
+      // The line is written when the driver reports ready; start() goes on to wait for a
+      // Home ID, so the mock reports one once the line under test has been written.
+      const started = controller.start();
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      mockDriver.controller.homeId = 1;
+      await started;
+
+      expect(infoText()).toContain('Controller Home ID: undefined');
+      expect(infoText()).not.toContain('(0x');
+    });
+
+    it('leaves the status out while it is still unknown', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      addNode();
+
+      expect(infoText()).toContain('added to controller (Interview Stage: 5)');
+      expect(infoText()).not.toContain('Status: Unknown');
+    });
+
+    it('gives the status once the node reports one', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      addNode({ status: 4 });
+
+      expect(infoText()).toContain('added to controller (Status: Alive, Interview Stage: 5)');
+    });
+
+    it('keeps a device serial number out of the ordinary log', async () => {
+      /**
+       * A serial number identifies a particular piece of a household's hardware. It is useful to
+       * someone diagnosing that device and to nobody else, so it belongs behind the debug option
+       * rather than in a log that gets attached to issue reports.
+       */
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode({
+        ready: true,
+        supportsCC: () => true,
+        commandClasses: {
+          'Manufacturer Specific': {
+            deviceSpecificGet: jest.fn().mockResolvedValue('SN-0042-ABCDEF'),
+          },
+        },
+      });
+      node.emit('ready');
+      await new Promise((resolve) => setImmediate(resolve));
+
+      expect(infoText()).not.toContain('SN-0042-ABCDEF');
+      expect(
+        log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n'),
+      ).toContain('SN-0042-ABCDEF');
+    });
+
+    it('keeps the plugin\u2019s own bookkeeping out of the ordinary log', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode({ ready: true });
+      node.emit('ready');
+
+      const written = infoText();
+      expect(written).not.toContain('registered with event listeners');
+      expect(written).not.toContain('already ready, emitting');
+      expect(written).not.toContain('is ready (Interview Stage');
+    });
+  });
 });

@@ -624,7 +624,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
   private syncNodeAccessory(node: IZWaveNode) {
     // Skip Node 1 (the controller itself) as it's handled by ControllerAccessory
     if (Number(node.nodeId) === 1) {
-      this.log.info(
+      this.log.debug(
         'System: Controller node (Node 1) identified. Skipping generic accessory creation.',
       );
       return;

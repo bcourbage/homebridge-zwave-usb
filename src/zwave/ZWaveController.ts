@@ -106,7 +106,18 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
         if (!this.driver) {
           return;
         }
-        this.log.info(`Controller Home ID: ${this.driver.controller.homeId}`);
+        const homeId = this.driver.controller.homeId;
+        /**
+         * Both bases, because the two places a reader meets this number disagree: the driver
+         * names its network cache file in lowercase hex while this line used to print decimal.
+         * The driver reports the number as possibly not known yet, and this handler registers
+         * every other controller listener, so the conversion is guarded rather than risked.
+         */
+        this.log.info(
+          `Controller Home ID: ${homeId}${
+            typeof homeId === 'number' ? ` (0x${homeId.toString(16)})` : ''
+          }`,
+        );
 
         this.controllerListeners = {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -244,12 +255,13 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
     const statusMap = ['Unknown', 'Asleep', 'Awake', 'Dead', 'Alive'];
     const status = statusMap[node.status] || node.status.toString();
     const nodeName = node.name || node.label || node.deviceConfig?.label || `Node ${node.nodeId}`;
+    const knownStatus = status === 'Unknown' ? '' : `Status: ${status}, `;
     this.log.info(
-      `Node ${node.nodeId} (${nodeName}) added to controller (Status: ${status}, Interview Stage: ${node.interviewStage})`,
+      `Node ${node.nodeId} (${nodeName}) added to controller (${knownStatus}Interview Stage: ${node.interviewStage})`,
     );
 
     const onReady = () => {
-      this.log.info(`Node ${node.nodeId} is ready (Interview Stage: ${node.interviewStage})`);
+      this.log.debug(`Node ${node.nodeId} is ready (Interview Stage: ${node.interviewStage})`);
       this.emit('status updated', `Node ${node.nodeId} Ready`);
       this.emit('node ready', node);
       void this.refreshNodeDeviceSerialNumber(node);
@@ -348,10 +360,10 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
     node.on('firmware update progress', onFirmwareUpdateProgress);
     node.on('firmware update finished', onFirmwareUpdateFinished);
 
-    this.log.info(`Node ${node.nodeId} registered with event listeners (ready: ${node.ready})`);
+    this.log.debug(`Node ${node.nodeId} registered with event listeners (ready: ${node.ready})`);
 
     if (node.ready) {
-      this.log.info(`Node ${node.nodeId} is already ready, emitting node ready immediately`);
+      this.log.debug(`Node ${node.nodeId} is already ready, emitting node ready immediately`);
       this.emit('node ready', node);
       void this.refreshNodeDeviceSerialNumber(node);
     }
@@ -400,7 +412,7 @@ export class ZWaveController extends EventEmitter implements IZWaveController {
       }
 
       (node as ZWaveNode & { deviceSerialNumber?: string }).deviceSerialNumber = deviceSerialNumber;
-      this.log.info(`Node ${node.nodeId} reported device serial number: ${deviceSerialNumber}`);
+      this.log.debug(`Node ${node.nodeId} reported device serial number: ${deviceSerialNumber}`);
       this.emit('node updated', node);
     } catch (err) {
       this.log.debug(`Node ${node.nodeId} did not provide a device serial number yet: ${err}`);
