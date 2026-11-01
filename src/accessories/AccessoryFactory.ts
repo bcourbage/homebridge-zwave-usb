@@ -289,7 +289,7 @@ export class AccessoryFactory {
   /**
    * The kinds an override removes together with the primary.
    *
-   * Colour and brightness share one Lightbulb service today, so replacing the colour control
+   * Color and brightness share one Lightbulb service today, so replacing the color control
    * has to take the brightness control with it or a second feature would be left writing to a
    * service that no longer exists. A thermostat is the opposite case: its suppressed
    * temperature sensor is not part of it, and is handed back as an ordinary sensor on override.

@@ -984,7 +984,7 @@ export class ZWaveUsbPlatform implements DynamicPlatformPlugin {
        * exists to prevent.
        *
        * A cohort node the decision does not change is then left alone rather than synced and
-       * compared afterwards. The sync reaches `updateNode` and `refresh` on its way past an
+       * compared afterward. The sync reaches `updateNode` and `refresh` on its way past an
        * accessory it will not replace, and either can throw, which would report a rebuild
        * failure for a node that was never going to be rebuilt. Planning can throw too, and a
        * plan that cannot be read is no reason to skip, so it falls through to the sync and the

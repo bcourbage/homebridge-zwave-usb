@@ -886,7 +886,7 @@
       /**
        * What each section is made of when it holds nothing, read from the markup once rather
        * than written out again here. A section whose own structure was emptied along with its
-       * contents could not be drawn into afterwards: the Device type section is two hosts, one
+       * contents could not be drawn into afterward: the Device type section is two hosts, one
        * for what the plugin reports and one for the decision being made.
        */
       const SECTION_SKELETON = new Map(
@@ -1908,7 +1908,7 @@
       /**
        * The covering controls on the node's page. The generation is kept per node rather than
        * shared with the dialog's counter, which a closing dialog bumps: that would drop the
-       * result of a move started here the moment the reader opened and cancelled Rename, and
+       * result of a move started here the moment the reader opened and canceled Rename, and
        * leave the controls disabled with nothing coming to enable them.
        *
        * It is also not bumped when the reader leaves the node, so a move started here is still

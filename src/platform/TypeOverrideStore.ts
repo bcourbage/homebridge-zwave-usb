@@ -153,7 +153,7 @@ function findProblem(parsed: unknown, homeId: string): StoreProblem | undefined 
       return invalidData('an observation records an unreadable orphan time');
     }
 
-    // Acknowledgement names one record by its identifier, so two records cannot share one.
+    // Acknowledgment names one record by its identifier, so two records cannot share one.
     if (seenIds.has(observation.id)) {
       return invalidData('two observations share an identifier');
     }
@@ -225,7 +225,7 @@ export class TypeOverrideStore {
 
   /**
    * Reads the file. Synchronous because every classification that follows depends on it: loading
-   * it afterwards would publish the detected graph first and rebuild it immediately.
+   * it afterward would publish the detected graph first and rebuild it immediately.
    */
   public load(): void {
     let contents: string;

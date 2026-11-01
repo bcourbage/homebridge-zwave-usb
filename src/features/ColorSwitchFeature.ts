@@ -10,8 +10,8 @@ import { ZWaveValueEvent } from '../zwave/interfaces';
  */
 export class ColorSwitchFeature extends BaseFeature {
   /**
-   * Colour alone is not enough: on/off and brightness always go through Multilevel Switch, so a
-   * device with colour values and no switch values would publish a light that cannot be lit.
+   * Color alone is not enough: on/off and brightness always go through Multilevel Switch, so a
+   * device with color values and no switch values would publish a light that cannot be lit.
    */
   public static canBePrimary(node: IZWaveNode, endpoint: Endpoint): boolean {
     const values = definedValues(node, endpoint.index);

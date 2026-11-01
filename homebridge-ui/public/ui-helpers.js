@@ -1145,7 +1145,7 @@
         },
         acknowledge: 'Acknowledge hardware change',
         /**
-         * The acknowledgement is answered against the fingerprint the node reports now, so
+         * The acknowledgment is answered against the fingerprint the node reports now, so
          * there is nothing to send while a re-interview has left it without one. The section
          * already says the interview has to finish first.
          */
