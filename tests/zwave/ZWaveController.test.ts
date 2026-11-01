@@ -1135,25 +1135,26 @@ describe('ZWaveController (Direct Mode)', () => {
       expect(infoText()).toContain('Controller Home ID: 3563963922 (0xd46dc612)');
     });
 
-    it('gives what it has when the Home ID is not known yet', async () => {
+    it('waits for a Home ID rather than reporting that it has none', async () => {
       /**
-       * The driver reports the Home ID as MaybeNotKnown, so the line can be written before
-       * there is one. Converting it to a base would throw inside the driver-ready handler,
-       * which is also where every other controller listener is registered, so one missing
-       * number would cost the inclusion and node events rather than a single log line.
+       * The driver reports the Home ID as possibly not known, and it is still unknown when the
+       * driver says it is ready. Writing the line there would print `undefined` to a reader who
+       * can do nothing with it, so it is written once startup has a number.
        */
       mockDriver.controller.homeId = undefined;
       controller = new ZWaveController(log, '/dev/ttyACM0');
 
-      // The line is written when the driver reports ready; start() goes on to wait for a
-      // Home ID, so the mock reports one once the line under test has been written.
       const started = controller.start();
       await new Promise((resolve) => setTimeout(resolve, 50));
+
+      // The driver has reported ready by now, which is where the line used to be written.
+      expect(infoText()).not.toContain('Controller Home ID');
+
       mockDriver.controller.homeId = 1;
       await started;
 
-      expect(infoText()).toContain('Controller Home ID: undefined');
-      expect(infoText()).not.toContain('(0x');
+      expect(infoText()).toContain('Controller Home ID: 1 (0x1)');
+      expect(infoText()).not.toContain('undefined');
     });
 
     it('leaves the status out while it is still unknown', async () => {
@@ -1162,7 +1163,7 @@ describe('ZWaveController (Direct Mode)', () => {
 
       addNode();
 
-      expect(infoText()).toContain('added to controller (Interview Stage: 5)');
+      expect(infoText()).toContain('Node 4 joined the network (Interview Stage: 5)');
       expect(infoText()).not.toContain('Status: Unknown');
     });
 
@@ -1172,14 +1173,14 @@ describe('ZWaveController (Direct Mode)', () => {
 
       addNode({ status: 4 });
 
-      expect(infoText()).toContain('added to controller (Status: Alive, Interview Stage: 5)');
+      expect(infoText()).toContain('Node 4 joined the network (Status: Alive, Interview Stage: 5)');
     });
 
-    it('keeps a device serial number out of the ordinary log', async () => {
+    it('never writes a device serial number, at any level', async () => {
       /**
-       * A serial number identifies a particular piece of a household's hardware. It is useful to
-       * someone diagnosing that device and to nobody else, so it belongs behind the debug option
-       * rather than in a log that gets attached to issue reports.
+       * A serial number identifies one particular piece of a household's hardware, and debug
+       * logs are the ones people attach to issue reports. That a device reported one is worth
+       * saying, because it tells a reader the request succeeded; the number is not.
        */
       controller = new ZWaveController(log, '/dev/ttyACM0');
       await controller.start();
@@ -1196,10 +1197,151 @@ describe('ZWaveController (Direct Mode)', () => {
       node.emit('ready');
       await new Promise((resolve) => setImmediate(resolve));
 
-      expect(infoText()).not.toContain('SN-0042-ABCDEF');
-      expect(
-        log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n'),
-      ).toContain('SN-0042-ABCDEF');
+      const everything = (['debug', 'info', 'warn', 'error'] as const)
+        .flatMap((level) => log[level].mock.calls.flat())
+        .map((entry: unknown) => String(entry))
+        .join('\n');
+
+      expect(everything).not.toContain('SN-0042-ABCDEF');
+
+      // That one arrived is bookkeeping, so it belongs with the rest of the telemetry
+      // rather than beside the outcomes a reader is looking for.
+      const debugged = log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(debugged).toContain('Node 4 reported a device serial number');
+      expect(infoText()).not.toContain('reported a device serial number');
+    });
+
+    it('treats losing a node as degradation and getting it back as recovery', async () => {
+      // An unreachable node is the plugin continuing in a degraded state, which is what warn
+      // is for. Its return is an outcome worth reporting rather than a problem.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode();
+      node.emit('dead');
+      node.emit('alive');
+
+      const warned = log.warn.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(warned).toContain('Node 4 is not responding');
+      expect(infoText()).toContain('Node 4 is responding again');
+      expect(infoText()).not.toContain('not responding');
+    });
+
+    it('says once that a node joined, and does not say it twice', async () => {
+      // Counting only the new phrasing would miss a second line that used different words,
+      // so this counts every info line that mentions the node at all.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+      log.info.mockClear();
+
+      const node = addNode({ status: 4, name: 'Hall' });
+
+      const aboutNode = log.info.mock.calls
+        .flat()
+        .map((e: unknown) => String(e))
+        .filter((line: string) => line.includes('Node 4'));
+
+      expect(aboutNode).toHaveLength(1);
+      expect(aboutNode[0]).toContain('Node 4 (Hall) joined the network');
+      expect(aboutNode[0]).toContain('Status: Alive, Interview Stage: 5');
+      expect(aboutNode[0]).not.toContain('added to controller');
+    });
+
+    it('does not announce the existing network as newly joined', async () => {
+      /**
+       * Startup walks every node the controller already knows through the same code as a node
+       * that has just arrived. Those devices have been on the network for months.
+       */
+      const existing = new EventEmitter() as any;
+      existing.nodeId = 4;
+      existing.status = 4;
+      existing.interviewStage = 5;
+      existing.name = 'Hall';
+      mockDriver.controller.nodes = new Map([[4, existing]]);
+
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const aboutNode = log.info.mock.calls
+        .flat()
+        .map((e: unknown) => String(e))
+        .filter((line: string) => line.includes('Node 4'));
+
+      expect(aboutNode).toHaveLength(1);
+      expect(aboutNode[0]).toContain('Node 4 (Hall) is on the network');
+      expect(aboutNode[0]).not.toContain('joined');
+    });
+
+    it('names the device when it leaves, and says it once', async () => {
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode({ status: 4, name: 'Hall' });
+      log.info.mockClear();
+      mockDriver.controller.emit('node removed', node);
+
+      const aboutNode = log.info.mock.calls
+        .flat()
+        .map((e: unknown) => String(e))
+        .filter((line: string) => line.includes('Node 4'));
+
+      expect(aboutNode).toHaveLength(1);
+      expect(aboutNode[0]).toBe('Node 4 (Hall) removed from the network');
+    });
+
+    it('never says a node was added to the controller', async () => {
+      // The phrase named an internal component and was written beside a second line that
+      // said the same thing with more detail.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode({ status: 4, name: 'Hall' });
+      mockDriver.controller.emit('node removed', node);
+
+      const everything = (['debug', 'info', 'warn', 'error'] as const)
+        .flatMap((level) => log[level].mock.calls.flat())
+        .map((e: unknown) => String(e))
+        .join('\n');
+
+      expect(everything).not.toContain('added to controller');
+      expect(everything).not.toContain('removed from controller');
+    });
+
+    it('keeps routine node telemetry at debug', async () => {
+      // Interview progress and a battery device's sleep cycle are continuous and say nothing
+      // about a change the reader asked for.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode();
+      node.emit('interview stage completed', node, 'NodeInfo');
+      node.emit('wake up');
+      node.emit('sleep');
+
+      const written = infoText();
+      expect(written).not.toContain('interview stage completed');
+      expect(written).not.toContain('woken up');
+      expect(written).not.toContain('gone to sleep');
+
+      const debugged = log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(debugged).toContain('interview stage completed: NodeInfo');
+      expect(debugged).toContain('has woken up');
+      expect(debugged).toContain('has gone to sleep');
+    });
+
+    it('does not claim that sleeping and waking control the interview', async () => {
+      // The driver resumes an interview on its own schedule. These lines only report what the
+      // radio did, so they should not describe what they do not govern.
+      controller = new ZWaveController(log, '/dev/ttyACM0');
+      await controller.start();
+
+      const node = addNode();
+      node.emit('wake up');
+      node.emit('sleep');
+
+      const debugged = log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(debugged).not.toContain('Interview will resume');
+      expect(debugged).not.toContain('Interview is paused');
     });
 
     it('keeps the plugin\u2019s own bookkeeping out of the ordinary log', async () => {

@@ -2098,4 +2098,53 @@ describe('ZWaveUsbPlatform', () => {
       expect(body.error).toContain('Controller');
     });
   });
+
+  describe('what the platform keeps out of the ordinary log', () => {
+    it('does not repeat a node arriving or leaving', () => {
+      // The controller reports both transitions with the node's name and interview stage.
+      // The platform following along is bookkeeping.
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+
+      const platform = new ZWaveUsbPlatform(log, config, api);
+      const controller = (platform as any).zwaveController;
+      controller.homeId = 100;
+
+      const node = { nodeId: 9, name: 'Hall', ready: false, status: 1 };
+      controller.emit('node added', node);
+      controller.emit('node removed', node);
+
+      const written = log.info.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(written).not.toContain('added');
+      expect(written).not.toContain('removed');
+
+      const debugged = log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(debugged).toContain('Node 9 added; waiting for the interview to complete');
+      expect(debugged).toContain('Node 9 removed');
+    });
+
+    it('restores the accessory cache quietly', () => {
+      // Homebridge restores every accessory on every restart. One line each says nothing
+      // about this run that the accessories themselves do not.
+      const log = { debug: jest.fn(), info: jest.fn(), warn: jest.fn(), error: jest.fn() } as any;
+      const config: PlatformConfig = {
+        platform: PLATFORM_NAME,
+        name: 'Z-Wave USB',
+        serialPort: '/dev/null',
+      };
+
+      const platform = new ZWaveUsbPlatform(log, config, api);
+      platform.configureAccessory({ displayName: 'Hall Light', UUID: 'u', context: {} } as any);
+
+      const written = log.info.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(written).not.toContain('Loading accessory from cache');
+
+      const debugged = log.debug.mock.calls.flat().map((e: unknown) => String(e)).join('\n');
+      expect(debugged).toContain('Loading accessory from cache');
+    });
+  });
 });
