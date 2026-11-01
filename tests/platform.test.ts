@@ -3271,6 +3271,36 @@ describe('ZWaveUsbPlatform', () => {
       });
     });
 
+    it('is not confirmed by the driver writing its own answer into the cache', async () => {
+      /**
+       * zwave-js writes the caller's own value into the value DB once a Set is accepted, and
+       * moves that value's timestamp with it. Nothing in that exchange came from the device, so
+       * no reading of the cache and no timestamp can confirm a change: only the number a Get
+       * returns can. A driver that updates its cache and never answers the Get must leave the
+       * change waiting rather than call it applied.
+       */
+      let cached = 5;
+      let stamp = 1_000;
+      const device = writable({
+        getValue: () => cached,
+        getValueTimestamp: () => stamp,
+      });
+      const platform = writingPlatform(device.node);
+
+      await change(platform, device.node);
+      // The driver's optimistic write, which is what the page would be reading from here on.
+      cached = 7;
+      stamp = 2_000;
+      device.accept();
+      await settled();
+
+      const { body } = await driveRoute(platform, '/nodes/10/parameters', 'GET');
+
+      expect(device.polls).toHaveLength(1);
+      expect(body.groups[0].values[0]).toMatchObject({ value: 7, reportedAt: 2_000 });
+      expect(body.write).toMatchObject({ state: 'confirming', wrote: 7, reported: null });
+    });
+
     it('reads the four answers a device can give as four different outcomes', async () => {
       const outcomes: Record<string, unknown> = {};
 
