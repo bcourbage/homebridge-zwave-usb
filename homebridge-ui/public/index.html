@@ -193,6 +193,21 @@
     .parameter-raw { font-weight: 400; opacity: 0.75; margin-left: 6px; }
     .parameter-rows { display: flex; flex-wrap: wrap; gap: 4px 16px; margin-top: 2px; }
     .parameter-marks { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+    .parameter-editor { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+    .parameter-editor .form-control { width: auto; min-width: 110px; max-width: 220px; }
+    .parameter-confirm {
+      margin-top: 6px;
+      padding: 8px;
+      border: 1px solid rgba(127, 127, 127, 0.4);
+      border-radius: 4px;
+    }
+    .parameter-confirm-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+    .parameter-said { margin-top: 4px; }
+    /* The tones the marks already use, so one parameter does not speak in two color schemes. */
+    .parameter-said-caution { color: #8a4b00 !important; }
+    .parameter-said-danger { color: #a71d2a !important; }
+    body.dark-mode #maintenance .parameter-said-caution { color: #e8a33d !important; }
+    body.dark-mode #maintenance .parameter-said-danger { color: #ea868f !important; }
     /*
      * Mark colors, measured against the card each theme puts this page on: #fff under the
      * light themes and #2b2b2b under the dark ones. The two a reader has to act on carry their
@@ -462,8 +477,10 @@
               <button type="button" class="btn btn-sm btn-outline-secondary" id="parametersAdvanced"
                 aria-expanded="false" aria-controls="parametersList" style="display: none;"></button>
               <button type="button" class="btn btn-sm btn-outline-primary" id="parametersReread"
-                style="display: none;"></button>
+                aria-describedby="parametersRereadNote" style="display: none;"></button>
             </div>
+            <div class="small text-muted mt-2" id="parametersRereadNote"
+              style="display: none;"></div>
             <div class="small text-muted mt-2" id="parametersStatus"></div>
             <div class="small text-muted" id="parametersCount"></div>
             <div id="parametersList" class="mt-2"></div>
@@ -477,6 +494,7 @@
           -->
           <div id="typeAnnounce" class="sr-only" role="status" aria-live="polite"></div>
           <div id="parametersAnnounce" class="sr-only" role="status" aria-live="polite"></div>
+          <div id="parametersChangeAnnounce" class="sr-only" role="status" aria-live="polite"></div>
         </div>
       </div>
     </div>
@@ -917,6 +935,7 @@
         parametersSearch = '';
         parametersShowAdvanced = false;
         document.getElementById('parameterSearch').value = '';
+        clearParameterEditors();
         selectNodeSection('type');
         renderDiagnosticsSection();
         // Read here rather than on entering the section, so the tab carries its count before a
@@ -1005,6 +1024,7 @@
           parametersDrawn = null;
           clearTypeAnnounce();
           clearParametersAnnounce();
+          clearParameterEditors();
         }
       };
 
@@ -1628,6 +1648,25 @@
       let parametersSearch = '';
       let parametersShowAdvanced = false;
 
+      /**
+       * The reader's half of the section: what they have typed into a field, what they are being
+       * asked to agree to, and what the plugin said about the last change they asked for.
+       *
+       * All of it is the browser's. The payload underneath is replaced every five seconds while
+       * a change is being applied, and a reader halfway through choosing a value would lose it.
+       */
+      const parameterEdits = new Map();
+      const parameterRefusals = new Map();
+      let parameterConfirm = null;
+      let parameterSaving = false;
+      /** Which confirmation was on screen last, so that opening one can take the keyboard. */
+      let parameterConfirmDrawn = null;
+      /**
+       * The value whose status the keyboard is owed, where answering a confirmation took the
+       * controls it was on away before there was anything to say about what it did.
+       */
+      let parameterLanding = null;
+
       /** Set between asking for a re-read and the answer, which refuses the control meanwhile. */
       let parametersAsking = false;
 
@@ -1641,7 +1680,18 @@
        */
       let parametersStatusSaid = null;
 
+      /** What the running change last said it was doing, which is not always what was said. */
+      let parametersChangeWrote = null;
+      /** The one announcement waiting to be made, which anything newer puts out of date. */
+      let parametersChangeTimer = null;
+
       const clearParametersAnnounce = () => {
+        window.clearTimeout(parametersChangeTimer);
+        parametersChangeTimer = null;
+        const change = document.getElementById('parametersChangeAnnounce');
+        if (change) change.textContent = '';
+        parametersChangeWrote = null;
+
         const region = document.getElementById('parametersAnnounce');
         if (region) region.textContent = '';
         parametersStatusSaid = null;
@@ -1667,7 +1717,246 @@
                .map((mark) => uiHelpers.escapeHtml(mark.explanation))
                .join(' ')}</div>`;
 
-      const parameterFieldHtml = (field, divided) => `
+      /** Everything the reader typed or was told is forgotten along with the node it was about. */
+      const clearParameterEditors = () => {
+        parameterEdits.clear();
+        parameterRefusals.clear();
+        parameterConfirm = null;
+        parameterConfirmDrawn = null;
+        parameterLanding = null;
+      };
+
+      /** What to call the device in a sentence, which is what the list calls it. */
+      const parameterDeviceName = (nodeId) => {
+        const node = lastNodes.find((one) => String(one.nodeId) === String(nodeId));
+
+        return node ? uiHelpers.describeNodeHeader(node).name : `Node ${nodeId}`;
+      };
+
+      /**
+       * What a field holds before the reader has touched it, which is the device's own value.
+       *
+       * A device can report a value its own list does not contain, and nothing is chosen for
+       * the reader there. The list stands at no selection and Save is refused until they pick
+       * one, because a list that had quietly moved to its first entry would send a number
+       * nobody chose to a device the reader was only looking at.
+       */
+      const parameterDefaultText = (editor) => {
+        if (editor.kind === 'choice') {
+          return editor.options.some((option) => option.value === editor.current)
+            ? String(editor.current)
+            : '';
+        }
+
+        return editor.current === null || editor.current === undefined
+          ? ''
+          : String(editor.current);
+      };
+
+      const parameterNumberBound = (name, one) =>
+        typeof one === 'number' && Number.isFinite(one) ? ` ${name}="${one}"` : '';
+
+      /**
+       * The control itself, holding what the reader typed rather than what the device reports,
+       * so that a redraw underneath them keeps their half-written number.
+       */
+      const parameterControlHtml = (field, typed, busy, label, describedBy) => {
+        const key = uiHelpers.escapeHtml(field.key);
+        const held = `${describedBy ? ` aria-describedby="${describedBy}"` : ''}${
+          busy ? ' disabled' : ''
+        }`;
+
+        if (field.editor.kind === 'choice') {
+          /**
+           * An entry that cannot be chosen, for a list the device has not put anywhere. It says
+           * what is wanted rather than standing empty, because a list read aloud as blank says
+           * only that something is missing.
+           */
+          const unset =
+            typed === '' ? '<option value="" selected disabled>Choose a value</option>' : '';
+
+          return `<select class="form-control form-control-sm" data-parameter-key="${key}"
+              aria-label="${label}"${held}>${unset}${field.editor.options
+                .map(
+                  (option) =>
+                    `<option value="${uiHelpers.escapeHtml(String(option.value))}"${
+                      String(option.value) === typed ? ' selected' : ''
+                    }>${uiHelpers.escapeHtml(option.label)}</option>`,
+                )
+                .join('')}</select>`;
+        }
+
+        return `<input type="number" class="form-control form-control-sm"
+            data-parameter-key="${key}" value="${uiHelpers.escapeHtml(typed)}"
+            aria-label="${label}"${parameterNumberBound('min', field.editor.min)}${
+              parameterNumberBound('max', field.editor.max)
+            }${parameterNumberBound('step', field.editor.step)}${held}>`;
+      };
+
+      /** What the reader is asked to agree to, drawn where the change they asked for is. */
+      const parameterConfirmHtml = (field, nodeId, label) => {
+        const asking = uiHelpers.describeParameterConfirmation(
+          field.risks,
+          parameterDeviceName(nodeId),
+          field.name,
+        );
+        if (!asking) return '';
+
+        const key = uiHelpers.escapeHtml(field.key);
+
+        /**
+         * The warning is named by the control that acts on it, so that the keyboard arriving on
+         * Change it brings the warning with it. One confirmation is open at a time, which is
+         * what lets the text be found by a fixed name.
+         */
+        return `<div class="parameter-confirm">
+            <div class="small" id="parameterConfirmText">${uiHelpers.escapeHtml(asking.text)}</div>
+            <div class="parameter-confirm-actions">
+              <button type="button" class="btn btn-sm btn-danger"
+                aria-describedby="parameterConfirmText"
+                data-parameter-confirm="${key}">${uiHelpers.escapeHtml(asking.action)}</button>
+              <button type="button" class="btn btn-sm btn-outline-secondary"
+                aria-label="Cancel ${label}"
+                data-parameter-cancel="${key}">Cancel</button>
+            </div>
+          </div>`;
+      };
+
+      const parameterSaidTone = (tone) =>
+        tone === 'neutral' ? 'text-muted' : `parameter-said-${tone}`;
+
+      const parameterSaidHtml = (text, tone) =>
+        text
+          ? `<div class="small parameter-said ${parameterSaidTone(tone)}">${uiHelpers.escapeHtml(
+              text,
+            )}</div>`
+          : '';
+
+      /**
+       * What became of a change, which the keyboard can be put on.
+       *
+       * A confirmation answered takes its own controls off the page and refuses the one that
+       * opened it, and this is what is left where they were for the keyboard to land on.
+       */
+      const parameterStatusHtml = (field, key) =>
+        field.write
+          ? `<div class="small parameter-said ${parameterSaidTone(field.write.tone)}"
+              data-parameter-status="${key}" tabindex="-1">${uiHelpers.escapeHtml(
+                field.write.text,
+              )}</div>`
+          : '';
+
+      /**
+       * The reader's half of a field: what they may choose, what the page makes of it, and what
+       * became of the last change they asked for.
+       *
+       * What the page makes of a value is said only once the reader has touched the field. A
+       * device can report a current value its own metadata does not permit, and a message under
+       * an untouched field would be the page objecting to the device's own reading.
+       */
+      const parameterEditorHtml = (field, busy, nodeId) => {
+        const key = uiHelpers.escapeHtml(field.key);
+        const status = parameterStatusHtml(field, key);
+
+        if (!field.editor) {
+          const why = field.blocked ? uiHelpers.describeParameterRefusal(field.blocked) : null;
+          const said = parameterSaidHtml(parameterRefusals.get(field.key) || null, 'danger');
+
+          return `${parameterSaidHtml(why, 'neutral')}${said}${status}`;
+        }
+
+        const typed = parameterEdits.has(field.key)
+          ? parameterEdits.get(field.key)
+          : parameterDefaultText(field.editor);
+        const label = uiHelpers.escapeHtml(field.editorLabel);
+        /**
+         * What explains the control is named by the control, so that a reader who arrives at it
+         * is told why a draft went or why Save will not answer rather than finding a sentence
+         * they would have to go looking for. An id of its own, since a parameter number and the
+         * bits of a field are not an id between them.
+         */
+        const named = field.key.replace(/[^a-zA-Z0-9]/g, '-');
+        const noteId = `parameterNote-${named}`;
+        const entryId = `parameterEntry-${named}`;
+        const describedBy = field.note ? `${noteId} ${entryId}` : entryId;
+        /**
+         * What the list can stand at, which is not always what the reader last chose: a payload
+         * can take their choice away between their choosing it and this being drawn. The draft
+         * itself is kept, so what the page makes of it is still said under the control, and the
+         * list goes back to standing at nothing rather than moving silently to an entry they
+         * never picked.
+         */
+        const offered =
+          field.editor.kind === 'choice' &&
+          !field.editor.options.some((option) => String(option.value) === typed)
+            ? ''
+            : typed;
+
+        /**
+         * What the page makes of the entry, and what the plugin last said about a change, are
+         * written into these two rather than built with them. Rebuilding the field would put a
+         * new control in the reader's hands at every keystroke, and a number field cannot be
+         * told where its caret was, so the caret would jump to the end of whatever they were
+         * editing in the middle of.
+         */
+        return `<div class="parameter-editor">
+            ${parameterControlHtml(field, offered, busy, label, describedBy)}
+            <button type="button" class="btn btn-sm btn-primary" aria-label="Save ${label}"
+              data-parameter-save="${key}" disabled>Save</button>
+          </div>
+          ${
+            field.note
+              ? `<div class="small parameter-said text-muted" id="${noteId}">${uiHelpers.escapeHtml(
+                  field.note,
+                )}</div>`
+              : ''
+          }
+          <div class="small parameter-said parameter-said-danger" data-parameter-entry="${key}"
+            id="${entryId}" style="display: none;"></div>
+          ${parameterConfirm === field.key ? parameterConfirmHtml(field, nodeId, label) : ''}
+          <div class="small parameter-said parameter-said-danger" data-parameter-refusal="${key}"
+            tabindex="-1" style="display: none;"></div>
+          ${status}`;
+      };
+
+      /**
+       * Writes into the controls what only the reader's own state decides, so that none of it
+       * rebuilds the field they are typing into.
+       *
+       * Read from what they typed rather than from the control, so that a field rebuilt for
+       * another reason and a field left alone say the same thing about the same entry.
+       */
+      const paintParameterEditors = (list, view, busy) => {
+        view.groups
+          .flatMap((group) => group.fields)
+          .forEach((field) => {
+            const save = list.querySelector(
+              `[data-parameter-save="${CSS.escape(field.key)}"]`,
+            );
+            if (!save || !field.editor) return;
+
+            const touched = parameterEdits.has(field.key);
+            const entry = uiHelpers.describeParameterEntry(
+              field.editor,
+              touched ? parameterEdits.get(field.key) : parameterDefaultText(field.editor),
+            );
+            const control = list.querySelector(`[data-parameter-key="${CSS.escape(field.key)}"]`);
+            const say = (attribute, text) => {
+              const line = list.querySelector(`[${attribute}="${CSS.escape(field.key)}"]`);
+              if (!line) return;
+
+              line.textContent = text || '';
+              line.style.display = text ? '' : 'none';
+            };
+
+            save.disabled = entry.kind !== 'ready' || busy;
+            if (control) control.disabled = busy;
+            say('data-parameter-entry', touched ? entry.text : null);
+            say('data-parameter-refusal', parameterRefusals.get(field.key) || null);
+          });
+      };
+
+      const parameterFieldHtml = (field, divided, busy, nodeId) => `
         <div class="parameter-field${divided ? ' parameter-field-divided' : ''}">
           ${
             field.label
@@ -1707,6 +1996,7 @@
               ? '<div class="small text-muted">Waiting for the device to report this value.</div>'
               : ''
           }
+          ${parameterEditorHtml(field, busy, nodeId)}
         </div>`;
 
       /**
@@ -1714,7 +2004,7 @@
        * set in from the number they share, so a reader can see that they are parts of one
        * setting rather than settings of their own.
        */
-      const parameterGroupHtml = (group) => `
+      const parameterGroupHtml = (group, busy, nodeId) => `
         <div class="parameter-group">
           <div class="parameter-head">
             <span class="font-weight-bold">${uiHelpers.escapeHtml(group.number)}</span>
@@ -1728,9 +2018,142 @@
             }
           </div>
           ${group.fields
-            .map((field) => parameterFieldHtml(field, group.fields.length > 1))
+            .map((field) => parameterFieldHtml(field, group.fields.length > 1, busy, nodeId))
             .join('')}
         </div>`;
+
+      /**
+       * Where the keyboard was inside the list, so that redrawing it can put the keyboard back.
+       *
+       * The list is rewritten whenever anything it draws moves, which while a change is being
+       * applied is every five seconds. A reader typing a number into a field would otherwise
+       * lose the keyboard partway through it.
+       */
+      const PARAMETER_FOCUS_ATTRIBUTES = [
+        'data-parameter-key',
+        'data-parameter-save',
+        'data-parameter-confirm',
+        'data-parameter-cancel',
+        /** The two the keyboard is put on when answering a confirmation refuses the control. */
+        'data-parameter-status',
+        'data-parameter-refusal',
+      ];
+
+      const captureParametersFocus = (list) => {
+        const active = document.activeElement;
+        if (!active || !list.contains(active)) return null;
+
+        const attribute = PARAMETER_FOCUS_ATTRIBUTES.find((one) => active.hasAttribute(one));
+        if (!attribute) return null;
+
+        let caret = null;
+        try {
+          caret = { start: active.selectionStart, end: active.selectionEnd };
+        } catch (err) {
+          // A number field will not report a caret position. Focus alone is enough.
+        }
+
+        return { attribute, key: active.getAttribute(attribute), caret };
+      };
+
+      /**
+       * What is left to say about one value, which is what the keyboard can be put on where the
+       * controls it was on have gone or been refused.
+       *
+       * The refusal answers what the reader just asked and comes first. Read from what the
+       * plugin answered rather than from the page, because the page is told what to say about
+       * it after it has been drawn.
+       */
+      const parameterSpokenFor = (list, key) => {
+        const refused = parameterRefusals.has(key)
+          ? list.querySelector(`[data-parameter-refusal="${CSS.escape(key)}"]`)
+          : null;
+
+        return refused || list.querySelector(`[data-parameter-status="${CSS.escape(key)}"]`);
+      };
+
+      /**
+       * Whether the plugin has answered about one value, which a page not drawing that value
+       * cannot be asked.
+       *
+       * A reader can search while a change is in flight and take the value off the screen, and
+       * the answer still arrives. Read from what the plugin said rather than from what is drawn,
+       * so that an answer nobody is looking at still counts as one.
+       */
+      const parameterAnswered = (key) => {
+        if (parameterRefusals.has(key)) {
+          return true;
+        }
+
+        const write = (parametersFor(detailNodeId).payload || {}).write;
+
+        return Boolean(
+          write &&
+            write.state !== 'idle' &&
+            uiHelpers.parameterValueKey(write.endpoint, write.parameter, write.bitMask) === key,
+        );
+      };
+
+      const restoreParametersFocus = (list, panel, held) => {
+        if (!held) return;
+
+        const find = (attribute) =>
+          list.querySelector(`[${attribute}="${CSS.escape(held.key)}"]`);
+        /**
+         * A confirmation answered is a confirmation gone, and its buttons with it. The keyboard
+         * goes to the control that opened it, which is the one a reader would reach for next,
+         * and where answering has refused that control as well, to what became of the change
+         * they just made. A control nothing can be done with cannot hold the keyboard, and the
+         * keyboard left on nothing is the keyboard at the top of the page.
+         */
+        const asked = find(held.attribute) || find('data-parameter-save');
+        const target =
+          asked && !asked.disabled ? asked : parameterSpokenFor(list, held.key) || panel;
+        if (!target) return;
+
+        target.focus();
+        if (!held.caret || target !== asked) return;
+
+        try {
+          target.setSelectionRange(held.caret.start, held.caret.end);
+        } catch (err) {
+          // As above: nothing in this field has a caret to put back.
+        }
+      };
+
+      /**
+       * Says one thing about a change, once.
+       *
+       * Each thing that happens says itself as it happens rather than being worked out from
+       * what is on the page, so what was said last is what happened last. Working it out would
+       * have to choose between a refusal and a change that is still running, and the answer is
+       * whichever of them is newer.
+       */
+      const announceChange = (text) => {
+        const region = document.getElementById('parametersChangeAnnounce');
+        if (!region) return;
+
+        /**
+         * Emptied before it is filled. A region already holding these words says nothing when
+         * they are written into it again, and a reader asking twice and being refused twice
+         * would hear the refusal once.
+         *
+         * Only one of these is ever owed. A later thing to say, or a reader who has gone to
+         * another device, puts the one waiting to be said out of date, and letting it arrive
+         * would have the section say something that is no longer about anything on it.
+         */
+        window.clearTimeout(parametersChangeTimer);
+        region.textContent = '';
+        if (!text) {
+          parametersChangeTimer = null;
+          return;
+        }
+
+        parametersChangeTimer = window.setTimeout(() => {
+          parametersChangeTimer = null;
+          region.textContent = text;
+        }, 0);
+      };
 
       const renderParametersSection = () => {
         const panel = document.getElementById('nodeSectionParameters');
@@ -1759,9 +2182,23 @@
           advanced.textContent = view.advanced.label;
           advanced.setAttribute('aria-expanded', view.advanced.expanded ? 'true' : 'false');
         }
+        /**
+         * Why the control will not answer, tied to the control rather than announced. It is an
+         * explanation of what is already on screen, not news, and a reader who has not reached
+         * the control has no use for it.
+         *
+         * Emptied first, every time. The explanation belongs to a control, and a payload that
+         * takes the control away would otherwise leave its reason behind with nothing to be
+         * about.
+         */
+        const note = document.getElementById('parametersRereadNote');
+        const why = listed && view.refresh.button ? view.refresh.button.note : null;
+        note.textContent = why || '';
+        note.style.display = why ? '' : 'none';
+
         if (listed && view.refresh.button) {
           reread.textContent = view.refresh.button.label;
-          reread.disabled = view.refresh.button.disabled || parametersAsking;
+          reread.disabled = view.refresh.button.disabled || parametersAsking || parameterSaving;
         }
 
         const status = listed ? view.refresh.status || '' : '';
@@ -1770,8 +2207,20 @@
           ? view.search.count || ''
           : '';
 
-        const signature = `${detailNodeId}:${JSON.stringify(view)}`;
-        if (signature !== parametersDrawn) {
+        /**
+         * A confirmation is the only thing the reader does that the list has to be rebuilt for,
+         * since it puts controls on the page and takes them off again. Everything else they do
+         * is written into the controls already there.
+         */
+        const busy =
+          parameterSaving ||
+          parametersAsking ||
+          uiHelpers.parametersWriteRunning(parametersFor(detailNodeId).payload);
+        const signature = `${detailNodeId}:${JSON.stringify(view)}:${parameterConfirm}`;
+        const rebuilt = signature !== parametersDrawn;
+        const held = rebuilt ? captureParametersFocus(list) : null;
+        if (rebuilt) {
+
           parametersDrawn = signature;
 
           if (view.kind === 'loading') {
@@ -1783,7 +2232,64 @@
           } else if (view.empty) {
             list.innerHTML = `<p class="small text-muted">${uiHelpers.escapeHtml(view.empty)}</p>`;
           } else {
-            list.innerHTML = view.groups.map(parameterGroupHtml).join('');
+            list.innerHTML = view.groups
+              .map((group) => parameterGroupHtml(group, busy, detailNodeId))
+              .join('');
+          }
+
+        }
+
+        if (listed) {
+          paintParameterEditors(list, view, busy);
+        }
+
+        if (rebuilt) {
+          restoreParametersFocus(list, panel, held);
+
+          /**
+           * A confirmation asks a question, so the keyboard goes to the answer rather than
+           * staying on the control that asked it. Only a confirmation that has just opened
+           * takes it: one already on screen is redrawn whenever the payload moves, and taking
+           * the keyboard back each time would hold a reader on it.
+           */
+          if (parameterConfirm && parameterConfirm !== parameterConfirmDrawn) {
+            const ask = list.querySelector(
+              `[data-parameter-confirm="${CSS.escape(parameterConfirm)}"]`,
+            );
+            if (ask) ask.focus();
+          }
+          parameterConfirmDrawn = parameterConfirm;
+        }
+
+        /**
+         * A change asked for from a confirmation leaves nothing to stand on until the plugin
+         * has answered, so the keyboard waits on the section and moves to whatever the plugin
+         * then says about that value, which is the refusal where it would not begin and what
+         * became of the change where it did. Only where the reader has not put the keyboard
+         * somewhere themselves in the meantime.
+         *
+         * Looked for on every pass rather than only where the list was rebuilt: a change the
+         * plugin would not begin leaves the list exactly as it was, and the refusal is written
+         * into the page the list already has.
+         */
+        if (parameterLanding) {
+          const answered = parameterAnswered(parameterLanding);
+          const landing = parameterSpokenFor(list, parameterLanding);
+          const adrift =
+            document.activeElement === document.body || document.activeElement === panel;
+          if (landing && adrift) {
+            landing.focus();
+          }
+          /**
+           * Spent on the answer rather than on the landing. A reader who has gone somewhere
+           * themselves has settled where the keyboard belongs, and one who has searched the
+           * value off the screen has no landing to be given, but in both cases the question the
+           * keyboard was waiting on has been answered. A debt left standing outlives that
+           * answer and would be paid, later and out of nowhere, from wherever the reader had
+           * got to by then.
+           */
+          if (answered) {
+            parameterLanding = null;
           }
         }
 
@@ -1792,6 +2298,23 @@
         } else if (status !== parametersStatusSaid) {
           document.getElementById('parametersAnnounce').textContent = status;
           parametersStatusSaid = status;
+        }
+
+        /**
+         * What became of a change is said as well as shown. It is written beside the value it
+         * belongs to, which a reader who cannot see the page would otherwise have to go looking
+         * for, and it moves on the plugin's own time rather than on anything they did. Its own
+         * region, so that saying it does not replace what the re-read is in the middle of.
+         */
+        const changing = listed
+          ? view.groups.flatMap((group) => group.fields).find((field) => field.write)
+          : null;
+        const wrote = changing ? changing.write.text : '';
+        if (parametersChangeWrote === null) {
+          parametersChangeWrote = wrote;
+        } else if (wrote !== parametersChangeWrote) {
+          parametersChangeWrote = wrote;
+          announceChange(wrote);
         }
 
         settlePanelFocus(panel);
@@ -1966,17 +2489,21 @@
           }
 
           /**
-           * The parameters payload is read again while a re-read is running, which is the one
-           * time it changes without anyone asking, and where the open section has nothing to
-           * draw, which is what a node number changing hands leaves behind. Settling ends the
-           * reason to keep looking: it says the attempt finished, never that a value answered,
-           * and what answered is read from the timestamps in the payload it ends on.
+           * The parameters payload is read again while a re-read or a change is running, which
+           * are the two times it changes without anyone asking, and where the open section has
+           * nothing to draw, which is what a node number changing hands leaves behind. Settling
+           * ends the reason to keep looking: it says the attempt finished, never that a value
+           * answered, and what answered is read from the timestamps in the payload it ends on.
            */
           if (detailNodeId !== null && !detailGone && nodeSection === 'parameters') {
             const state = parametersFor(detailNodeId);
             const unread = state.payload === undefined && state.error === undefined;
 
-            if (unread || uiHelpers.parametersRefreshRunning(state.payload)) {
+            if (
+              unread ||
+              uiHelpers.parametersRefreshRunning(state.payload) ||
+              uiHelpers.parametersWriteRunning(state.payload)
+            ) {
               loadParametersSection();
             }
           }
@@ -2347,15 +2874,137 @@
        * It is also not bumped when the reader leaves the node, so a move started here is still
        * reported on their return rather than quietly dropped.
        */
+      /** The field the section is currently drawing under a key, or none where it has gone. */
+      const parameterFieldFor = (key) => {
+        const view = uiHelpers.describeParametersSection(
+          Object.assign(
+            { search: parametersSearch, showAdvanced: parametersShowAdvanced },
+            parametersFor(detailNodeId),
+          ),
+        );
+        if (view.kind !== 'parameters') return null;
+
+        return view.groups
+          .flatMap((group) => group.fields)
+          .find((field) => field.key === key) || null;
+      };
+
+      /**
+       * Asks the plugin for one change and redraws from what it answers.
+       *
+       * The answer is the payload the plugin holds after the request, carrying a refusal beside
+       * it where there is one. A refusal is the answer to this request and not the state of the
+       * device, so it is kept apart from the change the payload reports: a change refused
+       * because another one is running is refused by a device still running that other one.
+       */
+      const sendParameterWrite = async (field, value) => {
+        const nodeId = detailNodeId;
+        const state = parametersFor(nodeId);
+        const asking = uiHelpers.describeParameterConfirmation(field.risks, '', '');
+
+        parameterSaving = true;
+        parameterConfirm = null;
+        /**
+         * Nothing is owed yet, and anything owed from before is not owed now. Until the plugin
+         * has answered, what the payload reports about this value is the change before this
+         * one, so a keyboard waiting on an answer would be given that one's ending.
+         */
+        parameterLanding = null;
+        /**
+         * Every earlier answer is spent. One change runs on a device at a time, so a refusal
+         * still on the page is the answer to a request that is over, and leaving it there
+         * would have it stand beside a value nothing is happening to.
+         */
+        parameterRefusals.clear();
+        renderParametersSection();
+
+        try {
+          const payload = await window.homebridge.request('write-node-parameter', {
+            nodeId,
+            identity: state.identity,
+            endpoint: field.target.endpoint,
+            parameter: field.target.parameter,
+            bitMask: field.target.bitMask,
+            value,
+            expectedValueSize: field.target.valueSize,
+            expectedFormat: field.target.format,
+            acknowledgeDestructive: Boolean(asking && asking.destructive),
+            acknowledgeRequiresReInclusion: Boolean(asking && asking.requiresReInclusion),
+          });
+          if (!parametersAnswerFits(nodeId, state, payload)) return;
+
+          state.payload = payload;
+          state.identity = payload.identity;
+          state.error = undefined;
+          parameterLanding = field.key;
+
+          if (payload.refusal) {
+            const why = uiHelpers.describeParameterRefusal(payload.refusal, field.editor);
+
+            parameterRefusals.set(field.key, why);
+            announceChange(why);
+          } else {
+            // The change is the plugin's now, and the field goes back to reporting the device.
+            parameterEdits.delete(field.key);
+          }
+        } catch (err) {
+          parameterRefusals.set(field.key, err.message);
+          parameterLanding = field.key;
+          announceChange(err.message);
+        } finally {
+          parameterSaving = false;
+          renderParametersSection();
+          renderParametersTab();
+        }
+      };
+
+      /**
+       * What a press of Save does, which is to send the change or to ask first.
+       *
+       * The risks are read from what the section is drawing now rather than from what it drew
+       * when the press was made, so a parameter that has become destructive since is asked
+       * about rather than written.
+       */
+      const startParameterWrite = (key) => {
+        const field = parameterFieldFor(key);
+        if (!field || !field.editor) return;
+
+        const entry = uiHelpers.describeParameterEntry(
+          field.editor,
+          parameterEdits.has(key) ? parameterEdits.get(key) : parameterDefaultText(field.editor),
+        );
+        if (entry.kind !== 'ready') return;
+
+        if (field.risks.length > 0) {
+          parameterConfirm = key;
+          renderParametersSection();
+          return;
+        }
+
+        sendParameterWrite(field, entry.value);
+      };
+
       /**
        * Delegated on the panel, which outlives every redraw of what is inside it, and bound at
        * page load rather than when a node is opened, so opening one twice does not leave two
        * listeners answering one press.
        */
       document.getElementById('nodeSectionParameters').addEventListener('input', (e) => {
-        if (e.target.id !== 'parameterSearch') return;
+        if (e.target.id === 'parameterSearch') {
+          parametersSearch = e.target.value;
+          renderParametersSection();
+          return;
+        }
 
-        parametersSearch = e.target.value;
+        const key = e.target.getAttribute('data-parameter-key');
+        if (key === null) return;
+
+        /**
+         * What the plugin said about the last change is about the value that was sent, and the
+         * reader has moved on from it.
+         */
+        parameterEdits.set(key, e.target.value);
+        parameterRefusals.delete(key);
         renderParametersSection();
       });
 
@@ -2369,6 +3018,37 @@
         }
         if (target.id === 'parametersReread') {
           requestParametersRefresh();
+        }
+
+        const save = target.getAttribute('data-parameter-save');
+        if (save !== null) {
+          startParameterWrite(save);
+        }
+
+        const confirmed = target.getAttribute('data-parameter-confirm');
+        if (confirmed !== null) {
+          const field = parameterFieldFor(confirmed);
+          const entry = field && field.editor
+            ? uiHelpers.describeParameterEntry(
+                field.editor,
+                parameterEdits.has(confirmed)
+                  ? parameterEdits.get(confirmed)
+                  : parameterDefaultText(field.editor),
+              )
+            : { kind: 'empty' };
+
+          if (entry.kind === 'ready') {
+            sendParameterWrite(field, entry.value);
+          } else {
+            // What was agreed to is no longer what would be sent, so nothing is sent.
+            parameterConfirm = null;
+            renderParametersSection();
+          }
+        }
+
+        if (target.getAttribute('data-parameter-cancel') !== null) {
+          parameterConfirm = null;
+          renderParametersSection();
         }
       });
 

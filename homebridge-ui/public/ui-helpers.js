@@ -1830,6 +1830,15 @@
      */
     const typing = value.allowManualEntry !== false;
     const bounds = parameterBounds(value);
+    /**
+     * A field whose ends have crossed describes nothing a device would take. Metadata can state
+     * a range in the wrong order, and a coherent range can still fall outside what the size it
+     * is encoded in can hold, which leaves no number between the ends to offer.
+     */
+    const field = (over) =>
+      isNumber(over.min) && isNumber(over.max) && over.min > over.max
+        ? null
+        : Object.assign({ kind: 'number', current, unit: value.unit || null }, over);
     const choice = (numbers) =>
       numbers.length > 0
         ? {
@@ -1876,16 +1885,13 @@
       const floor = isNumber(bounds.min) ? Math.max(span.from, bounds.min) : span.from;
       const ceiling = isNumber(bounds.max) ? Math.min(span.to, bounds.max) : span.to;
 
-      return {
-        kind: 'number',
-        current,
+      return field({
         min: span.from + Math.ceil((floor - span.from) / step) * step,
         max: span.from + Math.floor((ceiling - span.from) / step) * step,
         step,
-        unit: value.unit || null,
         constrained: false,
         permits: value.allowed,
-      };
+      });
     }
 
     if (stated) {
@@ -1899,28 +1905,17 @@
         entry.kind === 'value' ? [entry.value] : [entry.from, entry.to],
       );
 
-      return {
-        kind: 'number',
-        current,
+      return field({
         min: isNumber(bounds.min) ? Math.max(Math.min(...ends), bounds.min) : Math.min(...ends),
         max: isNumber(bounds.max) ? Math.min(Math.max(...ends), bounds.max) : Math.max(...ends),
         step: 1,
-        unit: value.unit || null,
         constrained: true,
         /** The set itself, so what is typed can be held to it before anything is asked of it. */
         permits: value.allowed,
-      };
+      });
     }
 
-    return {
-      kind: 'number',
-      current,
-      min: bounds.min,
-      max: bounds.max,
-      step: 1,
-      unit: value.unit || null,
-      constrained: false,
-    };
+    return field({ min: bounds.min, max: bounds.max, step: 1, constrained: false });
   }
 
   /** zwave-js's signed integer format, which is also what it assumes where none is stated. */
@@ -2116,9 +2111,10 @@
       'Some fields in this parameter have not been reported. Changing one could overwrite the ' +
       'others, so re-read the values first.',
     'definition-changed': 'This parameter changed while the page was open. Review it and try again.',
-    'needs-acknowledgment': 'This change needs your confirmation. Re-read the values and try again.',
-    'no-identity': 'This page is showing an older version of this device. Reload the page and try again.',
-    'wrong-device': 'This page is showing an older version of this device. Reload the page and try again.',
+    'needs-acknowledgment': 'This change now needs confirmation. Review the warning and try again.',
+    'no-identity': 'Reload the page and try again.',
+    'wrong-device':
+      'The device changed while this page was open. Return to the node list and open it again.',
     busy: 'Another setting change is still in progress for this device.',
     'busy-rereading': 'Wait for the current re-read to finish before changing a value.',
   };
@@ -2251,20 +2247,23 @@
    * What the reader is asked to agree to before a change is sent, or nothing where the device
    * says the change carries neither risk.
    *
-   * Each risk is named separately, because a parameter can carry both and a reader agreeing to
-   * one has not been told about the other.
+   * Every risk the device states is named, and a parameter carrying both states them on the one
+   * subject: what is being changed and what it is on are said once, because naming the device
+   * and the parameter twice in two sentences reads as two changes rather than one.
    */
-  function describeParameterConfirmation(value, device, label) {
-    const risks = describeParameterRisks(value);
-    if (risks.length === 0) {
+  function describeParameterConfirmation(risks, device, label) {
+    const asked = risks || [];
+    if (asked.length === 0) {
       return null;
     }
 
     return {
       action: 'Change it',
-      sentences: risks.map((risk) => `Changing ${label} on ${device} ${risk.explanation}.`),
-      destructive: risks.some((risk) => risk.kind === 'destructive'),
-      requiresReInclusion: risks.some((risk) => risk.kind === 'requiresReInclusion'),
+      text: `Changing ${label} on ${device} ${asked
+        .map((risk) => risk.explanation)
+        .join(', and ')}.`,
+      destructive: asked.some((risk) => risk.kind === 'destructive'),
+      requiresReInclusion: asked.some((risk) => risk.kind === 'requiresReInclusion'),
     };
   }
 
@@ -2273,6 +2272,11 @@
     const partial = value.bitMask !== null && value.bitMask !== undefined;
     const blocked = partial && !groupComposes(group) ? 'partial-incomplete' : null;
     const editor = blocked ? null : describeParameterEditor(value);
+    const bits = partial ? `Bit mask 0x${value.bitMask.toString(16).toUpperCase()}` : null;
+    const title = value.label || bits;
+    const where = `Parameter ${group.parameter}${
+      group.endpoint > 0 ? ` on endpoint ${group.endpoint}` : ''
+    }`;
     const marks = PARAMETER_MARKS.filter((mark) => mark.holds(value)).map((mark) => ({
       label: mark.label,
       tone: mark.tone,
@@ -2281,9 +2285,15 @@
 
     return {
       key,
-      label: partial
-        ? value.label || `Bit mask 0x${value.bitMask.toString(16).toUpperCase()}`
-        : null,
+      label: partial ? title : null,
+      /** What to call this value in a sentence about it, which is what a reader calls it. */
+      name: title || where,
+      /**
+       * What a control for this value is called where only its name is read out. One number can
+       * be a parameter on two endpoints, and one label can be on two fields, so the name carries
+       * what tells them apart as well as what a reader would call it.
+       */
+      editorLabel: title ? `${where}, ${title}` : where,
       description: value.description || null,
       value: parameterValueText(value),
       rows: parameterDetailRows(value),
@@ -2296,6 +2306,18 @@
       blocked,
       /** Said where a field cannot describe the set the device permits, and nowhere else. */
       note: editor && editor.constrained ? PARAMETER_CONSTRAINED_NOTE : null,
+      /**
+       * What a change to this value has to name, carried rather than read back out of the key,
+       * and including what the page believes the parameter to be so the route can tell that the
+       * definition moved underneath it.
+       */
+      target: {
+        endpoint: group.endpoint,
+        parameter: group.parameter,
+        bitMask: isNumber(value.bitMask) ? value.bitMask : null,
+        valueSize: isNumber(value.valueSize) ? value.valueSize : null,
+        format: isNumber(value.format) ? value.format : null,
+      },
       risks: describeParameterRisks(value),
       write: describeParameterWrite(write, group, value),
     };
@@ -2534,6 +2556,21 @@
     return Boolean(payload && payload.refresh && payload.refresh.state === 'dispatching');
   }
 
+  /**
+   * Whether a change is still going somewhere, which is the other reason to keep reading.
+   *
+   * A change moves through its states on the plugin's own time: nothing the reader does advances
+   * it, and a page that stopped reading would leave a change being applied described as one
+   * still being sent until something else asked.
+   */
+  function parametersWriteRunning(payload) {
+    const state = payload && payload.write ? payload.write.state : null;
+
+    return (
+      state === 'queued' || state === 'sending' || state === 'working' || state === 'confirming'
+    );
+  }
+
 
   return {
     SECURITY_KEY_FIELDS,
@@ -2588,5 +2625,6 @@
     parameterValueKey,
     parametersTabCount,
     parametersRefreshRunning,
+    parametersWriteRunning,
   };
 });

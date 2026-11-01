@@ -37,6 +37,7 @@ const { describeHealStart, healIsRunning,
   parameterAccepts,
   describeParametersRefresh,
   parametersTabCount,
+  parametersWriteRunning,
   parametersRefreshRunning,
 } = require('../homebridge-ui/public/ui-helpers.js');
 
@@ -2727,15 +2728,325 @@ describe('management page integration', () => {
     );
   });
 
-  it('re-reads while an attempt is running, and where the section has nothing to draw', () => {
+  it('names the device and what it believed the parameter to be in every change it asks for', () => {
+    /**
+     * A node number changes hands, and a parameter's own definition can move underneath an open
+     * page. Both are sent so the plugin can refuse a change made against either, rather than
+     * writing a number into whatever now holds that address.
+     */
+    const send = declaration('sendParameterWrite');
+
+    expect(send).toContain("window.homebridge.request('write-node-parameter'");
+    expect(send).toContain('identity: state.identity');
+    expect(send).toContain('expectedValueSize: field.target.valueSize');
+    expect(send).toContain('expectedFormat: field.target.format');
+    expect(send).toMatch(/acknowledgeDestructive: Boolean\(asking && asking\.destructive\)/);
+    expect(send).toMatch(
+      /acknowledgeRequiresReInclusion: Boolean\(asking && asking\.requiresReInclusion\)/,
+    );
+  });
+
+  it('keeps a refusal apart from the change the payload reports', () => {
+    /**
+     * A refusal answers the request just made. The change the node has in hand is whatever the
+     * payload says it is, and a change refused as busy is refused by a device still running the
+     * other one.
+     */
+    const send = declaration('sendParameterWrite');
+
+    expect(send).toMatch(/if \(payload\.refusal\) \{/);
+    expect(send).toContain('uiHelpers.describeParameterRefusal(payload.refusal, field.editor)');
+    expect(send).toContain('parameterEdits.delete(field.key)');
+  });
+
+  it('reads the risks from what the section draws now rather than from the press', () => {
+    const start = declaration('startParameterWrite');
+
+    expect(start).toContain('const field = parameterFieldFor(key);');
+    /** A value that offers no control has no default to read, so it is let go of first. */
+    expect(start).toMatch(/if \(!field \|\| !field\.editor\) return;/);
+    expect(start).toMatch(/if \(entry\.kind !== 'ready'\) return;/);
+    expect(start).toMatch(/if \(field\.risks\.length > 0\) \{\s+parameterConfirm = key;/);
+  });
+
+  it('keeps what the reader typed out of the payload, and forgets it with the node', () => {
+    const page = readPage();
+
+    expect(page).toMatch(/const parameterEdits = new Map\(\);/);
+    expect(page).toMatch(/const parameterRefusals = new Map\(\);/);
+    expect(declaration('clearParameterEditors')).toContain('parameterEdits.clear();');
+    expect(page).toContain('clearParameterEditors();');
+  });
+
+  it('draws a field from what the reader typed, and says nothing until they have', () => {
+    /**
+     * A device can report a current value its own metadata does not permit. A message under a
+     * field nobody has touched would be the page objecting to the device's own reading, and the
+     * control stays refused either way.
+     */
+    const editor = declaration('parameterEditorHtml');
+    const paint = declaration('paintParameterEditors');
+
+    expect(editor).toMatch(
+      /const typed = parameterEdits\.has\(field\.key\)\s+\? parameterEdits\.get\(field\.key\)\s+: parameterDefaultText\(field\.editor\);/,
+    );
+    expect(paint).toContain('const touched = parameterEdits.has(field.key);');
+    expect(paint).toMatch(/save\.disabled = entry\.kind !== 'ready' \|\| busy;/);
+    expect(paint).toContain("say('data-parameter-entry', touched ? entry.text : null);");
+  });
+
+  it('writes into the field rather than building a new one, which loses the caret', () => {
+    /**
+     * A number field cannot be told where its caret was, so replacing it at every keystroke
+     * sends the caret to the end of whatever was being edited in the middle of. Only a
+     * confirmation rebuilds the list, because it puts controls on the page and takes them off.
+     */
+    const render = declaration('renderParametersSection');
+
+    expect(render).toMatch(
+      /const signature = `\$\{detailNodeId\}:\$\{JSON\.stringify\(view\)\}:\$\{parameterConfirm\}`;/,
+    );
+    expect(render).toContain('paintParameterEditors(list, view, busy);');
+    expect(declaration('parameterEditorHtml')).toContain('data-parameter-entry="${key}"');
+    expect(declaration('parameterEditorHtml')).toContain('data-parameter-refusal="${key}"');
+  });
+
+  it('chooses nothing for the reader where the device stands outside its own list', () => {
+    const page = readPage();
+
+    expect(declaration('parameterDefaultText')).toMatch(
+      /return editor\.options\.some\(\(option\) => option\.value === editor\.current\)\s+\? String\(editor\.current\)\s+: '';/,
+    );
+    expect(page).toContain(
+      "typed === '' ? '<option value=\"\" selected disabled>Choose a value</option>' : '';",
+    );
+  });
+
+  it('brings the warning with the keyboard that lands on the control acting on it', () => {
+    const page = readPage();
+
+    expect(page).toContain('<div class="small" id="parameterConfirmText">');
+    expect(page).toContain('aria-describedby="parameterConfirmText"');
+  });
+
+  it('says the same thing twice where it happens twice', () => {
+    /**
+     * A region already holding these words says nothing when they are written into it again,
+     * so a reader asking twice and being refused twice would hear the refusal once.
+     */
+    const announce = declaration('announceChange');
+
+    expect(announce).toMatch(/region\.textContent = '';/);
+    expect(announce).toMatch(
+      /parametersChangeTimer = window\.setTimeout\(\(\) => \{\s+parametersChangeTimer = null;\s+region\.textContent = text;/,
+    );
+    /**
+     * Only one is ever owed. A later thing to say, or a reader gone to another device, puts the
+     * one waiting out of date, and letting it arrive would have the section say something that
+     * is no longer about anything on it.
+     */
+    expect(announce).toContain('window.clearTimeout(parametersChangeTimer);');
+    expect(declaration('clearParametersAnnounce')).toContain(
+      'window.clearTimeout(parametersChangeTimer);',
+    );
+  });
+
+  it('names what explains a control by the control it explains', () => {
+    /**
+     * A reader arriving at the control is told why a draft went or why Save will not answer,
+     * rather than finding a sentence somewhere below it that they would have to go looking for.
+     */
+    const editor = declaration('parameterEditorHtml');
+
+    expect(editor).toContain("const named = field.key.replace(/[^a-zA-Z0-9]/g, '-');");
+    expect(editor).toMatch(
+      /const describedBy = field\.note \? `\$\{noteId\} \$\{entryId\}` : entryId;/,
+    );
+    expect(editor).toContain('id="${entryId}"');
+    expect(editor).toContain('id="${noteId}"');
+    expect(declaration('parameterControlHtml')).toMatch(
+      /describedBy \? ` aria-describedby="\$\{describedBy\}"` : ''/,
+    );
+  });
+
+  it('paints what the controls say before putting the keyboard on any of them', () => {
+    const render = declaration('renderParametersSection');
+    const paint = render.indexOf('paintParameterEditors(list, view, busy);');
+    const focus = render.indexOf('restoreParametersFocus(list, panel, held);');
+
+    expect(paint).toBeGreaterThan(-1);
+    expect(focus).toBeGreaterThan(paint);
+  });
+
+  it('says what became of a change out loud, apart from what the re-read is saying', () => {
+    /**
+     * Each thing that happens says itself as it happens, so the newest is what was said last.
+     * A refusal left on the page from an earlier request would otherwise go on being the
+     * answer while a later change ran through every state unannounced.
+     */
+    const page = readPage();
+    const send = declaration('sendParameterWrite');
+
+    expect(page).toMatch(
+      /<div id="parametersChangeAnnounce" class="sr-only" role="status" aria-live="polite">/,
+    );
+    expect(declaration('announceChange')).toContain(
+      "document.getElementById('parametersChangeAnnounce')",
+    );
+    expect(send).toContain('parameterRefusals.clear();');
+    expect(send).toContain('announceChange(why);');
+    expect(send).toContain('announceChange(err.message);');
+    expect(declaration('renderParametersSection')).toContain('announceChange(wrote);');
+  });
+
+  it('puts the keyboard on what is left to say where answering refuses the control', () => {
+    /**
+     * What is left where a confirmation was is what became of the change, and the keyboard goes
+     * there. It has to be kept there as well: the status is redrawn every time the change moves,
+     * and a redraw that could not find the keyboard would drop it on the page.
+     */
+    const page = readPage();
+    const restore = declaration('restoreParametersFocus');
+
+    expect(restore).toMatch(
+      /const target =\s+asked && !asked\.disabled \? asked : parameterSpokenFor\(list, held\.key\) \|\| panel;/,
+    );
+    expect(declaration('parameterStatusHtml')).toContain('tabindex="-1"');
+    expect(page).toMatch(
+      /const PARAMETER_FOCUS_ATTRIBUTES = \[[\s\S]*?'data-parameter-status',\s+'data-parameter-refusal',\s*\];/,
+    );
+    /**
+     * A change that would not begin leaves nothing to say about what it did, so the refusal is
+     * what the keyboard is owed. Read from what the plugin answered rather than from the page,
+     * which is told what to say about it only after it has been drawn.
+     */
+    expect(declaration('parameterSpokenFor')).toContain('parameterRefusals.has(key)');
+    expect(declaration('renderParametersSection')).toContain(
+      'const landing = parameterSpokenFor(list, parameterLanding);',
+    );
+    /**
+     * Looked for on every pass rather than only where the list was rebuilt. A change the plugin
+     * would not begin leaves the list exactly as it was, so a handoff waiting on a rebuild
+     * would wait for one that never comes.
+     */
+    expect(declaration('renderParametersSection')).toMatch(/\n        if \(parameterLanding\) \{/);
+    /**
+     * Spent either way. A reader who has gone somewhere themselves has answered the question of
+     * where the keyboard belongs, and a debt left standing would be paid later out of wherever
+     * they had got to by then.
+     */
+    expect(declaration('renderParametersSection')).toMatch(
+      /if \(landing && adrift\) \{\s+landing\.focus\(\);\s+\}/,
+    );
+    /**
+     * Spent on the answer rather than on the landing. A reader can search the value off the
+     * screen while the plugin is answering, which leaves nothing to put the keyboard on and an
+     * answer all the same, and a debt left standing would be paid out of wherever they had got
+     * to by the time the value came back.
+     */
+    expect(declaration('renderParametersSection')).toMatch(
+      /const answered = parameterAnswered\(parameterLanding\);/,
+    );
+    expect(declaration('renderParametersSection')).toMatch(
+      /if \(answered\) \{\s+parameterLanding = null;\s+\}/,
+    );
+    expect(declaration('parameterAnswered')).toContain('parameterRefusals.has(key)');
+    expect(declaration('parameterAnswered')).toContain(
+      'uiHelpers.parameterValueKey(write.endpoint, write.parameter, write.bitMask) === key',
+    );
+    /**
+     * Nothing can be said about a change until the plugin has answered, so the keyboard waits
+     * on the section and moves to what became of the change when there is something to move
+     * to, and only where the reader has not put it somewhere themselves meanwhile.
+     */
+    /**
+     * Armed only once the plugin has answered. Until then the payload still reports the change
+     * before this one, and a handoff looking for an answer would be paid by that one's ending.
+     */
+    const send = declaration('sendParameterWrite');
+    const asked = send.indexOf("window.homebridge.request('write-node-parameter'");
+
+    expect(send).toContain('parameterLanding = null;');
+    expect(send.slice(0, asked)).not.toContain('parameterLanding = field.key;');
+    /** Owed on every answer there is: one the plugin gave, and one it could not. */
+    expect(send).toMatch(
+      /state\.error = undefined;\s+parameterLanding = field\.key;/,
+    );
+    expect(send).toMatch(
+      /parameterRefusals\.set\(field\.key, err\.message\);\s+parameterLanding = field\.key;/,
+    );
+    expect(declaration('renderParametersSection')).toMatch(
+      /const adrift =\s+document\.activeElement === document\.body \|\| document\.activeElement === panel;/,
+    );
+  });
+
+  it('names every control by what it would act on', () => {
+    const editor = declaration('parameterEditorHtml');
+
+    expect(editor).toContain('aria-label="Save ${label}"');
+    expect(declaration('parameterConfirmHtml')).toContain('aria-label="Cancel ${label}"');
+    expect(editor).toContain('const label = uiHelpers.escapeHtml(field.editorLabel);');
+  });
+
+  it('keeps a list from standing at an entry the reader never picked', () => {
+    /**
+     * A payload can take a chosen value away between the choosing and the drawing. The draft
+     * is kept so that what the page makes of it is still said, and the list goes back to
+     * standing at nothing rather than moving silently to whatever is left.
+     */
+    const editor = declaration('parameterEditorHtml');
+
+    expect(editor).toMatch(
+      /const offered =\s+field\.editor\.kind === 'choice' &&\s+!field\.editor\.options\.some\(\(option\) => String\(option\.value\) === typed\)\s+\? ''\s+: typed;/,
+    );
+    expect(editor).toContain('parameterControlHtml(field, offered, busy, label, describedBy)');
+  });
+
+  it('refuses every control on a device while one of its changes is going somewhere', () => {
+    const render = declaration('renderParametersSection');
+
+    expect(render).toMatch(
+      /const busy =\s+parameterSaving \|\|\s+parametersAsking \|\|\s+uiHelpers\.parametersWriteRunning\(/,
+    );
+    expect(render).toContain('parameterGroupHtml(group, busy, detailNodeId)');
+  });
+
+  it('puts the keyboard back where it was, and on a confirmation that has just opened', () => {
+    const page = readPage();
+
+    expect(declaration('captureParametersFocus')).toContain('document.activeElement');
+    expect(declaration('restoreParametersFocus')).toContain('target.setSelectionRange(');
+    expect(page).toMatch(/if \(parameterConfirm && parameterConfirm !== parameterConfirmDrawn\)/);
+  });
+
+  it('ties the reason the re-read control will not answer to the control itself', () => {
+    /**
+     * Emptied on every render before anything is written into it: an explanation belongs to a
+     * control, and a payload that takes the control away would leave its reason behind.
+     */
+    const page = readPage();
+    const render = declaration('renderParametersSection');
+
+    expect(page).toMatch(/id="parametersReread"\s+aria-describedby="parametersRereadNote"/);
+    expect(page).toMatch(/id="parametersRereadNote"/);
+    expect(render).toMatch(
+      /const why = listed && view\.refresh\.button \? view\.refresh\.button\.note : null;/,
+    );
+    expect(render).toMatch(/note\.textContent = why \|\| '';/);
+    expect(render).toMatch(/note\.style\.display = why \? '' : 'none';/);
+  });
+
+  it('re-reads while an attempt or a change is running, and where there is nothing to draw', () => {
     /**
      * Settling ends the reason to keep looking without answering the question: it says the
-     * attempt finished, never that a value was confirmed.
+     * attempt finished, never that a value was confirmed. A change moves on the plugin's own
+     * time, so it is the other reason to keep reading.
      */
     const load = declaration('loadNodes');
 
     expect(load).toMatch(/nodeSection === 'parameters'/);
-    expect(load).toMatch(/unread \|\| uiHelpers\.parametersRefreshRunning\(state\.payload\)/);
+    expect(load).toMatch(/unread \|\|\s+uiHelpers\.parametersRefreshRunning\(state\.payload\)/);
+    expect(load).toMatch(/uiHelpers\.parametersWriteRunning\(state\.payload\)/);
     expect(load).toContain('loadParametersSection();');
   });
 
@@ -4496,6 +4807,130 @@ describe('the Parameters section', () => {
     });
   });
 
+  describe('a field whose ends have crossed', () => {
+    const editorFor = (over: Record<string, unknown>) =>
+      sectionOf({ groups: [group({ values: [value(over)] })] }).groups[0].fields[0].editor;
+
+    it('offers nothing where the stated range runs backward', () => {
+      expect(editorFor({ min: 300, max: 255 })).toBeNull();
+    });
+
+    it('offers nothing where the size it is encoded in holds no part of the range', () => {
+      expect(editorFor({ min: 300, max: 400, valueSize: 1, format: 1 })).toBeNull();
+      expect(editorFor({ min: -200, max: -150, valueSize: 1, format: 1 })).toBeNull();
+    });
+
+    it('offers nothing where a set lies outside what the range permits', () => {
+      expect(
+        editorFor({
+          min: 300,
+          max: 400,
+          allowed: [
+            { kind: 'value', value: 10 },
+            { kind: 'range', from: 20, to: 100, step: 1 },
+            { kind: 'value', value: 150 },
+          ],
+        }),
+      ).toBeNull();
+    });
+
+    it('still offers a field wherever the ends leave something between them', () => {
+      expect(editorFor({ min: 10, max: 10 })).toEqual({
+        kind: 'number',
+        current: 1,
+        min: 10,
+        max: 10,
+        step: 1,
+        unit: null,
+        constrained: false,
+      });
+      expect(editorFor({ min: 10, max: 100 })?.max).toBe(100);
+    });
+  });
+
+  describe('what a value is called', () => {
+    const fieldOf = (over: Record<string, unknown>, value: Record<string, unknown> = {}) =>
+      sectionOf({ groups: [group(Object.assign({ values: [valueOf(value)] }, over))] })
+        .groups[0].fields[0];
+    const valueOf = (over: Record<string, unknown>) => value(over);
+
+    it('calls a whole parameter what the device named it, and the group keeps the name', () => {
+      const field = fieldOf({}, { label: 'Motion timeout' });
+
+      expect(field.name).toBe('Motion timeout');
+      expect(field.label).toBeNull();
+      expect(field.editorLabel).toBe('Parameter 1, Motion timeout');
+    });
+
+    it('falls back to the number where the device named nothing', () => {
+      const field = fieldOf({ parameter: 44 });
+
+      expect(field.name).toBe('Parameter 44');
+      expect(field.editorLabel).toBe('Parameter 44');
+    });
+
+    it('tells one number on two endpoints apart', () => {
+      expect(fieldOf({ endpoint: 2 }, { label: 'Relay state' }).editorLabel).toBe(
+        'Parameter 1 on endpoint 2, Relay state',
+      );
+      expect(fieldOf({ endpoint: 2 }).editorLabel).toBe('Parameter 1 on endpoint 2');
+    });
+
+    it('names a field by its bits where the device named it nothing', () => {
+      const fields = sectionOf({
+        groups: [
+          group({
+            parameter: 7,
+            partial: true,
+            raw: 49,
+            values: [
+              value({ bitMask: 0x0f, value: 1, reportedAt: 1, label: 'Chime volume' }),
+              value({ bitMask: 0xf0, value: 3, reportedAt: 1 }),
+            ],
+          }),
+        ],
+      }).groups[0].fields;
+
+      expect(fields[0].editorLabel).toBe('Parameter 7, Chime volume');
+      expect(fields[1].label).toBe('Bit mask 0xF0');
+      expect(fields[1].name).toBe('Bit mask 0xF0');
+      expect(fields[1].editorLabel).toBe('Parameter 7, Bit mask 0xF0');
+    });
+  });
+
+  describe('what a change has to name', () => {
+    it('carries the parameter and what the page believes it to be', () => {
+      const field = sectionOf({
+        groups: [
+          group({ endpoint: 2, parameter: 7, values: [value({ valueSize: 2, format: 1 })] }),
+        ],
+      }).groups[0].fields[0];
+
+      expect(field.target).toEqual({
+        endpoint: 2,
+        parameter: 7,
+        bitMask: null,
+        valueSize: 2,
+        format: 1,
+      });
+    });
+
+    it('names the bits a field occupies, and nothing where none are stated', () => {
+      const divided = sectionOf({
+        groups: [
+          group({
+            partial: true,
+            raw: 3,
+            values: [value({ bitMask: 2, value: 1, reportedAt: 1 })],
+          }),
+        ],
+      }).groups[0].fields[0];
+
+      expect(divided.target.bitMask).toBe(2);
+      expect(sectionOf().groups[0].fields[0].target.valueSize).toBeNull();
+    });
+  });
+
   describe('what a change is doing', () => {
     const writing = (over: Record<string, unknown> = {}) => ({
       state: 'sending',
@@ -4632,13 +5067,11 @@ describe('the Parameters section', () => {
         'Choose one of the values this device permits.',
       );
       expect(describeParameterRefusal('wrong-device')).toBe(
-        'This page is showing an older version of this device. Reload the page and try again.',
+        'The device changed while this page was open. Return to the node list and open it again.',
       );
-      expect(describeParameterRefusal('no-identity')).toBe(
-        describeParameterRefusal('wrong-device'),
-      );
+      expect(describeParameterRefusal('no-identity')).toBe('Reload the page and try again.');
       expect(describeParameterRefusal('needs-acknowledgment')).toBe(
-        'This change needs your confirmation. Re-read the values and try again.',
+        'This change now needs confirmation. Review the warning and try again.',
       );
     });
 
@@ -4726,32 +5159,36 @@ describe('the Parameters section', () => {
   });
 
   describe('what a change asks the reader to agree to', () => {
+    const risksOf = (over: Record<string, unknown>) =>
+      sectionOf({ groups: [group({ values: [value(over)] })] }).groups[0].fields[0].risks;
+
     it('asks nothing of a parameter that carries neither risk', () => {
-      expect(describeParameterConfirmation(value(), 'Hallway lamp', 'Parameter 1')).toBeNull();
+      expect(describeParameterConfirmation(risksOf({}), 'Hallway lamp', 'Parameter 1')).toBeNull();
+      expect(describeParameterConfirmation(null, 'Hallway lamp', 'Parameter 1')).toBeNull();
     });
 
     it('names the parameter, the device and the risk', () => {
       expect(
-        describeParameterConfirmation(value({ destructive: true }), 'Hallway lamp', 'Reset'),
+        describeParameterConfirmation(risksOf({ destructive: true }), 'Hallway lamp', 'Reset'),
       ).toEqual({
         action: 'Change it',
-        sentences: ['Changing Reset on Hallway lamp may reset or erase its settings.'],
+        text: 'Changing Reset on Hallway lamp may reset or erase its settings.',
         destructive: true,
         requiresReInclusion: false,
       });
     });
 
-    it('names both risks where a parameter carries both', () => {
+    it('says what is being changed once where a parameter carries both risks', () => {
       const asked = describeParameterConfirmation(
-        value({ destructive: true, requiresReInclusion: true }),
+        risksOf({ destructive: true, requiresReInclusion: true }),
         'Hallway lamp',
         'Mode',
       );
 
-      expect(asked?.sentences).toEqual([
-        'Changing Mode on Hallway lamp may reset or erase its settings.',
-        'Changing Mode on Hallway lamp may stop it working until it is excluded and re-included.',
-      ]);
+      expect(asked?.text).toBe(
+        'Changing Mode on Hallway lamp may reset or erase its settings, and may stop it ' +
+          'working until it is excluded and re-included.',
+      );
       expect(asked?.destructive).toBe(true);
       expect(asked?.requiresReInclusion).toBe(true);
     });
@@ -5007,6 +5444,32 @@ describe('the Parameters section', () => {
       expect(parametersRefreshRunning(payloadOf({ refresh: { state: 'incomplete' } }))).toBe(false);
       expect(parametersRefreshRunning(payloadOf({ refresh: { state: 'complete' } }))).toBe(false);
       expect(parametersRefreshRunning(null)).toBe(false);
+    });
+  });
+
+  describe('reading on while a change is in flight', () => {
+    it('keeps reading until the change has stopped moving', () => {
+      const running = (state: string) =>
+        parametersWriteRunning(payloadOf({ write: { state } }));
+
+      expect(running('queued')).toBe(true);
+      expect(running('sending')).toBe(true);
+      expect(running('working')).toBe(true);
+      expect(running('confirming')).toBe(true);
+    });
+
+    it('stops once the change has settled, and never starts without one', () => {
+      const running = (state: string) =>
+        parametersWriteRunning(payloadOf({ write: { state } }));
+
+      expect(running('idle')).toBe(false);
+      expect(running('sent')).toBe(false);
+      expect(running('confirmed')).toBe(false);
+      expect(running('different')).toBe(false);
+      expect(running('unconfirmed')).toBe(false);
+      expect(running('refused')).toBe(false);
+      expect(parametersWriteRunning(payloadOf())).toBe(false);
+      expect(parametersWriteRunning(undefined)).toBe(false);
     });
   });
 
