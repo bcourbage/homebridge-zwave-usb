@@ -31,6 +31,7 @@ const { describeHealStart, healIsRunning,
   describeTypeWrite,
   describeWriteOutcome,
   describeParametersSection,
+  parameterAccepts,
   describeParametersRefresh,
   parametersTabCount,
   parametersRefreshRunning,
@@ -4084,6 +4085,411 @@ describe('the Parameters section', () => {
 
       expect(shown.groups).toHaveLength(1);
       expect(shown.empty).toBeNull();
+    });
+  });
+
+  describe('changing a value', () => {
+    const editorFor = (over: Record<string, unknown>) =>
+      sectionOf({ groups: [group({ values: [value(over)] })] }).groups[0].fields[0].editor;
+
+    it('offers nothing for a parameter that cannot be changed', () => {
+      expect(editorFor({ writable: false })).toBeNull();
+    });
+
+    it('offers the names the device gave, where it permits only those numbers', () => {
+      const editor = editorFor({
+        value: 2,
+        allowManualEntry: false,
+        states: { 0: 'Always off', 1: 'On when switched', 2: 'On when off' },
+      });
+
+      expect(editor).toEqual({
+        kind: 'choice',
+        current: 2,
+        options: [
+          { value: 0, label: 'Always off' },
+          { value: 1, label: 'On when switched' },
+          { value: 2, label: 'On when off' },
+        ],
+      });
+    });
+
+    it('offers a permitted set as the list it is, naming what the device named', () => {
+      const editor = editorFor({
+        value: 5,
+        unit: 'seconds',
+        allowed: [
+          { kind: 'value', value: 0 },
+          { kind: 'range', from: 5, to: 9, step: 2 },
+        ],
+        states: { 0: 'Off' },
+      });
+
+      expect(editor).toMatchObject({ kind: 'choice', current: 5 });
+      expect(editor.options).toEqual([
+        { value: 0, label: 'Off' },
+        { value: 5, label: '5 seconds' },
+        { value: 7, label: '7 seconds' },
+        { value: 9, label: '9 seconds' },
+      ]);
+    });
+
+    it('offers a field where the device permits more numbers than anyone would read', () => {
+      const editor = editorFor({
+        value: 600,
+        unit: 'seconds',
+        min: 1,
+        max: 65_535,
+        allowed: [{ kind: 'range', from: 1, to: 65_535, step: null }],
+      });
+
+      expect(editor).toEqual({
+        kind: 'number',
+        current: 600,
+        min: 1,
+        max: 65_535,
+        step: 1,
+        unit: 'seconds',
+        constrained: false,
+        permits: [{ kind: 'range', from: 1, to: 65_535, step: null }],
+      });
+    });
+
+    it('offers a field where the permitted set is longer than a list should be', () => {
+      /**
+       * Twenty-five numbers is not a choice, it is a scroll. The field that replaces the list
+       * cannot say which of the numbers between its ends the device takes, so it is bounded by
+       * the set's own ends rather than the wider range, and says that it does not describe it.
+       */
+      const editor = editorFor({
+        value: 3,
+        max: 30,
+        allowed: Array.from({ length: 25 }, (_, at) => ({ kind: 'value', value: at * 2 })),
+      });
+
+      // Narrowed by the range the metadata states, which the route applies as well.
+      expect(editor).toMatchObject({ kind: 'number', min: 0, max: 30, constrained: true });
+    });
+
+    it('offers no number the stated range excludes', () => {
+      const editor = editorFor({
+        value: 1,
+        min: 1,
+        allowed: [
+          { kind: 'value', value: 0 },
+          { kind: 'value', value: 1 },
+          { kind: 'value', value: 2 },
+        ],
+      });
+
+      expect(editor.options.map((one: { value: number }) => one.value)).toEqual([1, 2]);
+    });
+
+    it('bounds a value by what it is encoded in, where the metadata states no range', () => {
+      /**
+       * The route holds a whole value to its size and format, and a field to the bits it is
+       * written into. A page that offered more would be offering what the device cannot hold.
+       */
+      const unsigned = editorFor({ value: 1, valueSize: 1, format: 1 });
+      const signed = editorFor({ value: 1, valueSize: 1, format: null });
+      const wide = editorFor({ value: 1, valueSize: 2, format: 1 });
+
+      expect(unsigned).toMatchObject({ min: 0, max: 255 });
+      expect(signed).toMatchObject({ min: -128, max: 127 });
+      expect(wide).toMatchObject({ min: 0, max: 65_535 });
+      expect(parameterAccepts(unsigned, 300)).toBe(false);
+      expect(parameterAccepts(unsigned, 255)).toBe(true);
+      expect(parameterAccepts(signed, 128)).toBe(false);
+      expect(parameterAccepts(signed, -128)).toBe(true);
+    });
+
+    it('takes the narrower of what the metadata states and what the value can hold', () => {
+      /**
+       * Both bound the value and the route applies both, so the page has to offer the tighter of
+       * the two in each direction, never the wider.
+       */
+      const tight = editorFor({ value: 20, min: 10, max: 50, valueSize: 1, format: 1 });
+      const held = editorFor({ value: 20, min: -500, max: 500, valueSize: 1, format: 1 });
+
+      expect(tight).toMatchObject({ min: 10, max: 50 });
+      expect(held).toMatchObject({ min: 0, max: 255 });
+    });
+
+    it('narrows a span by what the value can hold', () => {
+      const editor = editorFor({
+        value: 20,
+        valueSize: 1,
+        format: 1,
+        allowed: [{ kind: 'range', from: 0, to: 1_000, step: null }],
+      });
+
+      expect(editor).toMatchObject({ kind: 'number', min: 0, max: 255 });
+      expect(parameterAccepts(editor, 300)).toBe(false);
+    });
+
+    it('bounds a field of a divided parameter by the bits it occupies', () => {
+      const bits = (over: Record<string, unknown>) =>
+        sectionOf({
+          groups: [
+            group({
+              parameter: 7,
+              partial: true,
+              raw: 0x21,
+              values: [value({ bitMask: 0x0f, value: 1, reportedAt: 1_000, valueSize: 1, ...over })],
+            }),
+          ],
+        }).groups[0].fields[0].editor;
+
+      // Four bits, signed unless the metadata says otherwise, which is how the driver reads it.
+      expect(bits({})).toMatchObject({ min: -8, max: 7 });
+      expect(bits({ format: 1 })).toMatchObject({ min: 0, max: 15 });
+    });
+
+    it('does not mistake a span beside another value for the whole permitted set', () => {
+      /**
+       * Nought for off, or anything from one upward, is a shape devices really use. A field of
+       * one to sixty-five thousand would drop the nought; one of nought to sixty-five thousand
+       * describes the set no better, so it says as much.
+       */
+      const editor = editorFor({
+        value: 0,
+        allowed: [
+          { kind: 'value', value: 0 },
+          { kind: 'range', from: 1, to: 65_535, step: null },
+        ],
+      });
+
+      expect(editor).toMatchObject({ kind: 'number', min: 0, max: 65_535, constrained: true });
+    });
+
+    it('offers nothing where the device stated a set that nobody could read', () => {
+      /**
+       * An empty set is not an absent one. The device named its permitted values and none of
+       * them could be read, so the plugin refuses every number against it; a field there would
+       * invite a reader to type something that could only ever be turned away.
+       */
+      expect(editorFor({ value: 3, min: 0, max: 100, allowed: [] })).toBeNull();
+    });
+
+    it('says a single span exactly, rather than saying it cannot', () => {
+      const editor = editorFor({
+        value: 10,
+        allowed: [{ kind: 'range', from: 0, to: 1_000, step: 5 }],
+      });
+
+      expect(editor).toMatchObject({ kind: 'number', min: 0, max: 1_000, step: 5, constrained: false });
+    });
+
+    it('offers nothing where a device forbidding typing states a set too long to show', () => {
+      const editor = editorFor({
+        allowManualEntry: false,
+        states: { 0: 'Off', 1: 'On' },
+        allowed: Array.from({ length: 30 }, (_, at) => ({ kind: 'value', value: at })),
+      });
+
+      expect(editor).toBeNull();
+    });
+
+    it('offers a list that stops exactly at the length a reader can take in', () => {
+      const editor = editorFor({
+        value: 3,
+        allowed: Array.from({ length: 24 }, (_, at) => ({ kind: 'value', value: at })),
+      });
+
+      expect(editor.kind).toBe('choice');
+      expect(editor.options).toHaveLength(24);
+    });
+
+    it('offers a field beside names the device merely suggests', () => {
+      /**
+       * Named states with typing allowed do not say the names are all the device takes, and a
+       * list of only those would hide every number nobody named.
+       */
+      const editor = editorFor({ value: 1, max: 9, states: { 0: 'Off', 1: 'On' } });
+
+      expect(editor).toMatchObject({ kind: 'number', max: 9 });
+    });
+
+    it('offers nothing where nothing may be typed and nothing can be listed', () => {
+      expect(editorFor({ allowManualEntry: false, min: 0, max: 65_535 })).toBeNull();
+    });
+
+    it('takes the bounds and the step from the set where the metadata states no range', () => {
+      const editor = editorFor({
+        value: 10,
+        allowed: [{ kind: 'range', from: 10, to: 3_600, step: 10 }],
+      });
+
+      expect(editor).toMatchObject({ kind: 'number', min: 10, max: 3_600, step: 10 });
+    });
+
+    it('has no value to start from where the device has not reported one', () => {
+      expect(editorFor({ value: null, max: 9 }).current).toBeNull();
+    });
+
+    it('offers only what the device both permits and named, where typing is forbidden', () => {
+      /**
+       * A device can state a permitted set and also forbid typing. The route applies both, so a
+       * number it permits but never named is refused; offering it would be offering a change
+       * that was never going to be sent.
+       */
+      const both = {
+        value: 0,
+        allowed: [
+          { kind: 'value', value: 0 },
+          { kind: 'value', value: 1 },
+          { kind: 'value', value: 2 },
+        ],
+        states: { 0: 'Off', 1: 'On' },
+      };
+
+      expect(editorFor({ ...both, allowManualEntry: false }).options).toEqual([
+        { value: 0, label: 'Off' },
+        { value: 1, label: 'On' },
+      ]);
+      expect(editorFor(both).options).toHaveLength(3);
+    });
+
+    it('offers nothing where the device named none of the numbers it permits', () => {
+      expect(
+        editorFor({
+          value: 5,
+          allowManualEntry: false,
+          allowed: [{ kind: 'value', value: 5 }, { kind: 'value', value: 6 }],
+          states: { 0: 'Off' },
+        }),
+      ).toBeNull();
+    });
+
+    describe('holding what the reader chose to what the device takes', () => {
+      const accepts = (over: Record<string, unknown>, number: number) =>
+        parameterAccepts(editorFor(over), number);
+
+      it('takes only what a list holds', () => {
+        const listed = { value: 0, allowManualEntry: false, states: { 0: 'Off', 2: 'On' } };
+
+        expect(accepts(listed, 2)).toBe(true);
+        expect(accepts(listed, 1)).toBe(false);
+      });
+
+      it('holds a field to the set it could not describe', () => {
+        /**
+         * The field spans the set's ends, and most of the numbers between them are not in it. A
+         * reader typing one should be told before being asked to confirm a change that the
+         * plugin would refuse.
+         */
+        const sparse = {
+          value: 0,
+          allowed: Array.from({ length: 25 }, (_, at) => ({ kind: 'value', value: at * 2 })),
+        };
+
+        expect(editorFor(sparse)).toMatchObject({ constrained: true });
+        expect(accepts(sparse, 8)).toBe(true);
+        expect(accepts(sparse, 9)).toBe(false);
+        expect(accepts(sparse, 100)).toBe(false);
+      });
+
+      it('counts a narrowed span from where the device counts it', () => {
+        /**
+         * A span counting by five from ten permits fifteen and not seventeen. A field narrowed
+         * to start at twelve would count from twelve and offer exactly the numbers the route
+         * refuses, so the ends move onto the sequence instead.
+         */
+        const stepped = {
+          value: 20,
+          min: 12,
+          max: 98,
+          allowed: [{ kind: 'range', from: 10, to: 1_000, step: 5 }],
+        };
+
+        expect(editorFor(stepped)).toMatchObject({ kind: 'number', min: 15, max: 95, step: 5 });
+        expect(accepts(stepped, 15)).toBe(true);
+        expect(accepts(stepped, 17)).toBe(false);
+        expect(accepts(stepped, 95)).toBe(true);
+      });
+
+      it('holds a field to the step of the span it describes', () => {
+        // Long enough that it is a field rather than a list, which is where the step has to be
+        // checked at all: a list can only offer what it holds.
+        const stepped = { value: 0, allowed: [{ kind: 'range', from: 0, to: 1_000, step: 5 }] };
+
+        expect(editorFor(stepped)).toMatchObject({ kind: 'number', step: 5 });
+        expect(accepts(stepped, 25)).toBe(true);
+        expect(accepts(stepped, 26)).toBe(false);
+      });
+
+      it('takes nothing that is not a whole number, and nothing at all where nothing is offered', () => {
+        expect(accepts({ value: 1, max: 9 }, 1.5)).toBe(false);
+        expect(accepts({ value: 1, max: 9 }, Number.NaN)).toBe(false);
+        expect(parameterAccepts(null, 1)).toBe(false);
+      });
+
+      it('takes any whole number inside a plain range', () => {
+        expect(accepts({ value: 1, min: 0, max: 9 }, 4)).toBe(true);
+        expect(accepts({ value: 1, min: 0, max: 9 }, 10)).toBe(false);
+      });
+    });
+
+    it('offers no change to a field whose parameter cannot be composed', () => {
+      /**
+       * The driver builds a partial write from the cached values of the sibling fields, starting
+       * at zero, so a field it holds no value for contributes nothing. The route refuses such a
+       * change, and the page does not offer it: it says why instead, and the re-read is a button
+       * away.
+       */
+      const divided = (over: Record<string, unknown>, raw: number | null = 0x21) =>
+        sectionOf({
+          groups: [
+            group({
+              parameter: 7,
+              partial: true,
+              raw,
+              values: [
+                value({ bitMask: 0x0f, value: 1, reportedAt: 1_000 }),
+                value({ bitMask: 0xf0, value: 2, reportedAt: 1_000, ...over }),
+              ],
+            }),
+          ],
+        }).groups[0].fields;
+
+      const whole = divided({});
+      expect(whole[0].editor).not.toBeNull();
+      expect(whole[0].blocked).toBeNull();
+
+      [divided({ reportedAt: null }), divided({ value: null }), divided({}, null)].forEach(
+        (fields) => {
+          expect(fields[0].editor).toBeNull();
+          expect(fields[0].blocked).toBe('partial-incomplete');
+        },
+      );
+    });
+
+    it('still offers a change to a whole parameter that has never been reported', () => {
+      // Writing a whole parameter replaces all of it, so nothing of the device's is composed in.
+      const field = sectionOf({
+        groups: [group({ raw: null, values: [value({ value: null, reportedAt: null, max: 9 })] })],
+      }).groups[0].fields[0];
+
+      expect(field.blocked).toBeNull();
+      expect(field.editor).toMatchObject({ kind: 'number', current: null });
+    });
+
+    it('names what a change asks the reader to agree to, and asks nothing otherwise', () => {
+      const risksOf = (over: Record<string, unknown>) =>
+        sectionOf({ groups: [group({ values: [value(over)] })] }, { showAdvanced: true })
+          .groups[0].fields[0].risks;
+
+      expect(risksOf({})).toEqual([]);
+      expect(risksOf({ destructive: true })).toEqual([
+        { kind: 'destructive', explanation: 'may reset or erase its settings' },
+      ]);
+      expect(risksOf({ requiresReInclusion: true })).toEqual([
+        {
+          kind: 'requiresReInclusion',
+          explanation: 'may stop it working until it is excluded and re-included',
+        },
+      ]);
+      expect(risksOf({ destructive: true, requiresReInclusion: true })).toHaveLength(2);
     });
   });
 

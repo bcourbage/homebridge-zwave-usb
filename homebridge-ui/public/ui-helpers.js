@@ -1740,9 +1740,334 @@
    * label belongs to the group: carried here as well it would be written twice, once under the
    * other.
    */
+  /**
+   * The most values a list may hold before a reader is better served by typing one.
+   *
+   * A device can permit tens of thousands of numbers. A list of them is not a choice, it is a
+   * scroll, and the number field beside it says the same thing in one line.
+   */
+  const PARAMETER_CHOICE_LIMIT = 24;
+
+  /** Every number a permitted set names outright, or none where it describes a span instead. */
+  function enumerated(allowed) {
+    if (!Array.isArray(allowed)) {
+      return null;
+    }
+
+    const numbers = [];
+
+    for (const entry of allowed) {
+      if (entry.kind === 'value') {
+        numbers.push(entry.value);
+        continue;
+      }
+
+      const step = isNumber(entry.step) && entry.step > 1 ? entry.step : 1;
+      const count = Math.floor((entry.to - entry.from) / step) + 1;
+
+      if (!isNumber(count) || count < 1 || numbers.length + count > PARAMETER_CHOICE_LIMIT) {
+        return null;
+      }
+      for (let at = entry.from; at <= entry.to; at += step) {
+        numbers.push(at);
+      }
+    }
+
+    return numbers.length > 0 && numbers.length <= PARAMETER_CHOICE_LIMIT ? numbers : null;
+  }
+
+  /**
+   * How a reader changes one value, or none where they may not.
+   *
+   * A device that names its values is offered them by name; one that permits a short set of
+   * numbers is offered those; anything wider is typed into a field bounded by what the metadata
+   * states. A device that forbids typing is never given a field, whatever the set looks like:
+   * the list is the whole of what it will take.
+   *
+   * The editor describes only what the device permits. Whether the value may be written at all,
+   * and whether this particular number is one it would accept, are settled again by the plugin
+   * before anything reaches the network.
+   */
+  function describeParameterEditor(value) {
+    if (value.writable === false) {
+      return null;
+    }
+
+    const stated = Array.isArray(value.allowed);
+
+    /**
+     * A set the device stated and nobody could read permits nothing at all, and the plugin
+     * refuses every number against it. Offering a field there would invite a reader to type
+     * something that could only ever be turned away.
+     */
+    if (stated && value.allowed.length === 0) {
+      return null;
+    }
+
+    const names = value.states
+      ? Object.keys(value.states)
+          .map((key) => Number(key))
+          .filter((one) => isNumber(one))
+      : [];
+    const current = isNumber(value.value) ? value.value : null;
+    const permitted = enumerated(value.allowed);
+    const labelFor = (one) => {
+      const named = value.states ? lookup(value.states, String(one)) : undefined;
+
+      return named ? String(named) : withParameterUnit(String(one), value.unit);
+    };
+
+    /**
+     * A list is offered only where the numbers in it are the whole of what the device permits:
+     * a permitted set says so outright, and so do named states where the device forbids typing.
+     * Named states beside a free field do not, since a number nobody named is still permitted,
+     * and listing only the named ones would hide the rest.
+     *
+     * Every rule the route applies is applied to that list together. A number the device permits
+     * but never named, or one outside the range it states, or one too large for the bits it is
+     * written into, is a change the plugin refuses, and offering it would be offering a change
+     * that cannot happen.
+     */
+    const typing = value.allowManualEntry !== false;
+    const bounds = parameterBounds(value);
+    const choice = (numbers) =>
+      numbers.length > 0
+        ? {
+            kind: 'choice',
+            current,
+            options: numbers.map((one) => ({ value: one, label: labelFor(one) })),
+          }
+        : null;
+
+    /**
+     * Both rules at once, as the route applies them. A device can state a permitted set and
+     * also forbid typing, and then only the numbers it both permits and named may be written:
+     * offering one it permits but never named would be offering a change the plugin refuses.
+     */
+    const offerable = (numbers) =>
+      numbers.filter(
+        (one) => withinBounds(one, bounds) && (typing || names.includes(one)),
+      );
+
+    if (permitted) {
+      return choice(offerable(permitted));
+    }
+
+    if (!typing) {
+      // Nothing may be typed, so only a list can serve. A set too long to show leaves nothing
+      // that could be offered, and a set the device stated has already overruled its names.
+      return stated || names.length > PARAMETER_CHOICE_LIMIT ? null : choice(offerable(names));
+    }
+
+    const ranges = stated ? value.allowed.filter((entry) => entry.kind === 'range') : [];
+    const span = stated && ranges.length === 1 && ranges.length === value.allowed.length
+      ? ranges[0]
+      : null;
+
+    if (span) {
+      /**
+       * One span is exactly what a field says, bounds and step and all. Narrowing it moves the
+       * ends onto the sequence rather than wherever the other bounds fall: a span counting by
+       * five from ten permits fifteen and not seventeen, and a field starting at twelve would
+       * count from twelve and offer exactly the numbers the route refuses. The span itself is
+       * carried as well, so what is typed is held to the device's own arithmetic.
+       */
+      const step = isNumber(span.step) && span.step > 1 ? span.step : 1;
+      const floor = isNumber(bounds.min) ? Math.max(span.from, bounds.min) : span.from;
+      const ceiling = isNumber(bounds.max) ? Math.min(span.to, bounds.max) : span.to;
+
+      return {
+        kind: 'number',
+        current,
+        min: span.from + Math.ceil((floor - span.from) / step) * step,
+        max: span.from + Math.floor((ceiling - span.from) / step) * step,
+        step,
+        unit: value.unit || null,
+        constrained: false,
+        permits: value.allowed,
+      };
+    }
+
+    if (stated) {
+      /**
+       * A set too long to list and not one span. A field cannot describe it: it would invite
+       * every number between its ends, and the device permits only some of them. It is bounded
+       * by the set's own ends, which is tighter than the metadata's range, and marked so the
+       * page can say that not every number in it will be taken.
+       */
+      const ends = value.allowed.flatMap((entry) =>
+        entry.kind === 'value' ? [entry.value] : [entry.from, entry.to],
+      );
+
+      return {
+        kind: 'number',
+        current,
+        min: isNumber(bounds.min) ? Math.max(Math.min(...ends), bounds.min) : Math.min(...ends),
+        max: isNumber(bounds.max) ? Math.min(Math.max(...ends), bounds.max) : Math.max(...ends),
+        step: 1,
+        unit: value.unit || null,
+        constrained: true,
+        /** The set itself, so what is typed can be held to it before anything is asked of it. */
+        permits: value.allowed,
+      };
+    }
+
+    return {
+      kind: 'number',
+      current,
+      min: bounds.min,
+      max: bounds.max,
+      step: 1,
+      unit: value.unit || null,
+      constrained: false,
+    };
+  }
+
+  /** zwave-js's signed integer format, which is also what it assumes where none is stated. */
+  const PARAMETER_SIGNED = 0;
+
+  /**
+   * The numbers a value can hold at all, before anything the device says it permits.
+   *
+   * A whole parameter is bounded by the size and format it is encoded in. A field is bounded by
+   * the bits it occupies instead, because the driver shifts the value into them and a number too
+   * large would be truncated there and silently mean something else. A field of more than one bit
+   * is signed unless the metadata says otherwise, which is the rule the driver reads it by.
+   */
+  function encodedLimits(value) {
+    const signed = (width) =>
+      value.format === null || value.format === undefined || value.format === PARAMETER_SIGNED
+        ? width > 1
+        : false;
+
+    if (isNumber(value.bitMask)) {
+      const shift = value.bitMask & -value.bitMask;
+      const span = Math.floor(value.bitMask / shift);
+      const width = span.toString(2).length;
+
+      return signed(width)
+        ? { min: -(2 ** (width - 1)), max: 2 ** (width - 1) - 1 }
+        : { min: 0, max: span };
+    }
+
+    if (!isNumber(value.valueSize) || value.valueSize < 1 || value.valueSize > 4) {
+      return null;
+    }
+
+    const bits = value.valueSize * 8;
+
+    return signed(bits)
+      ? { min: -(2 ** (bits - 1)), max: 2 ** (bits - 1) - 1 }
+      : { min: 0, max: 2 ** bits - 1 };
+  }
+
+  /**
+   * Everything that bounds a value at once: what the metadata states, and what it can be encoded
+   * in. The route applies both, so the page has to offer both or it offers changes that will be
+   * turned away.
+   */
+  function parameterBounds(value) {
+    const encoded = encodedLimits(value);
+    const floors = [value.min, encoded && encoded.min].filter(isNumber);
+    const ceilings = [value.max, encoded && encoded.max].filter(isNumber);
+
+    return {
+      min: floors.length > 0 ? Math.max(...floors) : null,
+      max: ceilings.length > 0 ? Math.min(...ceilings) : null,
+    };
+  }
+
+  const withinBounds = (number, bounds) =>
+    (!isNumber(bounds.min) || number >= bounds.min) && (!isNumber(bounds.max) || number <= bounds.max);
+
+  /**
+   * Whether a permitted set takes this number.
+   *
+   * This mirrors the rule the route applies and does not replace it: the route reads the device's
+   * live metadata and is the only thing that decides. It is here so the page can refuse a number
+   * before asking a reader to confirm a change that was never going to be sent.
+   */
+  function permittedBy(number, allowed) {
+    return allowed.some((entry) => {
+      if (entry.kind === 'value') {
+        return entry.value === number;
+      }
+      if (
+        !Number.isInteger(entry.from) ||
+        !Number.isInteger(entry.to) ||
+        entry.from > entry.to ||
+        number < entry.from ||
+        number > entry.to
+      ) {
+        return false;
+      }
+      if (entry.step === null || entry.step === undefined || entry.step === 1) {
+        return true;
+      }
+      if (!Number.isInteger(entry.step) || entry.step < 1) {
+        return false;
+      }
+
+      return (number - entry.from) % entry.step === 0;
+    });
+  }
+
+  /** Whether what the reader chose or typed is something the device would take. */
+  function parameterAccepts(editor, number) {
+    if (!editor || !Number.isInteger(number)) {
+      return false;
+    }
+    if (editor.kind === 'choice') {
+      return editor.options.some((option) => option.value === number);
+    }
+    if (
+      (isNumber(editor.min) && number < editor.min) ||
+      (isNumber(editor.max) && number > editor.max)
+    ) {
+      return false;
+    }
+    return editor.permits ? permittedBy(number, editor.permits) : true;
+  }
+
+  /** What a change asks the reader to agree to before it is sent, or none where it asks nothing. */
+  function describeParameterRisks(value) {
+    const risks = [];
+
+    if (value.destructive === true) {
+      risks.push({ kind: 'destructive', explanation: 'may reset or erase its settings' });
+    }
+    if (value.requiresReInclusion === true) {
+      risks.push({
+        kind: 'requiresReInclusion',
+        explanation: 'may stop it working until it is excluded and re-included',
+      });
+    }
+
+    return risks;
+  }
+
+  /**
+   * Whether changing one field of this parameter would leave the others as the device has them.
+   *
+   * The driver builds a partial write from the cached values of the sibling fields, starting at
+   * zero, so a field it holds no value for contributes nothing and so do the bits no field
+   * describes. The route refuses such a change; the page does not offer it, and says why.
+   */
+  function groupComposes(group) {
+    const values = group.values || [];
+
+    return (
+      group.raw !== null &&
+      group.raw !== undefined &&
+      values.length > 0 &&
+      values.every((one) => isNumber(one.value) && isNumber(one.reportedAt))
+    );
+  }
+
   function describeParameterField(group, value, waiting) {
     const key = parameterValueKey(group.endpoint, group.parameter, value.bitMask);
     const partial = value.bitMask !== null && value.bitMask !== undefined;
+    const blocked = partial && !groupComposes(group) ? 'partial-incomplete' : null;
     const marks = PARAMETER_MARKS.filter((mark) => mark.holds(value)).map((mark) => ({
       label: mark.label,
       tone: mark.tone,
@@ -1761,6 +2086,10 @@
       reportedAt: parameterReportedText(value),
       waiting: waiting.has(key),
       advanced: value.advanced === true,
+      editor: blocked ? null : describeParameterEditor(value),
+      /** Why no change is offered, where the value itself is not the reason. */
+      blocked,
+      risks: describeParameterRisks(value),
     };
   }
 
@@ -2031,6 +2360,9 @@
     typeName,
     listNodeNumbers,
     describeParametersSection,
+    describeParameterEditor,
+    parameterAccepts,
+    describeParameterRisks,
     describeParametersRefresh,
     describeParameterGroup,
     parameterGroupMatches,
