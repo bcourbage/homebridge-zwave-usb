@@ -2064,10 +2064,215 @@
     );
   }
 
-  function describeParameterField(group, value, waiting) {
+  /**
+   * What a change is doing, in the reader's terms rather than the plugin's.
+   *
+   * `sent` is where a change to a write-only parameter ends. Nothing will report the new value,
+   * so the sentence says why no confirmation is coming rather than leaving the reader waiting
+   * for one, and an unconfirmed change, which is a change that should have been reported and
+   * was not, keeps its own sentence.
+   */
+  const PARAMETER_WRITE_SENTENCES = {
+    queued: 'Queued. The change will be sent when the device wakes.',
+    sending: 'Sending the new value to the device.',
+    working: 'The device accepted the change and is still applying it.',
+    confirming: 'Sent. Waiting for the device to report the new value.',
+    sent: 'Sent. This parameter does not report a value, so the change cannot be confirmed here.',
+    unconfirmed: 'The device did not report this value back. It may not have applied the change.',
+  };
+
+  /** Why a change that did reach the driver was turned away, which the plugin tells apart. */
+  const PARAMETER_WRITE_FAILURES = {
+    'send-failed': 'The change could not be sent to the device.',
+    'device-rejected': 'The device rejected this change.',
+  };
+
+  /**
+   * How each ending reads. A change in flight is neither good news nor bad and says so in the
+   * muted color the rest of the section uses.
+   */
+  const PARAMETER_WRITE_TONES = {
+    different: 'caution',
+    unconfirmed: 'caution',
+    refused: 'danger',
+  };
+
+  /** Said where the plugin reports something this page has no sentence for. */
+  const PARAMETER_WRITE_UNKNOWN = 'This change was not made.';
+
+  /**
+   * Why a change was not begun at all.
+   *
+   * Several of these the page cannot provoke while its metadata is current: it offers no control
+   * on a read-only value, no field where typing is forbidden, and no change at all without the
+   * acknowledgment the value asks for. They are answered anyway, because the metadata the page
+   * is holding can be older than the metadata the route reads.
+   */
+  const PARAMETER_REFUSALS = {
+    'not-writable': 'This parameter cannot be changed.',
+    'not-permitted': 'Choose one of the values this device permits.',
+    'manual-entry-forbidden': 'Choose one of the values this device permits.',
+    'partial-incomplete':
+      'Some fields in this parameter have not been reported. Changing one could overwrite the ' +
+      'others, so re-read the values first.',
+    'definition-changed': 'This parameter changed while the page was open. Review it and try again.',
+    'needs-acknowledgment': 'This change needs your confirmation. Re-read the values and try again.',
+    'no-identity': 'This page is showing an older version of this device. Reload the page and try again.',
+    'wrong-device': 'This page is showing an older version of this device. Reload the page and try again.',
+    busy: 'Another setting change is still in progress for this device.',
+    'busy-rereading': 'Wait for the current re-read to finish before changing a value.',
+  };
+
+  /**
+   * Why the re-read control is refused rather than removed while a change is in flight.
+   *
+   * Only the states the plugin suppresses a re-read in are here. Once a change is being
+   * confirmed the Set is out and further Gets can only help, so nothing blocks the control.
+   */
+  const PARAMETER_REREAD_BLOCKS = {
+    queued: 'Wait for the current setting change to be sent before re-reading values.',
+    sending: 'Wait for the current setting change to be sent before re-reading values.',
+    working:
+      'Wait for the device to finish applying the current setting change before re-reading values.',
+  };
+
+  /** The one sentence a field that cannot take every number between its ends adds. */
+  const PARAMETER_CONSTRAINED_NOTE = 'Only the permitted values shown above can be saved.';
+
+  /**
+   * The change this node has in hand, where it belongs to this value and nowhere else.
+   *
+   * A parameter's other fields are not being changed, and a sentence under them would say they
+   * were, so the write is matched to the one value it names before anything is said about it.
+   */
+  function describeParameterWrite(write, group, value) {
+    const mask = (one) => (isNumber(one) ? one : null);
+    if (
+      !write ||
+      write.state === 'idle' ||
+      write.endpoint !== group.endpoint ||
+      write.parameter !== group.parameter ||
+      mask(write.bitMask) !== mask(value.bitMask)
+    ) {
+      return null;
+    }
+
+    const said = (text) => ({
+      state: write.state,
+      text,
+      tone: lookup(PARAMETER_WRITE_TONES, write.state) || 'neutral',
+    });
+
+    if (write.state === 'confirmed') {
+      const when = parameterMomentText(write.settledAt);
+
+      return said(
+        when ? `The device confirmed this value on ${when}.` : 'The device confirmed this value.',
+      );
+    }
+
+    /**
+     * A different number is worth reporting only where there is one. A state saying the device
+     * answered with another value and carrying no value is a state that cannot be read, so it
+     * falls back to the sentence for a change nothing confirmed.
+     */
+    if (write.state === 'different') {
+      return said(
+        isNumber(write.reported)
+          ? `The device reported a different value: ${withParameterUnit(
+              String(write.reported),
+              value.unit,
+            )}.`
+          : PARAMETER_WRITE_SENTENCES.unconfirmed,
+      );
+    }
+
+    if (write.state === 'refused') {
+      return said(lookup(PARAMETER_WRITE_FAILURES, write.code) || PARAMETER_WRITE_UNKNOWN);
+    }
+
+    return said(lookup(PARAMETER_WRITE_SENTENCES, write.state) || PARAMETER_WRITE_UNKNOWN);
+  }
+
+  /**
+   * The answer to the request just made, which is not the same thing as the change the node has
+   * in hand: a change refused because another one is running is refused by a device that is
+   * still running that other one.
+   */
+  function describeParameterRefusal(code, editor) {
+    if (code === 'out-of-range' && editor && isNumber(editor.min) && isNumber(editor.max)) {
+      return `Enter a number from ${editor.min} to ${editor.max}.`;
+    }
+    if (code === 'out-of-range') {
+      return PARAMETER_REFUSALS['not-permitted'];
+    }
+
+    return lookup(PARAMETER_REFUSALS, code) || PARAMETER_WRITE_UNKNOWN;
+  }
+
+  /**
+   * What the page makes of what was typed, while it is still being typed.
+   *
+   * This is the same arithmetic the route applies and does not replace it: the route reads the
+   * live metadata and is the only thing that decides. It is here so that a reader is told which
+   * number to choose before they ask for one that could only be turned away.
+   */
+  function describeParameterEntry(editor, text) {
+    const typed = String(text === null || text === undefined ? '' : text).trim();
+    if (!editor || typed === '') {
+      return { kind: 'empty', value: null, text: null };
+    }
+
+    const number = Number(typed);
+    if (parameterAccepts(editor, number)) {
+      return { kind: 'ready', value: number, text: null };
+    }
+
+    /**
+     * The nearer of the two things that can be wrong. A number the field's own ends exclude is
+     * answered by those ends; one they take and the device still refuses is answered by the set.
+     */
+    const outside =
+      editor.kind !== 'choice' &&
+      isNumber(editor.min) &&
+      isNumber(editor.max) &&
+      (!Number.isInteger(number) || number < editor.min || number > editor.max);
+
+    return {
+      kind: 'invalid',
+      value: null,
+      text: outside
+        ? `Enter a number from ${editor.min} to ${editor.max}.`
+        : PARAMETER_REFUSALS['not-permitted'],
+    };
+  }
+
+  /**
+   * What the reader is asked to agree to before a change is sent, or nothing where the device
+   * says the change carries neither risk.
+   *
+   * Each risk is named separately, because a parameter can carry both and a reader agreeing to
+   * one has not been told about the other.
+   */
+  function describeParameterConfirmation(value, device, label) {
+    const risks = describeParameterRisks(value);
+    if (risks.length === 0) {
+      return null;
+    }
+
+    return {
+      action: 'Change it',
+      sentences: risks.map((risk) => `Changing ${label} on ${device} ${risk.explanation}.`),
+      destructive: risks.some((risk) => risk.kind === 'destructive'),
+      requiresReInclusion: risks.some((risk) => risk.kind === 'requiresReInclusion'),
+    };
+  }
+
+  function describeParameterField(group, value, waiting, write) {
     const key = parameterValueKey(group.endpoint, group.parameter, value.bitMask);
     const partial = value.bitMask !== null && value.bitMask !== undefined;
     const blocked = partial && !groupComposes(group) ? 'partial-incomplete' : null;
+    const editor = blocked ? null : describeParameterEditor(value);
     const marks = PARAMETER_MARKS.filter((mark) => mark.holds(value)).map((mark) => ({
       label: mark.label,
       tone: mark.tone,
@@ -2086,10 +2291,13 @@
       reportedAt: parameterReportedText(value),
       waiting: waiting.has(key),
       advanced: value.advanced === true,
-      editor: blocked ? null : describeParameterEditor(value),
+      editor,
       /** Why no change is offered, where the value itself is not the reason. */
       blocked,
+      /** Said where a field cannot describe the set the device permits, and nowhere else. */
+      note: editor && editor.constrained ? PARAMETER_CONSTRAINED_NOTE : null,
       risks: describeParameterRisks(value),
+      write: describeParameterWrite(write, group, value),
     };
   }
 
@@ -2098,9 +2306,9 @@
    * a partial parameter divides it into, and both are drawn inside the one group so that a
    * parameter is never read as several, nor one of its fields as the whole of it.
    */
-  function describeParameterGroup(group, waiting) {
+  function describeParameterGroup(group, waiting, write) {
     const values = group.values || [];
-    const fields = values.map((value) => describeParameterField(group, value, waiting));
+    const fields = values.map((value) => describeParameterField(group, value, waiting, write));
 
     return {
       key: `${group.endpoint}:${group.parameter}`,
@@ -2153,9 +2361,16 @@
     const refresh = (payload && payload.refresh) || {};
     const sleeping = payload && payload.listening === false;
     const label = sleeping ? 'Re-read when it wakes' : 'Re-read values';
+    /**
+     * A change the plugin is still sending is a change a re-read would read across, so the
+     * control is refused rather than removed and says which of the two waits it is in.
+     */
+    const held = lookup(PARAMETER_REREAD_BLOCKS, ((payload && payload.write) || {}).state) || null;
     /** A control only where one could do something, which is the one thing capability decides. */
     const control = (text, disabled) =>
-      refresh.canRequest ? { label: text, disabled: Boolean(disabled) } : null;
+      refresh.canRequest
+        ? { label: text, disabled: Boolean(disabled) || held !== null, note: held }
+        : null;
 
     if (refresh.state === 'dispatching') {
       return {
@@ -2205,7 +2420,7 @@
 
     // Nothing has been asked, so the only thing to say is where nothing can be.
     return refresh.canRequest
-      ? { button: { label, disabled: false }, status: null }
+      ? { button: control(label), status: null }
       : {
           button: null,
           status: 'This device does not report any configuration values that can be re-read.',
@@ -2268,7 +2483,7 @@
     const search = String(current.search || '');
     const showAdvanced = current.showAdvanced === true;
     const matched = (payload.groups || [])
-      .map((group) => describeParameterGroup(group, waiting))
+      .map((group) => describeParameterGroup(group, waiting, payload.write))
       .filter((group) => parameterGroupMatches(group, search));
 
     const groups = [];
@@ -2361,6 +2576,10 @@
     listNodeNumbers,
     describeParametersSection,
     describeParameterEditor,
+    describeParameterEntry,
+    describeParameterWrite,
+    describeParameterRefusal,
+    describeParameterConfirmation,
     parameterAccepts,
     describeParameterRisks,
     describeParametersRefresh,

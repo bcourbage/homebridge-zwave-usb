@@ -31,6 +31,9 @@ const { describeHealStart, healIsRunning,
   describeTypeWrite,
   describeWriteOutcome,
   describeParametersSection,
+  describeParameterEntry,
+  describeParameterRefusal,
+  describeParameterConfirmation,
   parameterAccepts,
   describeParametersRefresh,
   parametersTabCount,
@@ -4493,6 +4496,350 @@ describe('the Parameters section', () => {
     });
   });
 
+  describe('what a change is doing', () => {
+    const writing = (over: Record<string, unknown> = {}) => ({
+      state: 'sending',
+      endpoint: 0,
+      parameter: 1,
+      bitMask: null,
+      wrote: 7,
+      reported: null,
+      sentAt: 1_700_000_000_000,
+      settledAt: null,
+      remainingMs: null,
+      code: null,
+      ...over,
+    });
+
+    const fieldOf = (write: Record<string, unknown>, over: Record<string, unknown> = {}) =>
+      sectionOf({ write, groups: [group(over)] }).groups[0].fields[0];
+
+    it('says nothing where no change has been made', () => {
+      expect(fieldOf(writing({ state: 'idle', endpoint: null, parameter: null })).write).toBeNull();
+      expect(sectionOf().groups[0].fields[0].write).toBeNull();
+    });
+
+    it('says what each state of a change in flight is doing', () => {
+      const said = (state: string) => fieldOf(writing({ state })).write;
+
+      expect(said('queued')).toEqual({
+        state: 'queued',
+        text: 'Queued. The change will be sent when the device wakes.',
+        tone: 'neutral',
+      });
+      expect(said('sending').text).toBe('Sending the new value to the device.');
+      expect(said('working').text).toBe(
+        'The device accepted the change and is still applying it.',
+      );
+      expect(said('confirming').text).toBe('Sent. Waiting for the device to report the new value.');
+    });
+
+    it('tells a change nothing will report from one nothing did', () => {
+      expect(fieldOf(writing({ state: 'sent' })).write).toEqual({
+        state: 'sent',
+        text: 'Sent. This parameter does not report a value, so the change cannot be confirmed here.',
+        tone: 'neutral',
+      });
+      expect(fieldOf(writing({ state: 'unconfirmed' })).write).toEqual({
+        state: 'unconfirmed',
+        text: 'The device did not report this value back. It may not have applied the change.',
+        tone: 'caution',
+      });
+    });
+
+    it('dates a confirmation', () => {
+      const at = new Date('2026-03-04T15:30:00Z').getTime();
+      const when = fieldOf(writing({ state: 'confirmed', settledAt: at })).write;
+
+      expect(when.tone).toBe('neutral');
+      expect(when.text).toMatch(/^The device confirmed this value on .+\.$/);
+      expect(when.text).toContain('2026');
+    });
+
+    it('reports the number the device answered with, in its own unit', () => {
+      const other = fieldOf(writing({ state: 'different', reported: 12 }), {
+        values: [value({ unit: 'minutes' })],
+      }).write;
+
+      expect(other).toEqual({
+        state: 'different',
+        text: 'The device reported a different value: 12 minutes.',
+        tone: 'caution',
+      });
+    });
+
+    it('falls back where a different value carries no value to report', () => {
+      expect(fieldOf(writing({ state: 'different', reported: null })).write.text).toBe(
+        'The device did not report this value back. It may not have applied the change.',
+      );
+    });
+
+    it('tells the driver refusing to send from the device rejecting it', () => {
+      const refused = (code: string) => fieldOf(writing({ state: 'refused', code })).write;
+
+      expect(refused('send-failed')).toEqual({
+        state: 'refused',
+        text: 'The change could not be sent to the device.',
+        tone: 'danger',
+      });
+      expect(refused('device-rejected').text).toBe('The device rejected this change.');
+      expect(refused('something-else').text).toBe('This change was not made.');
+    });
+
+    it('says what is happening beside the value it is happening to, and nowhere else', () => {
+      const divided = {
+        partial: true,
+        raw: 3,
+        values: [
+          value({ bitMask: 1, value: 1, reportedAt: 1, label: 'First' }),
+          value({ bitMask: 2, value: 1, reportedAt: 1, label: 'Second' }),
+        ],
+      };
+      const fields = sectionOf({ write: writing({ bitMask: 2 }), groups: [group(divided)] })
+        .groups[0].fields;
+
+      expect(fields[0].write).toBeNull();
+      expect(fields[1].write?.text).toBe('Sending the new value to the device.');
+    });
+
+    it('does not read a change to one parameter as a change to another', () => {
+      expect(fieldOf(writing({ parameter: 2 })).write).toBeNull();
+      expect(fieldOf(writing({ endpoint: 1 })).write).toBeNull();
+      expect(fieldOf(writing({ bitMask: 1 })).write).toBeNull();
+    });
+  });
+
+  describe('why a change was refused', () => {
+    it('answers each refusal the plugin can give', () => {
+      expect(describeParameterRefusal('busy')).toBe(
+        'Another setting change is still in progress for this device.',
+      );
+      expect(describeParameterRefusal('busy-rereading')).toBe(
+        'Wait for the current re-read to finish before changing a value.',
+      );
+      expect(describeParameterRefusal('definition-changed')).toBe(
+        'This parameter changed while the page was open. Review it and try again.',
+      );
+      expect(describeParameterRefusal('partial-incomplete')).toBe(
+        'Some fields in this parameter have not been reported. Changing one could overwrite the ' +
+          'others, so re-read the values first.',
+      );
+      expect(describeParameterRefusal('not-writable')).toBe('This parameter cannot be changed.');
+      expect(describeParameterRefusal('not-permitted')).toBe(
+        'Choose one of the values this device permits.',
+      );
+      expect(describeParameterRefusal('manual-entry-forbidden')).toBe(
+        'Choose one of the values this device permits.',
+      );
+      expect(describeParameterRefusal('wrong-device')).toBe(
+        'This page is showing an older version of this device. Reload the page and try again.',
+      );
+      expect(describeParameterRefusal('no-identity')).toBe(
+        describeParameterRefusal('wrong-device'),
+      );
+      expect(describeParameterRefusal('needs-acknowledgment')).toBe(
+        'This change needs your confirmation. Re-read the values and try again.',
+      );
+    });
+
+    it('answers a number outside the range with the range itself', () => {
+      expect(describeParameterRefusal('out-of-range', { min: 1, max: 10 })).toBe(
+        'Enter a number from 1 to 10.',
+      );
+    });
+
+    it('falls back where the range is not known', () => {
+      expect(describeParameterRefusal('out-of-range', null)).toBe(
+        'Choose one of the values this device permits.',
+      );
+      expect(describeParameterRefusal('out-of-range', { min: 1, max: null })).toBe(
+        'Choose one of the values this device permits.',
+      );
+    });
+
+    it('says something for a refusal it has no sentence for', () => {
+      expect(describeParameterRefusal('invented')).toBe('This change was not made.');
+      expect(describeParameterRefusal(undefined)).toBe('This change was not made.');
+    });
+  });
+
+  describe('holding what is typed while it is typed', () => {
+    const editorFor = (over: Record<string, unknown> = {}) =>
+      sectionOf({ groups: [group({ values: [value(over)] })] }).groups[0].fields[0].editor;
+
+    it('asks for nothing while nothing has been typed', () => {
+      const editor = editorFor({ min: 1, max: 10 });
+
+      expect(describeParameterEntry(editor, '')).toEqual({ kind: 'empty', value: null, text: null });
+      expect(describeParameterEntry(editor, '   ').kind).toBe('empty');
+      expect(describeParameterEntry(editor, null).kind).toBe('empty');
+    });
+
+    it('takes a number the device would take', () => {
+      expect(describeParameterEntry(editorFor({ min: 1, max: 10 }), ' 7 ')).toEqual({
+        kind: 'ready',
+        value: 7,
+        text: null,
+      });
+    });
+
+    it('answers a number outside the ends with the ends', () => {
+      const editor = editorFor({ min: 1, max: 10 });
+
+      expect(describeParameterEntry(editor, '11')).toEqual({
+        kind: 'invalid',
+        value: null,
+        text: 'Enter a number from 1 to 10.',
+      });
+      expect(describeParameterEntry(editor, '0').text).toBe('Enter a number from 1 to 10.');
+      expect(describeParameterEntry(editor, 'abc').text).toBe('Enter a number from 1 to 10.');
+      expect(describeParameterEntry(editor, '3.5').text).toBe('Enter a number from 1 to 10.');
+    });
+
+    it('answers a number the ends take and the device does not with the set', () => {
+      const editor = editorFor({
+        min: 10,
+        max: 100,
+        allowed: [{ kind: 'range', from: 10, to: 100, step: 5 }],
+      });
+
+      expect(describeParameterEntry(editor, '15').kind).toBe('ready');
+      expect(describeParameterEntry(editor, '17')).toEqual({
+        kind: 'invalid',
+        value: null,
+        text: 'Choose one of the values this device permits.',
+      });
+    });
+
+    it('answers a choice nobody offered with the set', () => {
+      const editor = editorFor({ allowManualEntry: false, states: { '1': 'On', '2': 'Off' } });
+
+      expect(editor.kind).toBe('choice');
+      expect(describeParameterEntry(editor, '3').text).toBe(
+        'Choose one of the values this device permits.',
+      );
+    });
+
+    it('offers nothing where there is no editor to hold it to', () => {
+      expect(describeParameterEntry(null, '7').kind).toBe('empty');
+    });
+  });
+
+  describe('what a change asks the reader to agree to', () => {
+    it('asks nothing of a parameter that carries neither risk', () => {
+      expect(describeParameterConfirmation(value(), 'Hallway lamp', 'Parameter 1')).toBeNull();
+    });
+
+    it('names the parameter, the device and the risk', () => {
+      expect(
+        describeParameterConfirmation(value({ destructive: true }), 'Hallway lamp', 'Reset'),
+      ).toEqual({
+        action: 'Change it',
+        sentences: ['Changing Reset on Hallway lamp may reset or erase its settings.'],
+        destructive: true,
+        requiresReInclusion: false,
+      });
+    });
+
+    it('names both risks where a parameter carries both', () => {
+      const asked = describeParameterConfirmation(
+        value({ destructive: true, requiresReInclusion: true }),
+        'Hallway lamp',
+        'Mode',
+      );
+
+      expect(asked?.sentences).toEqual([
+        'Changing Mode on Hallway lamp may reset or erase its settings.',
+        'Changing Mode on Hallway lamp may stop it working until it is excluded and re-included.',
+      ]);
+      expect(asked?.destructive).toBe(true);
+      expect(asked?.requiresReInclusion).toBe(true);
+    });
+  });
+
+  describe('a field that cannot describe what the device permits', () => {
+    it('says so, where it is bounded more tightly than it can describe', () => {
+      const field = sectionOf({
+        groups: [
+          group({
+            values: [
+              value({
+                min: 0,
+                max: 1000,
+                allowed: [
+                  { kind: 'range', from: 10, to: 400, step: 1 },
+                  { kind: 'value', value: 900 },
+                ],
+              }),
+            ],
+          }),
+        ],
+      }).groups[0].fields[0];
+
+      expect(field.editor.constrained).toBe(true);
+      expect(field.note).toBe('Only the permitted values shown above can be saved.');
+    });
+
+    it('says nothing where the field says the whole of it', () => {
+      expect(sectionOf().groups[0].fields[0].note).toBeNull();
+    });
+  });
+
+  describe('re-reading while a change is in flight', () => {
+    const rereadWith = (state: string) =>
+      sectionOf({ write: { state, endpoint: 0, parameter: 1, bitMask: null } }).refresh;
+
+    it('refuses the control rather than removing it, and says which wait it is', () => {
+      const queued = rereadWith('queued');
+
+      expect(queued.button).toEqual({
+        label: 'Re-read values',
+        disabled: true,
+        note: 'Wait for the current setting change to be sent before re-reading values.',
+      });
+      expect(rereadWith('sending').button).toEqual(queued.button);
+      expect(rereadWith('working').button).toEqual({
+        label: 'Re-read values',
+        disabled: true,
+        note:
+          'Wait for the device to finish applying the current setting change before re-reading ' +
+          'values.',
+      });
+    });
+
+    it('allows one once the change is only waiting to be confirmed', () => {
+      expect(rereadWith('confirming').button).toEqual({
+        label: 'Re-read values',
+        disabled: false,
+        note: null,
+      });
+      expect(rereadWith('idle').button?.disabled).toBe(false);
+    });
+
+    it('holds a control the section offers for any other reason too', () => {
+      const held = describeParametersSection({
+        payload: payloadOf({
+          write: { state: 'working', endpoint: 0, parameter: 1, bitMask: null },
+          refresh: { state: 'complete', completedAt: 1, waiting: [], asked: 1, canRequest: true },
+        }),
+      });
+
+      expect(held.refresh.button?.disabled).toBe(true);
+      expect(held.refresh.status).toMatch(/^Configuration values re-read /);
+    });
+
+    it('offers no control at all where there is nothing to re-read', () => {
+      const none = describeParametersSection({
+        payload: payloadOf({
+          write: { state: 'working', endpoint: 0, parameter: 1, bitMask: null },
+          refresh: { state: 'idle', requestedAt: null, waiting: [], asked: 0, canRequest: false },
+        }),
+      });
+
+      expect(none.refresh.button).toBeNull();
+    });
+  });
+
   describe('asking the device for current values', () => {
     const refreshOf = (over: Record<string, unknown>, listening = true) =>
       describeParametersRefresh({
@@ -4515,16 +4862,21 @@ describe('the Parameters section', () => {
     });
 
     it('says what a re-read can promise for a device that is awake and one that is not', () => {
-      expect(refreshOf({}).button).toEqual({ label: 'Re-read values', disabled: false });
+      expect(refreshOf({}).button).toEqual({
+        label: 'Re-read values',
+        disabled: false,
+        note: null,
+      });
       expect(refreshOf({}, false).button).toEqual({
         label: 'Re-read when it wakes',
         disabled: false,
+        note: null,
       });
     });
 
     it('refuses a second ask while one is running, and says what is being waited for', () => {
       expect(refreshOf({ state: 'dispatching' })).toEqual({
-        button: { label: 'Re-read values', disabled: true },
+        button: { label: 'Re-read values', disabled: true, note: null },
         status: 'Waiting for the device to report current values.',
       });
       expect(refreshOf({ state: 'dispatching' }, false).status).toBe(
@@ -4534,7 +4886,7 @@ describe('the Parameters section', () => {
 
     it('offers another attempt where one finished with values unreported', () => {
       expect(refreshOf({ state: 'incomplete' })).toEqual({
-        button: { label: 'Try re-read again', disabled: false },
+        button: { label: 'Try re-read again', disabled: false, note: null },
         status: 'Some values have not been reported yet.',
       });
     });
@@ -4547,6 +4899,7 @@ describe('the Parameters section', () => {
       expect(refreshOf({ state: 'incomplete' }, false).button).toEqual({
         label: 'Try re-read when it wakes',
         disabled: false,
+        note: null,
       });
     });
 
@@ -4577,7 +4930,7 @@ describe('the Parameters section', () => {
        * answer, because another attempt can bring those and will never bring these.
        */
       expect(refreshOf({ state: 'unavailable' })).toEqual({
-        button: { label: 'Re-read values', disabled: false },
+        button: { label: 'Re-read values', disabled: false, note: null },
         status: 'Some values could not be confirmed because they are no longer available.',
       });
       expect(refreshOf({ state: 'unavailable' }, false).button.label).toBe('Re-read when it wakes');
@@ -4587,6 +4940,7 @@ describe('the Parameters section', () => {
       expect(refreshOf({ state: 'complete' }).button).toEqual({
         label: 'Re-read values',
         disabled: false,
+        note: null,
       });
     });
 
